@@ -1,0 +1,264 @@
+// PackageDescription — the API for M++ package manifests (Package.mpp).
+//
+// It mirrors SwiftPM's PackageDescription. `mpp pm` compiles a package's
+// Package.mpp against this module and runs it; when the manifest program
+// exits, the package it declared is written out as JSON for the package
+// manager to read.
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+// MARK: - Version
+
+/// A semantic version: major.minor.patch, with an optional pre-release tag.
+public struct Version: Comparable, Hashable, Sendable, CustomStringConvertible, ExpressibleByStringLiteral {
+    public let major: Int
+    public let minor: Int
+    public let patch: Int
+    public let prerelease: String
+
+    public init(_ major: Int, _ minor: Int, _ patch: Int, prerelease: String = "") {
+        self.major = major; self.minor = minor; self.patch = patch; self.prerelease = prerelease
+    }
+
+    public init(stringLiteral value: String) {
+        var s = Substring(value)
+        if s.first == "v" { s = s.dropFirst() }
+        let dash = s.firstIndex(of: "-")
+        let core = dash.map { s[..<$0] } ?? s
+        let parts = core.split(separator: ".").map { Int($0) }
+        guard (1...3).contains(parts.count), parts.allSatisfy({ $0 != nil }) else {
+            fatalError("Package.mpp: invalid version \"\(value)\" (expected major.minor.patch)")
+        }
+        major = parts[0]!
+        minor = parts.count > 1 ? parts[1]! : 0
+        patch = parts.count > 2 ? parts[2]! : 0
+        prerelease = dash.map { String(s[s.index(after: $0)...]) } ?? ""
+    }
+
+    public var description: String { "\(major).\(minor).\(patch)" + (prerelease.isEmpty ? "" : "-\(prerelease)") }
+
+    public static func < (a: Version, b: Version) -> Bool {
+        if (a.major, a.minor, a.patch) != (b.major, b.minor, b.patch) {
+            return (a.major, a.minor, a.patch) < (b.major, b.minor, b.patch)
+        }
+        if a.prerelease.isEmpty != b.prerelease.isEmpty { return !a.prerelease.isEmpty }
+        return a.prerelease < b.prerelease
+    }
+
+    public func nextMajor() -> Version { Version(major + 1, 0, 0) }
+    public func nextMinor() -> Version { Version(major, minor + 1, 0) }
+}
+
+// MARK: - Package
+
+public final class Package {
+    public var name: String
+    public var products: [Product]
+    public var dependencies: [Dependency]
+    public var targets: [Target]
+
+    public init(
+        name: String,
+        products: [Product] = [],
+        dependencies: [Dependency] = [],
+        targets: [Target] = []
+    ) {
+        self.name = name
+        self.products = products
+        self.dependencies = dependencies
+        self.targets = targets
+        _ManifestRecorder.register(self)
+    }
+
+    // MARK: Dependencies
+
+    public struct Dependency: Sendable {
+        public enum Requirement: Sendable {
+            case range(Version, Version)   // lower ..< upper
+            case exact(Version)
+            case branch(String)
+            case revision(String)
+        }
+        enum Kind: Sendable {
+            case path(String)
+            case url(String, Requirement)
+        }
+        let kind: Kind
+
+        /// A package in a local directory.
+        public static func package(path: String) -> Dependency { Dependency(kind: .path(path)) }
+
+        /// Any version from `version` up to, not including, the next major version.
+        public static func package(url: String, from version: Version) -> Dependency {
+            Dependency(kind: .url(url, .range(version, version.nextMajor())))
+        }
+
+        /// Versions in `range` (e.g. "1.2.0"..<"1.5.0").
+        public static func package(url: String, _ range: Range<Version>) -> Dependency {
+            Dependency(kind: .url(url, .range(range.lowerBound, range.upperBound)))
+        }
+
+        /// Versions in a closed range (e.g. "1.2.0"..."1.4.9").
+        public static func package(url: String, _ range: ClosedRange<Version>) -> Dependency {
+            let u = range.upperBound
+            return Dependency(kind: .url(url, .range(range.lowerBound, Version(u.major, u.minor, u.patch + 1))))
+        }
+
+        public static func package(url: String, exact version: Version) -> Dependency {
+            Dependency(kind: .url(url, .exact(version)))
+        }
+
+        public static func package(url: String, branch: String) -> Dependency {
+            Dependency(kind: .url(url, .branch(branch)))
+        }
+
+        public static func package(url: String, revision: String) -> Dependency {
+            Dependency(kind: .url(url, .revision(revision)))
+        }
+
+        /// Any version from `version` up to the next minor version.
+        public static func package(url: String, upToNextMinor version: Version) -> Dependency {
+            Dependency(kind: .url(url, .range(version, version.nextMinor())))
+        }
+    }
+}
+
+// MARK: - Products
+
+public struct Product: Sendable {
+    enum Kind: String, Sendable { case executable, library }
+    let name: String
+    let kind: Kind
+    let targets: [String]
+
+    public enum LibraryType: Sendable { case `static`, dynamic }
+
+    public static func executable(name: String, targets: [String]) -> Product {
+        Product(name: name, kind: .executable, targets: targets)
+    }
+
+    public static func library(name: String, type: LibraryType? = nil, targets: [String]) -> Product {
+        Product(name: name, kind: .library, targets: targets)
+    }
+}
+
+// MARK: - Targets
+
+public struct Target: Sendable {
+    enum Kind: String, Sendable { case regular, executable, test }
+
+    public enum Dependency: Sendable, ExpressibleByStringLiteral {
+        case byName(String)
+        case target(String)
+        case product(String, package: String)
+
+        public init(stringLiteral value: String) { self = .byName(value) }
+
+        public static func target(name: String) -> Dependency { .target(name) }
+        public static func product(name: String, package: String) -> Dependency { .product(name, package: package) }
+    }
+
+    let name: String
+    let kind: Kind
+    let dependencies: [Dependency]
+    let path: String?
+    let exclude: [String]
+
+    public static func target(name: String, dependencies: [Dependency] = [], path: String? = nil,
+                              exclude: [String] = []) -> Target {
+        Target(name: name, kind: .regular, dependencies: dependencies, path: path, exclude: exclude)
+    }
+
+    public static func executableTarget(name: String, dependencies: [Dependency] = [], path: String? = nil,
+                                        exclude: [String] = []) -> Target {
+        Target(name: name, kind: .executable, dependencies: dependencies, path: path, exclude: exclude)
+    }
+
+    public static func testTarget(name: String, dependencies: [Dependency] = [], path: String? = nil,
+                                  exclude: [String] = []) -> Target {
+        Target(name: name, kind: .test, dependencies: dependencies, path: path, exclude: exclude)
+    }
+}
+
+// MARK: - JSON output (read by `mpp pm`)
+
+enum _ManifestRecorder {
+    nonisolated(unsafe) static var package: Package?
+
+    static func register(_ p: Package) {
+        let first = package == nil
+        package = p
+        if first { atexit { _ManifestRecorder.dump() } }
+    }
+
+    static func dump() {
+        guard let p = package else { return }
+        guard let outPath = getenv("MPP_MANIFEST_OUTPUT").map({ String(cString: $0) }) else {
+            print(json(p))
+            return
+        }
+        guard let f = fopen(outPath, "w") else { return }
+        fputs(json(p), f)
+        fclose(f)
+    }
+
+    static func q(_ s: String) -> String {
+        var out = "\""
+        for u in s.unicodeScalars {
+            switch u {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\n": out += "\\n"
+            case "\t": out += "\\t"
+            default:
+                if u.value < 0x20 {
+                    let h = String(u.value, radix: 16)
+                    out += "\\u" + String(repeating: "0", count: 4 - h.count) + h
+                }
+                else { out.unicodeScalars.append(u) }
+            }
+        }
+        return out + "\""
+    }
+
+    static func list(_ items: [String]) -> String { "[" + items.joined(separator: ",") + "]" }
+
+    static func json(_ p: Package) -> String {
+        let products = p.products.map {
+            "{\"name\":\(q($0.name)),\"type\":\(q($0.kind.rawValue)),\"targets\":\(list($0.targets.map(q)))}"
+        }
+        let deps = p.dependencies.map { d -> String in
+            switch d.kind {
+            case .path(let path):
+                return "{\"kind\":\"path\",\"path\":\(q(path))}"
+            case .url(let url, let req):
+                let r: String
+                switch req {
+                case .range(let lo, let hi): r = "{\"type\":\"range\",\"lower\":\(q(lo.description)),\"upper\":\(q(hi.description))}"
+                case .exact(let v): r = "{\"type\":\"exact\",\"version\":\(q(v.description))}"
+                case .branch(let b): r = "{\"type\":\"branch\",\"name\":\(q(b))}"
+                case .revision(let rev): r = "{\"type\":\"revision\",\"id\":\(q(rev))}"
+                }
+                return "{\"kind\":\"url\",\"url\":\(q(url)),\"requirement\":\(r)}"
+            }
+        }
+        let targets = p.targets.map { t -> String in
+            let tdeps = t.dependencies.map { d -> String in
+                switch d {
+                case .byName(let n): return "{\"type\":\"byName\",\"name\":\(q(n))}"
+                case .target(let n): return "{\"type\":\"target\",\"name\":\(q(n))}"
+                case .product(let n, let pkg): return "{\"type\":\"product\",\"name\":\(q(n)),\"package\":\(q(pkg))}"
+                }
+            }
+            return "{\"name\":\(q(t.name)),\"type\":\(q(t.kind.rawValue)),\"dependencies\":\(list(tdeps)),"
+                + "\"path\":\(t.path.map(q) ?? "null"),\"exclude\":\(list(t.exclude.map(q)))}"
+        }
+        return "{\"name\":\(q(p.name)),\"products\":\(list(products)),\"dependencies\":\(list(deps)),\"targets\":\(list(targets))}"
+    }
+}

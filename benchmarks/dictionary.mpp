@@ -1,0 +1,74 @@
+// MppDictionary vs Swift's Dictionary: nanoseconds per lookup.
+//   mpp benchmarks/dictionary.mpp
+//
+// warm: a small table that stays in the L1/L2 cache, looked up over and over.
+// cold: a table much bigger than the CPU cache, looked up at random, so most
+//       lookups wait on main memory.
+import MppKit
+
+func time(_ lookups: Int, _ body: () -> Int) -> (ns: Double, check: Int) {
+    var best = Double.infinity
+    var check = 0
+    for _ in 0 ..< 5 {
+        let t0 = ContinuousClock.now
+        check = body()
+        let d = ContinuousClock.now - t0
+        let s = Double(d.components.seconds) + Double(d.components.attoseconds) * 1e-18
+        best = min(best, s)
+    }
+    return (best * 1e9 / Double(lookups), check)
+}
+
+func row(_ name: String, _ r: (ns: Double, check: Int)) {
+    print(format("  {:<34} {:>7.2f} ns/lookup", name, r.ns))
+}
+
+
+
+func intBench(_ title: String, keys n: Int, lookups q: Int) {
+    var rng = PCG32(seed: 42)
+    print("\(title): \(n) Int keys, \(q) random lookups (half hits)")
+    var swiftDict = [Int: Int](minimumCapacity: n)
+    var mpp = MppDictionary<Int, Int>(minimumCapacity: n)
+    for i in 0 ..< n {
+        let k = i &* 0x9E37_79B9 &+ 17
+        swiftDict[k] = i
+        mpp[k] = i
+    }
+    var queries = [Int](repeating: 0, count: q)
+    for j in 0 ..< q {
+        let i = Int(rng.next() % UInt32(n))
+        queries[j] = j & 1 == 0 ? i &* 0x9E37_79B9 &+ 17 : -i - 1
+    }
+    let a = time(q) { var s = 0; for k in queries { s &+= swiftDict[k] ?? 1 }; return s }
+    let b = time(q) { var s = 0; for k in queries { s &+= mpp[k] ?? 1 }; return s }
+    let c = time(q) { var s = 0; for v in mpp.values(forKeys: queries) { s &+= v ?? 1 }; return s }
+    precondition(a.check == b.check && b.check == c.check)
+    row("Dictionary", a)
+    row("MppDictionary", b)
+    row("MppDictionary.values(forKeys:)", c)
+}
+
+func stringBench(keys n: Int, lookups q: Int) {
+    var rng = PCG32(seed: 7)
+    print("strings: \(n) String keys (8–24 bytes), \(q) random lookups (half hits)")
+    var swiftDict = [String: Int](minimumCapacity: n)
+    var mpp = MppDictionary<String, Int>(minimumCapacity: n)
+    let names = (0 ..< n).map { "user-\($0)-" + String(repeating: "x", count: $0 % 16) }
+    for (i, k) in names.enumerated() { swiftDict[k] = i; mpp[k] = i }
+    var queries = [String]()
+    queries.reserveCapacity(q)
+    for j in 0 ..< q {
+        let i = Int(rng.next() % UInt32(n))
+        queries.append(j & 1 == 0 ? names[i] : "absent-\(i)")
+    }
+    let a = time(q) { var s = 0; for k in queries { s &+= swiftDict[k] ?? 1 }; return s }
+    let b = time(q) { var s = 0; for k in queries { s &+= mpp[k] ?? 1 }; return s }
+    precondition(a.check == b.check)
+    row("Dictionary", a)
+    row("MppDictionary", b)
+}
+
+intBench("warm", keys: 1_000, lookups: 10_000_000)
+intBench("cold", keys: 4_000_000, lookups: 4_000_000)
+stringBench(keys: 100_000, lookups: 2_000_000)

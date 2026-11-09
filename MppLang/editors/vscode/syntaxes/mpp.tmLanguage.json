@@ -1,0 +1,230 @@
+{
+ "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+ "name": "M++",
+ "scopeName": "source.mpp",
+ "fileTypes": [
+  "mpp"
+ ],
+ "patterns": [
+  {
+   "include": "#comments"
+  },
+  {
+   "include": "#strings"
+  },
+  {
+   "include": "#attributes"
+  },
+  {
+   "include": "#directives"
+  },
+  {
+   "include": "#numbers"
+  },
+  {
+   "include": "#declarations"
+  },
+  {
+   "include": "#keywords"
+  },
+  {
+   "include": "#types"
+  },
+  {
+   "include": "#calls"
+  },
+  {
+   "include": "#members"
+  }
+ ],
+ "repository": {
+  "comments": {
+   "patterns": [
+    {
+     "name": "comment.block.documentation.mpp",
+     "begin": "/\\*\\*(?!/)",
+     "end": "\\*/"
+    },
+    {
+     "name": "comment.block.mpp",
+     "begin": "/\\*",
+     "end": "\\*/",
+     "patterns": [
+      {
+       "include": "#comments"
+      }
+     ]
+    },
+    {
+     "name": "comment.line.documentation.mpp",
+     "match": "///.*$"
+    },
+    {
+     "name": "comment.line.double-slash.mpp",
+     "match": "//.*$"
+    }
+   ]
+  },
+  "strings": {
+   "patterns": [
+    {
+     "name": "string.quoted.triple.mpp",
+     "begin": "\"\"\"",
+     "end": "\"\"\"",
+     "patterns": [
+      {
+       "include": "#interpolation"
+      },
+      {
+       "include": "#escapes"
+      }
+     ]
+    },
+    {
+     "name": "string.quoted.double.mpp",
+     "begin": "\"",
+     "end": "\"|$",
+     "patterns": [
+      {
+       "include": "#interpolation"
+      },
+      {
+       "include": "#escapes"
+      }
+     ]
+    }
+   ]
+  },
+  "escapes": {
+   "name": "constant.character.escape.mpp",
+   "match": "\\\\[0\\\\tnr\\\"'']|\\\\u\\{[0-9a-fA-F]{1,8}\\}"
+  },
+  "interpolation": {
+   "name": "meta.embedded.line.mpp",
+   "begin": "\\\\\\(",
+   "end": "\\)",
+   "beginCaptures": {
+    "0": {
+     "name": "punctuation.section.embedded.begin.mpp"
+    }
+   },
+   "endCaptures": {
+    "0": {
+     "name": "punctuation.section.embedded.end.mpp"
+    }
+   },
+   "contentName": "source.mpp",
+   "patterns": [
+    {
+     "include": "$self"
+    }
+   ]
+  },
+  "attributes": {
+   "name": "storage.modifier.attribute.mpp",
+   "match": "@[A-Za-z_][A-Za-z0-9_]*"
+  },
+  "directives": {
+   "name": "keyword.other.directive.mpp",
+   "match": "#[A-Za-z_][A-Za-z0-9_]*"
+  },
+  "numbers": {
+   "name": "constant.numeric.mpp",
+   "match": "\\b(?:0x[0-9A-Fa-f_]+(?:\\.[0-9A-Fa-f_]+)?(?:[pP][-+]?\\d+)?|0b[01_]+|0o[0-7_]+|\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][-+]?\\d+)?)\\b"
+  },
+  "keywords": {
+   "patterns": [
+    {
+     "name": "keyword.other.mpp",
+     "match": "\\b(?:place|unplace|serial|parallel)\\b"
+    },
+    {
+     "name": "storage.type.mpp",
+     "match": "\\b(?:associatedtype|class|deinit|enum|extension|func|import|init|let|operator|protocol|struct|subscript|typealias|var|actor|macro)\\b"
+    },
+    {
+     "name": "storage.modifier.mpp",
+     "match": "\\b(?:public|private|fileprivate|internal|open|package|static|final|lazy|weak|unowned|mutating|nonmutating|override|convenience|required|optional|indirect|dynamic|nonisolated|isolated|consuming|borrowing|inout|some|any|async|throws|rethrows|sending)\\b"
+    },
+    {
+     "name": "keyword.control.mpp",
+     "match": "\\b(?:if|else|guard|switch|case|default|for|in|while|repeat|do|catch|try|throw|return|break|continue|fallthrough|defer|where|await|as|is)\\b"
+    },
+    {
+     "name": "constant.language.mpp",
+     "match": "\\b(?:true|false|nil|self|Self|super)\\b"
+    }
+   ]
+  },
+  "declarations": {
+   "patterns": [
+    {
+     "match": "\\b(func|var|let|case)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+     "captures": {
+      "1": {
+       "name": "storage.type.mpp"
+      },
+      "2": {
+       "name": "entity.name.function.mpp"
+      }
+     }
+    },
+    {
+     "match": "\\b(class|struct|enum|protocol|actor|typealias|extension)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+     "captures": {
+      "1": {
+       "name": "storage.type.mpp"
+      },
+      "2": {
+       "name": "entity.name.type.mpp"
+      }
+     }
+    }
+   ]
+  },
+  "types": {
+   "patterns": [
+    {
+     "name": "support.type.swiftui.mpp",
+     "match": "\\b(?:Alignment|Angle|AngularGradient|Animation|AnyShape|AnyTransition|AnyView|App|AppStorage|ArrangementView|AsyncImage|Axis|Bindable|Binding|Button|ButtonBorderShape|ButtonRole|ButtonSizing|ButtonStyle|ButtonStyleConfiguration|Canvas|Capsule|Circle|Color|ColorPicker|ColorScheme|ConcentricRectangle|ContainerRelativeShape|ContentUnavailableView|ContentView|ControlGroup|ControlGroupStyle|ControlGroupStyleConfiguration|ControlSize|DatePicker|DatePickerStyle|DefaultGlassEffectShape|DisclosureGroup|DisclosureGroupStyle|Divider|DocumentGroup|DynamicTypeSize|DynamicViewContent|Edge|EdgeInsets|EditButton|EditMode|Ellipse|EllipticalGradient|EmptyView|Environment|EnvironmentObject|EnvironmentValues|EquatableView|FetchRequest|FillShapeView|FocusState|FocusedValue|Font|ForEach|Form|FormStyle|FormStyleConfiguration|Gauge|GaugeStyle|GaugeStyleConfiguration|GeometryProxy|GeometryReader|GeometryReader3D|Glass|GlassButtonStyle|GlassEffectContainer|GlassEffectTransition|GlassProminentButtonStyle|Gradient|Grid|GridItem|GridRow|Group|GroupBox|GroupBoxStyle|GroupBoxStyleConfiguration|HSplitView|HStack|HelpLink|HorizontalAlignment|Image|ImageRenderer|ImmersiveSpace|IndexViewStyle|InsettableShape|KeyEquivalent|KeyPress|KeyframeAnimator|Label|LabelStyle|LabelStyleConfiguration|LabeledContent|LabeledContentStyle|LayoutDirection|LazyHGrid|LazyHStack|LazyVGrid|LazyVStack|LinearGradient|Link|List|ListStyle|LocalizedStringKey|Material|Menu|MenuButton|MenuStyle|MenuStyleConfiguration|MeshGradient|ModifiedContent|MultiDatePicker|Namespace|NavigationLink|NavigationPath|NavigationSplitView|NavigationSplitViewStyle|NavigationStack|NavigationView|NewDocumentButton|ObservedObject|OffsetShape|OutlineGroup|PasteButton|Path|PhaseAnimator|Picker|PickerStyle|PreviewProvider|PrimitiveButtonStyle|ProgressView|ProgressViewStyle|ProgressViewStyleConfiguration|RadialGradient|Rectangle|RenameButton|RotatedShape|RoundedCornerStyle|RoundedRectangle|ScaledShape|Scene|SceneStorage|ScrollView|ScrollViewProxy|ScrollViewReader|SearchFieldPlacement|Section|SecureField|Settings|SettingsLink|Shape|ShapeStyle|ShapeView|ShareLink|Slider|SortDescriptor|Spacer|State|StateObject|Stepper|StrokeBorderShapeView|StrokeShapeView|StrokeStyle|SubmitLabel|Subview|SubviewsCollection|Tab|TabView|TabViewStyle|Table|TableColumn|TableStyle|Text|TextAlignment|TextEditor|TextEditorStyle|TextField|TextFieldLink|TextFieldStyle|TimelineView|Toggle|ToggleStyle|ToggleStyleConfiguration|ToolbarItem|ToolbarItemGroup|ToolbarItemPlacement|Transaction|TransformedShape|TupleView|UnevenRoundedRectangle|UnitPoint|VSplitView|VStack|VerticalAlignment|View|ViewBuilder|ViewModifier|ViewThatFits|Visibility|Window|WindowGroup|WindowVisibilityToggle|ZStack)\\b"
+    },
+    {
+     "name": "support.type.mpp",
+     "match": "\\b(?:Int|Int8|Int16|Int32|Int64|UInt|UInt8|UInt16|UInt32|UInt64|Float|Float16|Double|Bool|String|Character|Substring|Array|Dictionary|Set|Optional|Result|Range|ClosedRange|Never|Void|Error|Equatable|Hashable|Comparable|Codable|Sendable|Sequence|Collection|Identifiable|Task|MainActor|UnsafePointer|UnsafeMutablePointer|UnsafeRawPointer|UnsafeMutableRawPointer|UnsafeBufferPointer|UnsafeMutableBufferPointer|Duration|KeyPath|Arena|Pool|Unique|Memory|File|FS|BufferedWriter|TokenReader|ByteWriter|ByteReader|MappedFile|Bits|MppDictionary|MppSet|Matrix|JSON|Parallel|RingBuffer|BitSet|SmallArray|PCG32|TokenFile|TokenWriter|Tensor|Accelarate|ModelContainer|ModelContext|ModelConfiguration|FetchDescriptor|Predicate|PersistentModel|Card|MppButton|MppTextField|Bar|Pill)\\b"
+    },
+    {
+     "name": "entity.name.type.mpp",
+     "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+    }
+   ]
+  },
+  "calls": {
+   "patterns": [
+    {
+     "match": "\\.(accessibilityAction|accessibilityAddTraits|accessibilityElement|accessibilityHidden|accessibilityHint|accessibilityIdentifier|accessibilityLabel|accessibilityRemoveTraits|accessibilitySortPriority|accessibilityValue|accessoryWidgetGroupStyle|alert|alignmentGuide|allowedDynamicRange|allowsHitTesting|allowsTightening|allowsWindowActivationEvents|alternatingRowBackgrounds|animation|appEntityIdentifier|appEntityUIElements|arrangementViewStyle|aspectRatio|aspectRatio3D|asyncImageURLSession|attributedTextFormattingDefinition|autocorrectionDisabled|background|backgroundExtensionEffect|backgroundStyle|badge|baselineOffset|blendMode|blur|bold|border|breakthroughEffect|brightness|buttonBorderShape|buttonRepeatBehavior|buttonSizing|buttonStyle|cameraAnchor|clipShape|clipped|colorEffect|colorInvert|colorMultiply|compositingGroup|confirmationDialog|containerBackground|containerCornerOffset|containerRelativeFrame|containerShape|containerValue|contentCaptureProtected|contentMargins|contentShape|contentTransition|contextMenu|contrast|controlGroupStyle|controlSize|controlWidgetActionHint|controlWidgetStatus|coordinateSpace|copyable|cuttable|dataDetection|datePickerStyle|defaultFocus|defaultHoverEffect|defaultScrollAnchor|defaultWheelPickerItemHeight|defersSystemGestures|deleteDisabled|digitalCrownAccessory|digitalCrownRotation|disabled|disclosureGroupStyle|distortionEffect|dragConfiguration|dragContainer|dragContainerSelection|dragPreviewsFormation|draggable|drawingGroup|dropConfiguration|dropDestination|dropPreviewsFormation|dynamicIsland|dynamicTypeSize|environment|environmentObject|equatable|exportableToServices|exportsItemProviders|fileExporter|fileImporter|fileMover|findDisabled|findNavigator|fixedSize|flipsForRightToLeftLayoutDirection|focusEffectDisabled|focusScope|focusSection|focusable|focused|focusedObject|focusedSceneObject|focusedSceneValue|focusedValue|font|fontDesign|fontWeight|fontWidth|foregroundColor|foregroundStyle|formStyle|frame|fullScreenCover|gaugeStyle|geometryGroup|gesture|glassBackgroundEffect|glassEffect|glassEffectID|glassEffectTransition|glassEffectUnion|grayscale|gridCellAnchor|gridCellColumns|gridCellUnsizedAxes|gridColumnAlignment|groupBoxStyle|handGestureShortcut|handPointerBehavior|handlesExternalEvents|handlesGameControllerEvents|headerProminence|help|hidden|highPriorityGesture|horizontalRadioGroupLayout|hoverEffect|hoverEffectDisabled|hoverEffectGroup|hueRotation|id|ignoresSafeArea|imageScale|immersiveEnvironmentPicker|importableFromServices|importsItemProviders|indexViewStyle|inspector|interactionActivityTrackingTag|interactive|interactiveDismissDisabled|invalidatableContent|italic|itemProvider|kerning|keyboardShortcut|keyboardType|keyframeAnimator|labelIconToTitleSpacing|labelReservedIconWidth|labelStyle|labeledContentStyle|labelsHidden|labelsVisibility|layerEffect|layoutDirectionBehavior|layoutPriority|layoutValue|lineHeight|lineLimit|lineSpacing|listItemTint|listRowBackground|listRowHoverEffect|listRowHoverEffectDisabled|listRowInsets|listRowSeparator|listRowSeparatorTint|listRowSpacing|listSectionIndexVisibility|listSectionMargins|listSectionSeparator|listSectionSeparatorTint|listSectionSpacing|listStyle|luminanceToAlpha|manipulable|manipulationGesture|mask|matchedGeometryEffect|matchedTransitionSource|materialActiveAppearance|menuActionDismissBehavior|menuIndicator|menuOrder|menuStyle|minimumScaleFactor|modelContainer|modelContext|modifierKeyAlternate|monospaced|monospacedDigit|moveDisabled|multilineTextAlignment|navigationBarBackButtonHidden|navigationBarTitleDisplayMode|navigationDestination|navigationSplitViewStyle|navigationSubtitle|navigationTitle|offset|onAppIntentExecution|onAppear|onCameraCaptureEvent|onChange|onCommand|onContinueUserActivity|onContinuousHover|onCopyCommand|onCutCommand|onDeleteCommand|onDisappear|onDrag|onDragSessionUpdated|onDrop|onDropSessionUpdated|onExitCommand|onGeometryChange|onGeometryChange3D|onHingeChange|onHover|onImmersionChange|onInteractiveResizeChange|onKeyPress|onLongPressGesture|onLongTouchGesture|onModifierKeysChanged|onMoveCommand|onOpenURL|onPasteCommand|onPencilDoubleTap|onPencilSqueeze|onPlayPauseCommand|onPreferenceChange|onReceive|onScrollGeometryChange|onScrollPhaseChange|onScrollTargetVisibilityChange|onScrollVisibilityChange|onSubmit|onTapGesture|onVolumeViewpointChange|onWorldRecenter|opacity|overlay|overlayArrangementEdge|padding|padding3D|pageCommand|paletteSelectionEffect|pasteDestination|persistentSystemOverlays|perspectiveRotationEffect|phaseAnimator|pickerStyle|pointerStyle|pointerVisibility|popover|position|preference|preferredColorScheme|preferredSurroundingsEffect|preferredWindowClippingMargins|prefersDefaultFocus|presentationBackground|presentationCornerRadius|presentationDetents|presentationDragIndicator|presentedWindowStyle|presentedWindowToolbarStyle|privacySensitive|progressViewStyle|projectionEffect|redacted|refreshable|renameAction|reorderContainer|replaceDisabled|rotation3DEffect|rotation3DLayout|rotationEffect|safeAreaBar|safeAreaInset|safeAreaPadding|saturation|scaleEffect|scaledToFill|scaledToFill3D|scaledToFit|scaledToFit3D|scenePadding|scrollBounceBehavior|scrollClipDisabled|scrollContentBackground|scrollDisabled|scrollDismissesKeyboard|scrollIndicators|scrollIndicatorsFlash|scrollInputBehavior|scrollPosition|scrollTargetBehavior|scrollTargetLayout|scrollTransition|searchFocused|searchScopes|searchSuggestions|searchable|selectionDisabled|sensoryFeedback|shadow|sheet|shortcutsLinkStyle|signInWithAppleButtonStyle|simultaneousGesture|siriTipViewStyle|sliderThumbVisibility|spatialOverlay|spatialOverlayPreferenceValue|splitArrangementFixedLayoutSize|splitArrangementLayoutRatio|splitArrangementLayoutSize|springLoadingBehavior|strikethrough|submitLabel|submitScope|supportedVolumeViewpoints|swipeActions|swipeActionsContainer|symbolColorRenderingMode|symbolEffect|symbolEffectsRemoved|symbolRenderingMode|symbolVariableValueMode|symbolVariant|tabItem|tabViewStyle|tableColumnHeaders|tableStyle|tag|task|textCase|textContentType|textEditorStyle|textFieldStyle|textInputAutocapitalization|textInputBorderShape|textInputCompletion|textInputFormattingControlVisibility|textInputSuggestions|textRenderer|textScale|textSelection|textSelectionAffinity|tint|toggleStyle|toolbar|toolbarBackground|toolbarColorScheme|toolbarRole|toolbarTitleDisplayMode|toolbarVisibility|tracking|transaction|transform3DEffect|transformEffect|transition|truncationMode|typeSelectEquivalent|typesettingLanguage|underline|unredacted|upperLimbVisibility|userActivity|visualEffect|visualEffect3D|volumeBaseplateVisibility|widgetAccentable|widgetCurvesContent|widgetLabel|widgetURL|windowDismissBehavior|windowFullScreenBehavior|windowMinimizeBehavior|windowResizeAnchor|windowResizeBehavior|windowToolbarFullScreenVisibility|writingDirection|writingToolsAffordanceVisibility|writingToolsBehavior|zIndex)\\b",
+     "captures": {
+      "1": {
+       "name": "support.function.swiftui.mpp"
+      }
+     }
+    },
+    {
+     "name": "support.function.mpp",
+     "match": "\\b(?:print|debugPrint|dump|min|max|abs|zip|stride|precondition|preconditionFailure|assert|fatalError|sqrt|exp|log|sin|cos|pow|app|format|println)\\b(?=\\s*\\()"
+    },
+    {
+     "name": "entity.name.function.call.mpp",
+     "match": "\\b[a-z_][A-Za-z0-9_]*(?=\\s*\\()"
+    }
+   ]
+  },
+  "members": {
+   "match": "\\.([a-z_][A-Za-z0-9_]*)",
+   "captures": {
+    "1": {
+     "name": "variable.other.member.mpp"
+    }
+   }
+  }
+ }
+}

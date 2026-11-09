@@ -1,0 +1,276 @@
+// MppUI engine — Liquid Glass, rendered with Metallic shaders.
+//
+// The lens is a port of liquidGL's fragment shader (naughtyduk/liquidGL,
+// MIT License, Copyright (c) NaughtyDuk; https://github.com/naughtyduk/liquidGL):
+//   • a rounded-rect lens; inside a bevel band (bevelWidth × the shorter
+//     side) the backdrop is offset along the edge normal by
+//     edge · refraction + edge¹⁰ · bevelDepth, with corner-aware normals and
+//     the offset faded out toward the centre
+//   • frost: liquidGL averages 16 random samples within frost × 4 texels;
+//     here the backdrop is Gaussian-blurred once (σ = half that radius, the
+//     same spread) and sampled once: smoother, and the cost doesn't grow with
+//     the radius
+//   • chromatic aberration: red and blue pulled either side of the offset
+//   • a multiply tint, two drifting specular lights, magnify and tilt
+//   • a soft drop shadow outside the lens
+// Like liquidGL it samples a snapshot of the page, but only the part the lens
+// can reach (its bevel, refraction, tilt and magnification bound how far a
+// sample can land). It runs on the CPU through Metallic — the fragment shader
+// is compiled to C++ — so it looks the same on every machine, no GPU required.
+
+import Metallic
+
+/// Everything the lens can be told (SwiftUI's `Glass` maps onto it).
+/// Defaults are liquidGL's own option defaults.
+public struct MppUIGlass: Sendable {
+    public var refraction: Float = 0.01        // base offset across the pane (0–1, of the window)
+    public var aberration: Float = 0           // chromatic aberration (0–1)
+    public var bevelDepth: Float = 0.08        // extra offset at the edge (0–1)
+    public var bevelWidth: Float = 0.15        // bevel band, fraction of the shorter side (0–1)
+    public var frost: Float = 0                // blur radius in points; 0 = crystal clear
+    public var specular = true                 // drifting light highlights
+    public var shadow = true                   // soft drop shadow
+    public var magnify: Float = 1              // 1 = none (0.001–3)
+    public var tiltX: Float = 0, tiltY: Float = 0   // degrees
+    public var tint: UInt32 = 0                // 0xAARRGGBB: content × colour, alpha = strength
+    public var opacity: Float = 1
+    public init() {}
+}
+
+// MARK: - Shaders
+
+struct LensUniforms {
+    var boxOrigin: float2      // lens top-left (window px)
+    var boxSize: float2        // lens size (px)
+    var radius: Float
+    var page: float2           // window size (px)
+    var snapScale: float2      // window UV -> page texture UV (the texture holds only the
+    var snapBias: float2       // part of the window a sample can reach)
+    var regionOrigin: float2   // the drawn quad (lens + shadow padding)
+    var regionSize: float2
+    var refraction: Float, aberration: Float, bevelDepth: Float, bevelWidth: Float
+    var specular: Bool
+    var light1: float2         // the two drifting specular lights (lens UV)
+    var light2: float2
+    var shadow: Float          // shadow strength (0 = none)
+    var shadowSpread: Float
+    var tiltOffset: float2     // window UV
+    var magnify: Float
+    var tint: float4
+    var opacity: Float
+}
+
+struct LensVarying {
+    var position: float4 [[position]]
+    var pagePx: float2         // window pixel this fragment covers
+}
+
+@vertex func lensVertex(_ id: uint [[vertex_id]], _ u: LensUniforms [[buffer(0)]]) -> LensVarying {
+    // The quad over the region, as a triangle strip; region pixels map 1:1 to the target.
+    let corner = float2(id & 1 == 0 ? 0 : 1, id & 2 == 0 ? 0 : 1)
+    let local = corner * u.regionSize
+    let ndc = float2(local.x / u.regionSize.x * 2 - 1, 1 - local.y / u.regionSize.y * 2)
+    return LensVarying(position: float4(ndc, 0, 1), pagePx: u.regionOrigin + local)
+}
+
+func udRoundBox(_ p: float2, _ b: float2, _ r: Float) -> Float { length(max(abs(p) - b + r, 0)) - r }
+
+func cornerNormal(_ p: float2, _ b: float2, _ r: Float, _ fallback: float2) -> float2 {
+    let q = abs(p) - b + r
+    let m = max(q, 0)
+    let l = length(m)
+    if l <= 0 { return fallback }
+    let w = smoothstep(0, max(r * 0.5, 1), min(m.x, m.y))
+    if w <= 0 { return fallback }
+    let s = float2(p.x < 0 ? -1 : 1, p.y < 0 ? -1 : 1)
+    return normalize(mix(fallback, s * (m / l), w))
+}
+
+/// The page at window UV `uv` (the texture holds only the snapshot region).
+func pageAt(_ page: texture2d<float>, _ s: sampler, _ u: LensUniforms, _ uv: float2) -> float4 {
+    page.sample(s, uv * u.snapScale + u.snapBias)
+}
+
+@fragment func lensFragment(_ v: LensVarying [[stage_in]],
+                            _ u: LensUniforms [[buffer(0)]],
+                            _ page: texture2d<float> [[texture(0)]],
+                            _ s: sampler [[sampler(0)]]) -> float4 {
+    let lensUV = (v.pagePx - u.boxOrigin) / u.boxSize
+    let pPx = (lensUV - 0.5) * u.boxSize
+    let b = 0.5 * u.boxSize
+    let p = pPx / u.boxSize.y
+    let dmask = udRoundBox(pPx, b, u.radius)
+    let inShape = 1 - smoothstep(-0.5, 0.5, dmask)
+
+    // Shadow outside the lens: a soft, slightly lowered copy of its shape.
+    var shadowAlpha: Float = 0
+    if u.shadow > 0 && inShape < 1 {
+        let d = udRoundBox(pPx - float2(0, u.shadowSpread * 0.3), b, u.radius)
+        shadowAlpha = (1 - smoothstep(-u.shadowSpread, u.shadowSpread, d)) * u.shadow * (1 - inShape)
+    }
+    if inShape <= 0 { return float4(0, 0, 0, shadowAlpha * u.opacity) }
+
+    // Edge factor: 1 at the rim, 0 past the bevel band.
+    let bevelPx = u.bevelWidth * min(u.boxSize.x, u.boxSize.y)
+    let edge = 1 - smoothstep(0, bevelPx, -dmask)
+    let e2 = edge * edge
+    let e8 = e2 * e2 * e2 * e2
+    let offsetAmount = edge * u.refraction + e8 * e2 * u.bevelDepth          // edge · refraction + edge¹⁰ · bevelDepth
+    var offset = float2(0)                                                  // window UV
+    if offsetAmount > 0 {
+        let centreBlend = smoothstep(0.15, 0.45, length(p))
+        let direction = cornerNormal(pPx, b, u.radius, normalize(p + float2(0.000001)))
+        offset = direction * offsetAmount * centreBlend
+    }
+
+    let localUV = (lensUV - 0.5) / u.magnify + 0.5
+    let mapped = (u.boxOrigin + localUV * u.boxSize) / u.page
+    let refracted = mapped + offset - u.tiltOffset
+    let oob = max(max(-refracted.x, refracted.x - 1), max(-refracted.y, refracted.y - 1))
+    let sampleUV = mix(mapped, refracted, 1 - smoothstep(0, 0.01, oob))
+
+    // The page texture is already filtered (liquidGL's five-tap softening,
+    // or the frost blur), so one sample does it — three with aberration.
+    let chroma = offset * u.aberration
+    var color = pageAt(page, s, u, sampleUV)
+    if u.aberration > 0 {
+        color.x = pageAt(page, s, u, sampleUV - chroma).x
+        color.z = pageAt(page, s, u, sampleUV + chroma).z
+    }
+    if color.w < 0.1 { color = pageAt(page, s, u, mapped) }
+
+    color.xyz = mix(color.xyz, color.xyz * u.tint.xyz, u.tint.w)
+    if u.specular {
+        let q = (pPx + b) / u.boxSize
+        let h = smoothstep(0.4, 0, distance(q, u.light1)) * 0.1 + smoothstep(0.5, 0, distance(q, u.light2)) * 0.08
+        color.xyz += h
+    }
+    color.xyz *= inShape
+    color.w = color.w * inShape + shadowAlpha
+    return float4(color.xyz, color.w * u.opacity)
+}
+
+// MARK: - Pipeline
+
+final class _GlassRenderer: @unchecked Sendable {
+    let device = MetallicCreateSystemDefaultDevice()!
+    lazy var queue = device.makeCommandQueue()!
+    lazy var pipeline: MetallicRenderPipelineState = {
+        var d = MetallicRenderPipelineDescriptor()
+        d.vertexFunction = lensVertexFunction
+        d.fragmentFunction = lensFragmentFunction
+        d.colorAttachments[0].isBlendingEnabled = false     // composited onto the window afterwards
+        return try! device.makeRenderPipelineState(descriptor: d)
+    }()
+    var page: MetallicTexture? = nil
+    var target: MetallicTexture? = nil
+    var start: Double = -1
+
+    func texture(_ t: inout MetallicTexture?, _ w: Int, _ h: Int) -> MetallicTexture {
+        if let existing = t, existing.width == w, existing.height == h { return existing }
+        let d = MetallicTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: w, height: h, mipmapped: false)
+        t = device.makeTexture(descriptor: d)!
+        return t!
+    }
+
+    /// Seconds since the first lens was drawn (0 when headless, so renders repeat exactly).
+    func time() -> Float {
+        if _g.headless { return 0 }
+        var ts = timespec()
+        clock_gettime(CLOCK_MONOTONIC, &ts)
+        let now = Double(ts.tv_sec) + Double(ts.tv_nsec) / 1e9
+        if start < 0 { start = now }
+        return Float(now - start)
+    }
+}
+
+let _glass = _GlassRenderer()
+
+/// Liquid Glass over (x, y, w, h) with corner radius `radius`, refracting
+/// everything drawn so far.
+public func mppui_glass_effect(_ x: Float, _ y: Float, _ w: Float, _ h: Float, _ radius: Float, _ g: MppUIGlass) {
+    if !(w > 0 && h > 0) { return }
+    let s = _g.scale
+    let spread = 10 * s
+    let box = _deviceBox(x, y, w, h, pad: spread * 2 + 1)
+    let rw = box.x1 - box.x0, rh = box.y1 - box.y0
+    if rw <= 0 || rh <= 0 { return }
+    let r = _deviceRRect(x, y, w, h, radius)
+    let W = _g.width, H = _g.height
+    let magnify = min(max(g.magnify, 0.001), 3)
+    let frostRadius = max(g.frost, 0) * s * 4
+    let tiltOffset = float2(tan(g.tiltY * .pi / 180), -tan(g.tiltX * .pi / 180)) * 0.05
+
+    // The part of the window a sample can land in: the lens, widened by its
+    // magnification, the largest offset (bevel + refraction, with aberration),
+    // the tilt, and the blur's reach.
+    let reach = max(g.refraction, 0) + max(g.bevelDepth, 0)
+    let spill = (1 + max(g.aberration, 0)) * reach
+    let grow = max(0, 1 / magnify - 1) * 0.5
+    let blurPad = frostRadius * 1.5 + 3
+    let padX = Int((spill + abs(tiltOffset.x)) * Float(W) + grow * r.hw * 2 + blurPad) + 2
+    let padY = Int((spill + abs(tiltOffset.y)) * Float(H) + grow * r.hh * 2 + blurPad) + 2
+    let lx = Int((r.cx - r.hw).rounded(.down)), ly = Int((r.cy - r.hh).rounded(.down))
+    let sx0 = max(0, lx - padX), sy0 = max(0, ly - padY)
+    let sx1 = min(W, Int((r.cx + r.hw).rounded(.up)) + padX), sy1 = min(H, Int((r.cy + r.hh).rounded(.up)) + padY)
+    if sx1 <= sx0 || sy1 <= sy0 { return }
+    let sw = sx1 - sx0, sh = sy1 - sy0
+
+    // Frost blurs the snapshot; a wide blur loses nothing at half resolution.
+    let half = frostRadius >= 4
+    let tw = half ? (sw + 1) / 2 : sw, th = half ? (sh + 1) / 2 : sh
+    let extentW = half ? 2 * tw : sw, extentH = half ? 2 * th : sh          // window px the texture spans
+    let page = _glass.texture(&_glass.page, tw, th), target = _glass.texture(&_glass.target, rw, rh)
+    if half { page.replaceHalf(fromARGB: _g.pixels + sy0 * W + sx0, bytesPerRow: W * 4, width: sw, height: sh) }
+    else { page.replace(region: 0, 0, sw, sh, fromARGB: _g.pixels + sy0 * W + sx0, bytesPerRow: W * 4) }
+    let origin = _g.pixels + box.y0 * W + box.x0
+
+    let tintA = Float((g.tint >> 24) & 255) / 255
+    let tint = float4(Float((g.tint >> 16) & 255) / 255, Float((g.tint >> 8) & 255) / 255, Float(g.tint & 255) / 255, tintA)
+    let t = _glass.time()
+    let u = LensUniforms(boxOrigin: float2(r.cx - r.hw, r.cy - r.hh), boxSize: float2(r.hw * 2, r.hh * 2), radius: r.r,
+                         page: float2(Float(W), Float(H)),
+                         snapScale: float2(Float(W) / Float(extentW), Float(H) / Float(extentH)),
+                         snapBias: float2(-Float(sx0) / Float(extentW), -Float(sy0) / Float(extentH)),
+                         regionOrigin: float2(Float(box.x0), Float(box.y0)), regionSize: float2(Float(rw), Float(rh)),
+                         refraction: g.refraction, aberration: g.aberration, bevelDepth: g.bevelDepth,
+                         bevelWidth: g.bevelWidth, specular: g.specular,
+                         light1: float2(sin(t * 0.2), cos(t * 0.3)) * 0.6 + 0.5,
+                         light2: float2(sin(t * -0.4 + 1.5), cos(t * 0.25 - 0.5)) * 0.6 + 0.5,
+                         shadow: g.shadow ? 0.25 : 0, shadowSpread: spread, tiltOffset: tiltOffset,
+                         magnify: magnify, tint: tint, opacity: g.opacity * _opacity)
+    let cb = _glass.queue.makeCommandBuffer()!
+    if frostRadius > 0.6 { MetallicGaussianBlur(sigma: frostRadius / (half ? 4 : 2)).encode(commandBuffer: cb, inPlaceTexture: page) }
+    else { MetallicCrossAverage().encode(commandBuffer: cb, inPlaceTexture: page) }
+    var pass = MetallicRenderPassDescriptor()
+    pass.colorAttachments[0].texture = target
+    pass.colorAttachments[0].loadAction = .clear
+    pass.colorAttachments[0].clearColor = MetallicClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+    let re = cb.makeRenderCommandEncoder(descriptor: pass)!
+    re.setRenderPipelineState(_glass.pipeline)
+    re.setVertexBytes(u, index: 0)
+    re.setFragmentBytes(u, index: 0)
+    re.setFragmentTexture(page, index: 0)
+    re.setFragmentSamplerState(sampler(filter: .linear, address: .clamp_to_edge), index: 0)
+    re.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+    re.endEncoding()
+    cb.commit()
+    if let error = cb.error {
+        _g.error = "Liquid Glass: \(error)"
+        let message = "MppUI: Liquid Glass failed: \(error)\n"
+        _ = message.withCString { write(2, $0, strlen($0)) }
+        return
+    }
+    if let path = _env("MPP_GLASS_DEBUG") { _ = target.savePNG(path) }
+    // Composite: source-over with the lens's alpha.
+    target.getARGB(into: UnsafeMutablePointer(mutating: origin), bytesPerRow: W * 4, region: 0, 0, rw, rh, blend: true)
+}
+
+/// The earlier API: a tint colour (its alpha = strength) and "interactive".
+public func mppui_glass(_ x: Float, _ y: Float, _ w: Float, _ h: Float, _ radius: Float, _ tint: UInt32, _ interactive: Int32) {
+    var g = MppUIGlass()
+    g.frost = 2                                  // liquidGL's demo default: a little frost
+    g.tint = tint
+    g.specular = interactive != 0
+    mppui_glass_effect(x, y, w, h, radius, g)
+}

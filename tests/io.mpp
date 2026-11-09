@@ -1,0 +1,43 @@
+// Core I/O features. Exits non-zero on failure.
+let dir = "/tmp/mpp-io-test-\(CommandLine.arguments.count)"
+try FS.makeDirectory(dir)
+let path = dir + "/a.txt"
+
+try FS.write(path, "one\r\ntwo\nthree")          // CRLF and no trailing newline
+var lines: [String] = []
+try FS.forEachLine(path) { lines.append($0) }
+precondition(lines == ["one", "two", "three"], "\(lines)")
+
+try FS.append(path, "\nfour")
+let text = try FS.read(path), size = try FS.size(path)
+precondition(text.hasSuffix("four") && size == 19)
+
+// Big line (bigger than the reader's buffer) survives intact.
+let big = String(repeating: "x", count: 200_000)
+try FS.write(path, big + "\nend\n")
+lines = []
+try FS.forEachLine(path) { lines.append($0) }
+precondition(lines.count == 2 && lines[0].count == 200_000 && lines[1] == "end")
+
+// createNew refuses to clobber.
+do { _ = try File(path, .createNew); preconditionFailure("should have thrown") }
+catch { precondition(error.isAlreadyExists) }
+
+// Binary round trip.
+var w = ByteWriter()
+for i in 0..<1000 { w.write(Int64(i) * -7, i % 2 == 0 ? .big : .little) }
+var r = ByteReader(w.bytes)
+for i in 0..<1000 {
+    let v = try r.read(Int64.self, i % 2 == 0 ? .big : .little)
+    precondition(v == Int64(i) * -7)
+}
+precondition(r.isAtEnd)
+
+// Empty file maps fine.
+try FS.write(path, "")
+let m = try MappedFile(path)
+precondition(m.count == 0)
+
+try FS.remove(path)
+precondition(!FS.exists(path))
+print("io: ok")

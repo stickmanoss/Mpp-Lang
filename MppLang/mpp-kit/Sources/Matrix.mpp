@@ -1,0 +1,328 @@
+// MppKit — Matrix: Eigen-style dense linear algebra.
+//
+//   let a: Mat = [[1, 2], [3, 4]]
+//   let b = Mat.identity(2)
+//   let c = a * b + 0.5 * a.transposed     // * is matrix product, as in Eigen
+//   let x = try a.solve([[5], [6]])        // LU with partial pivoting
+//   let d = a.hadamard(b)                  // element-wise product (Eigen: cwiseProduct)
+//
+// Storage is one contiguous row-major array. The product kernel streams
+// rows (i-k-j order, so the inner loop vectorizes), blocks for cache, and
+// splits large products across cores.
+
+public protocol MatrixScalar: BinaryFloatingPoint, SIMDScalar, Sendable, LosslessStringConvertible, Codable {}
+extension Double: MatrixScalar {}
+extension Float: MatrixScalar {}
+
+public typealias Mat = Matrix<Double>
+public typealias MatF = Matrix<Float>
+
+public struct MatrixError: Error, CustomStringConvertible, Sendable {
+    public let description: String
+    public init(_ d: String) { description = d }
+}
+
+public struct Matrix<T: MatrixScalar>: Equatable, Sendable, CustomStringConvertible, ExpressibleByArrayLiteral {
+    public let rows: Int
+    public let cols: Int
+    /// Row-major elements: element (i, j) is storage[i * cols + j].
+    public var storage: [T]
+
+    // MARK: Construction
+
+    @inlinable
+    public init(rows: Int, cols: Int, repeating value: T = 0) {
+        precondition(rows >= 0 && cols >= 0, "Matrix: negative shape")
+        self.rows = rows; self.cols = cols
+        storage = [T](repeating: value, count: rows * cols)
+    }
+
+    @inlinable
+    public init(rows: Int, cols: Int, storage: [T]) {
+        precondition(storage.count == rows * cols, "Matrix: \(storage.count) elements for \(rows)x\(cols)")
+        self.rows = rows; self.cols = cols; self.storage = storage
+    }
+
+    @inlinable
+    public init(rows: Int, cols: Int, _ element: (Int, Int) -> T) {
+        self.rows = rows; self.cols = cols
+        var s = [T]()
+        s.reserveCapacity(rows * cols)
+        for i in 0 ..< rows { for j in 0 ..< cols { s.append(element(i, j)) } }
+        storage = s
+    }
+
+    public init(_ rowsArray: [[T]]) {
+        let r = rowsArray.count, c = rowsArray.first?.count ?? 0
+        precondition(rowsArray.allSatisfy { $0.count == c }, "Matrix: rows have different lengths")
+        self.init(rows: r, cols: c, storage: rowsArray.flatMap { $0 })
+    }
+
+    public init(arrayLiteral elements: [T]...) { self.init(elements) }
+
+    /// A column vector (n x 1).
+    public init(column: [T]) { self.init(rows: column.count, cols: 1, storage: column) }
+    /// A row vector (1 x n).
+    public init(row: [T]) { self.init(rows: 1, cols: row.count, storage: row) }
+
+    public static func zeros(_ rows: Int, _ cols: Int) -> Matrix { Matrix(rows: rows, cols: cols) }
+    public static func ones(_ rows: Int, _ cols: Int) -> Matrix { Matrix(rows: rows, cols: cols, repeating: 1) }
+    public static func identity(_ n: Int) -> Matrix { Matrix(rows: n, cols: n) { $0 == $1 ? 1 : 0 } }
+
+    /// Uniform random entries in `range`.
+    public static func random<G: RandomNumberGenerator>(_ rows: Int, _ cols: Int, in range: ClosedRange<T> = -1 ... 1,
+                                                        using rng: inout G) -> Matrix
+        where T.RawSignificand: FixedWidthInteger {
+        Matrix(rows: rows, cols: cols, storage: (0 ..< rows * cols).map { _ in T.random(in: range, using: &rng) })
+    }
+
+    // MARK: Access
+
+    @inlinable public var shape: (rows: Int, cols: Int) { (rows, cols) }
+    @inlinable public var count: Int { storage.count }
+    @inlinable public var isSquare: Bool { rows == cols }
+
+    @inlinable
+    public subscript(i: Int, j: Int) -> T {
+        get {
+            precondition(i >= 0 && i < rows && j >= 0 && j < cols, "Matrix: index (\(i), \(j)) out of \(rows)x\(cols)")
+            return storage[i &* cols &+ j]
+        }
+        set {
+            precondition(i >= 0 && i < rows && j >= 0 && j < cols, "Matrix: index (\(i), \(j)) out of \(rows)x\(cols)")
+            storage[i &* cols &+ j] = newValue
+        }
+    }
+
+    public func row(_ i: Int) -> [T] { Array(storage[i * cols ..< (i + 1) * cols]) }
+    public func column(_ j: Int) -> [T] { (0 ..< rows).map { storage[$0 * cols + j] } }
+
+    /// Rows `r` and columns `c` as a new matrix (Eigen: block()).
+    public func block(rows r: Range<Int>, cols c: Range<Int>) -> Matrix {
+        Matrix(rows: r.count, cols: c.count) { self[r.lowerBound + $0, c.lowerBound + $1] }
+    }
+
+    /// Same elements, new shape (row-major order is kept).
+    public func reshaped(_ rows: Int, _ cols: Int) -> Matrix { Matrix(rows: rows, cols: cols, storage: storage) }
+
+    // MARK: Element-wise
+
+    @inlinable
+    public func map(_ f: (T) -> T) -> Matrix { Matrix(rows: rows, cols: cols, storage: storage.map(f)) }
+
+    @inlinable
+    public func zipMap(_ other: Matrix, _ f: (T, T) -> T) -> Matrix {
+        precondition(rows == other.rows && cols == other.cols,
+                     "Matrix: shape mismatch \(rows)x\(cols) vs \(other.rows)x\(other.cols)")
+        var out = storage
+        out.withUnsafeMutableBufferPointer { o in
+            other.storage.withUnsafeBufferPointer { b in
+                for k in 0 ..< o.count { o[k] = f(o[k], b[k]) }
+            }
+        }
+        return Matrix(rows: rows, cols: cols, storage: out)
+    }
+
+    /// Element-wise product (Eigen: cwiseProduct).
+    @inlinable public func hadamard(_ other: Matrix) -> Matrix { zipMap(other, *) }
+
+    @inlinable public static func + (a: Matrix, b: Matrix) -> Matrix { a.zipMap(b, +) }
+    @inlinable public static func - (a: Matrix, b: Matrix) -> Matrix { a.zipMap(b, -) }
+    @inlinable public static prefix func - (a: Matrix) -> Matrix { a.map { -$0 } }
+    @inlinable public static func * (s: T, a: Matrix) -> Matrix { a.map { s * $0 } }
+    @inlinable public static func * (a: Matrix, s: T) -> Matrix { a.map { $0 * s } }
+    @inlinable public static func / (a: Matrix, s: T) -> Matrix { a.map { $0 / s } }
+    @inlinable public static func += (a: inout Matrix, b: Matrix) { a = a + b }
+    @inlinable public static func -= (a: inout Matrix, b: Matrix) { a = a - b }
+    @inlinable public static func *= (a: inout Matrix, s: T) { a = a * s }
+
+    /// Adds `row` (1 x cols) to every row (broadcasting, like NumPy/Eigen rowwise()).
+    public func addingRow(_ row: Matrix) -> Matrix {
+        precondition(row.rows == 1 && row.cols == cols, "Matrix: broadcast row must be 1x\(cols)")
+        var out = storage
+        for i in 0 ..< rows { for j in 0 ..< cols { out[i * cols + j] += row.storage[j] } }
+        return Matrix(rows: rows, cols: cols, storage: out)
+    }
+
+    // MARK: Reductions
+
+    public var sum: T { storage.reduce(0, +) }
+    public var mean: T { count == 0 ? 0 : sum / T(count) }
+    public var max: T? { storage.max() }
+    public var min: T? { storage.min() }
+    /// Frobenius norm.
+    public var norm: T { storage.reduce(0) { $0 + $1 * $1 }.squareRoot() }
+    /// Sum of each column, as a 1 x cols row.
+    public var columnSums: Matrix {
+        var out = [T](repeating: 0, count: cols)
+        for i in 0 ..< rows { for j in 0 ..< cols { out[j] += storage[i * cols + j] } }
+        return Matrix(row: out)
+    }
+    /// Sum of each row, as a rows x 1 column.
+    public var rowSums: Matrix { Matrix(column: (0 ..< rows).map { i in storage[i * cols ..< (i + 1) * cols].reduce(0, +) }) }
+    /// Index of the largest element in each row.
+    public var rowArgmax: [Int] {
+        (0 ..< rows).map { i in
+            var best = 0
+            for j in 1 ..< Swift.max(cols, 1) where storage[i * cols + j] > storage[i * cols + best] { best = j }
+            return best
+        }
+    }
+
+    /// Dot product of two vectors (any shapes with the same element count).
+    public func dot(_ other: Matrix) -> T {
+        precondition(count == other.count, "Matrix.dot: \(count) vs \(other.count) elements")
+        var s: T = 0
+        for k in 0 ..< count { s += storage[k] * other.storage[k] }
+        return s
+    }
+
+    // MARK: Products
+
+    public var transposed: Matrix {
+        var out = [T](repeating: 0, count: count)
+        let r = rows, c = cols, b = 32
+        storage.withUnsafeBufferPointer { src in
+            out.withUnsafeMutableBufferPointer { dst in
+                var i0 = 0
+                while i0 < r {                       // cache-blocked transpose
+                    var j0 = 0
+                    while j0 < c {
+                        for i in i0 ..< Swift.min(i0 + b, r) {
+                            for j in j0 ..< Swift.min(j0 + b, c) { dst[j * r + i] = src[i * c + j] }
+                        }
+                        j0 += b
+                    }
+                    i0 += b
+                }
+            }
+        }
+        return Matrix(rows: c, cols: r, storage: out)
+    }
+
+    /// Matrix product (rows x k) * (k x cols).
+    @inlinable
+    public static func * (a: Matrix, b: Matrix) -> Matrix {
+        precondition(a.cols == b.rows, "Matrix product: \(a.rows)x\(a.cols) * \(b.rows)x\(b.cols)")
+        let m = a.rows, k = a.cols, n = b.cols
+        var out = [T](repeating: 0, count: m * n)
+        a.storage.withUnsafeBufferPointer { ap in
+            b.storage.withUnsafeBufferPointer { bp in
+                out.withUnsafeMutableBufferPointer { cp in
+                    let A = UnsafeSendable(ap.baseAddress), B = UnsafeSendable(bp.baseAddress),
+                        C = UnsafeSendable(cp.baseAddress)
+                    guard A.value != nil, B.value != nil, C.value != nil else { return }
+                    let rowsKernel: @Sendable (Range<Int>) -> Void = { rowRange in
+                        let A = A.value!, B = B.value!, C = C.value!
+                        let kb = 256, nb = 512                         // cache blocks
+                        var p0 = 0
+                        while p0 < k {
+                            let p1 = Swift.min(p0 + kb, k)
+                            var j0 = 0
+                            while j0 < n {
+                                let j1 = Swift.min(j0 + nb, n)
+                                for i in rowRange {
+                                    let crow = C + i * n
+                                    for p in p0 ..< p1 {
+                                        let aip = A[i * k + p]
+                                        if aip == 0 { continue }
+                                        let brow = B + p * n
+                                        for j in j0 ..< j1 { crow[j] += aip * brow[j] }   // vectorizes
+                                    }
+                                }
+                                j0 = j1
+                            }
+                            p0 = p1
+                        }
+                    }
+                    if m * n * k >= 1 << 18 && m > 1 {
+                        Parallel.forChunks(0 ..< m, grain: Swift.max(1, m / (Parallel.threadCount * 4)), rowsKernel)
+                    } else {
+                        rowsKernel(0 ..< m)
+                    }
+                }
+            }
+        }
+        return Matrix(rows: m, cols: n, storage: out)
+    }
+
+    // MARK: Decompositions
+
+    /// LU decomposition with partial pivoting: returns (LU packed, permutation, sign).
+    func lu() throws(MatrixError) -> (lu: [T], perm: [Int], sign: T) {
+        guard isSquare else { throw MatrixError("LU needs a square matrix, got \(rows)x\(cols)") }
+        let n = rows
+        var a = storage
+        var perm = Array(0 ..< n)
+        var sign: T = 1
+        for c in 0 ..< n {
+            var p = c
+            var best = abs(a[c * n + c])
+            for r in c + 1 ..< Swift.max(n, c + 1) where abs(a[r * n + c]) > best { best = abs(a[r * n + c]); p = r }
+            if best == 0 { throw MatrixError("matrix is singular") }
+            if p != c {
+                for j in 0 ..< n { a.swapAt(p * n + j, c * n + j) }
+                perm.swapAt(p, c)
+                sign = -sign
+            }
+            let pivot = a[c * n + c]
+            for r in c + 1 ..< Swift.max(n, c + 1) {
+                let f = a[r * n + c] / pivot
+                a[r * n + c] = f
+                if f == 0 { continue }
+                for j in c + 1 ..< n { a[r * n + j] -= f * a[c * n + j] }
+            }
+        }
+        return (a, perm, sign)
+    }
+
+    /// Solves self * X = B for X.
+    public func solve(_ b: Matrix) throws(MatrixError) -> Matrix {
+        guard b.rows == rows else { throw MatrixError("solve: right-hand side has \(b.rows) rows, need \(rows)") }
+        let (a, perm, _) = try lu()
+        let n = rows, m = b.cols
+        var x = Matrix(rows: n, cols: m)
+        for col in 0 ..< m {
+            var y = (0 ..< n).map { b[perm[$0], col] }
+            for i in 0 ..< n { for j in 0 ..< i { y[i] -= a[i * n + j] * y[j] } }
+            for i in stride(from: n - 1, through: 0, by: -1) {
+                for j in i + 1 ..< n { y[i] -= a[i * n + j] * y[j] }
+                y[i] /= a[i * n + i]
+            }
+            for i in 0 ..< n { x[i, col] = y[i] }
+        }
+        return x
+    }
+
+    public func inverse() throws(MatrixError) -> Matrix { try solve(.identity(rows)) }
+
+    public var determinant: T {
+        guard let (a, _, sign) = try? lu() else { return 0 }
+        var d = sign
+        for i in 0 ..< rows { d *= a[i * rows + i] }
+        return d
+    }
+
+    // MARK: Comparison and printing
+
+    /// True when every element differs by at most `tolerance`.
+    public func isApproximatelyEqual(to other: Matrix, tolerance: T = 1e-6) -> Bool {
+        rows == other.rows && cols == other.cols && zip(storage, other.storage).allSatisfy { abs($0 - $1) <= tolerance }
+    }
+
+    public var description: String {
+        if rows == 0 || cols == 0 { return "[]" }
+        let cells = storage.map { "\($0)" }
+        let w = cells.map(\.count).max() ?? 0
+        var out = ""
+        for i in 0 ..< rows {
+            out += i == 0 ? "[" : " "
+            for j in 0 ..< cols {
+                let s = cells[i * cols + j]
+                out += String(repeating: " ", count: w - s.count) + s + (j + 1 < cols ? "  " : "")
+            }
+            out += i + 1 == rows ? "]" : "\n"
+        }
+        return out
+    }
+}

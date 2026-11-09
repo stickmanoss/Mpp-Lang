@@ -1,0 +1,18 @@
+// liquidglass (portable engine) — import it and the whole app is Liquid Glass.
+//
+//   import liquidglass        // or: import liquidglass.mpp
+//   app("Notes") { NotesView() }
+//
+// With liquidglass imported, `app` draws a soft gradient backdrop, every
+// MppUI component and every plain Button as glass, and toggles, sliders and
+// pickers with glass knobs. The glass is a port of liquidGL's lens, run as
+// Metallic shaders by the MppUI engine — on the CPU, so every Mac (and
+// Linux) shows exactly the same glass whatever its GPU or macOS version.
+
+@_exported import MppUI
+
+/// Opens a Liquid Glass window showing `content` and runs the app.
+public func app<Content: View>(_ title: String = "M++", width: Double = 480, height: Double = 360,
+                               @ViewBuilder content: @escaping () -> Content) -> Never {
+    _runApp(title: title, width: width, height: height, style: .liquidGlass) { content() }
+}

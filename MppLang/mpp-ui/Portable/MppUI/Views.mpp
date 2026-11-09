@@ -1,0 +1,641 @@
+// MppUI (portable engine) — built-in views: text, images, shapes, stacks,
+// scrolling, lists, grids and navigation.
+
+import MppUIEngine
+
+/// A view that builds its node with a closure (most built-in views).
+struct _Prim: View, PrimitiveView {
+    typealias Body = Never
+    let make: (inout BuildContext) -> Node
+    func makeNode(_ ctx: inout BuildContext) -> Node { make(&ctx) }
+}
+
+// MARK: - Text
+
+public struct Text: View, PrimitiveView, Equatable {
+    public typealias Body = Never
+    var content: String
+    var font: Font?
+    var color: Color?
+    var bold = false
+    var mono = false
+
+    public init(_ content: String) { self.content = content }
+    public init<S: StringProtocol>(_ content: S) { self.content = String(content) }
+    public init(verbatim content: String) { self.content = content }
+    public init(_ value: some CustomStringConvertible) { self.content = value.description }
+
+    public func font(_ f: Font?) -> Text { var t = self; t.font = f; return t }
+    public func fontWeight(_ w: Font.Weight?) -> Text { var t = self; t.bold = w.map { [.semibold, .bold, .heavy, .black].contains($0) } ?? false; return t }
+    public func bold(_ on: Bool = true) -> Text { var t = self; t.bold = on; return t }
+    public func italic(_ on: Bool = true) -> Text { self }
+    public func monospaced(_ on: Bool = true) -> Text { var t = self; t.mono = on; return t }
+    public func monospacedDigit() -> Text { self }
+    public func foregroundColor(_ c: Color?) -> Text { var t = self; t.color = c; return t }
+    public func foregroundStyle(_ c: Color) -> Text { var t = self; t.color = c; return t }
+    public func underline(_ on: Bool = true, color: Color? = nil) -> Text { self }
+    public func strikethrough(_ on: Bool = true, color: Color? = nil) -> Text { self }
+    public static func + (a: Text, b: Text) -> Text { var t = a; t.content += b.content; return t }
+
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let node = TextNode(content)
+        var env = Runtime.environment
+        if let font { env.font = font }
+        if bold { env.font.isBold = true }
+        if mono { env.font.isMonospaced = true }
+        if let color { env.foregroundColor = color }
+        node.env = env
+        node.envAssigned = true
+        return node
+    }
+}
+
+// MARK: - Images and symbols
+
+public struct Image: View, PrimitiveView {
+    public typealias Body = Never
+    let name: String
+    public init(systemName: String) { name = systemName }
+    public init(_ name: String) { self.name = name }
+    public func resizable() -> Image { self }
+    public func renderingMode(_ m: Any?) -> Image { self }
+    func makeNode(_ ctx: inout BuildContext) -> Node { ImageNode(name) }
+}
+
+public struct Label: View {
+    let title: String
+    let systemImage: String
+    public init(_ title: String, systemImage: String) { self.title = title; self.systemImage = systemImage }
+    public var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: systemImage)
+            Text(title)
+        }
+    }
+}
+
+// MARK: - Spacing
+
+public struct Spacer: View, PrimitiveView {
+    public typealias Body = Never
+    let minLength: Double
+    public init(minLength: Double? = nil) { self.minLength = minLength ?? 8 }
+    func makeNode(_ ctx: inout BuildContext) -> Node { SpacerNode(minLength) }
+}
+
+public struct Divider: View, PrimitiveView {
+    public typealias Body = Never
+    public init() {}
+    func makeNode(_ ctx: inout BuildContext) -> Node { DividerNode() }
+}
+
+final class DividerNode: Node {
+    var vertical = false
+    override func size(_ p: Proposal) -> Size {
+        vertical ? Size(width: 1, height: p.height ?? 0) : Size(width: p.width ?? 0, height: 1)
+    }
+    override func draw() {
+        mppui_fill_rounded_rect(Float(frame.x), Float(frame.y), Float(frame.width), Float(frame.height), 0, 0x1F00_0000)
+    }
+}
+
+// MARK: - Shapes and colors
+
+public enum RoundedCornerStyle: Sendable { case circular, continuous }
+
+public struct Rectangle: Shape, PrimitiveView {
+    public typealias Body = Never
+    public init() {}
+    public var kind: ShapeKind { .rectangle }
+}
+public struct RoundedRectangle: Shape, PrimitiveView {
+    public typealias Body = Never
+    let r: Double
+    public init(cornerRadius: Double, style: RoundedCornerStyle = .continuous) { r = cornerRadius }
+    public var kind: ShapeKind { .rounded(r) }
+}
+public struct Capsule: Shape, PrimitiveView {
+    public typealias Body = Never
+    public init(style: RoundedCornerStyle = .continuous) {}
+    public var kind: ShapeKind { .capsule }
+}
+public struct Ellipse: Shape, PrimitiveView {
+    public typealias Body = Never
+    public init() {}
+    public var kind: ShapeKind { .ellipse }
+}
+public struct Circle: Shape, PrimitiveView {
+    public typealias Body = Never
+    public init() {}
+    public var kind: ShapeKind { .ellipse }
+}
+
+extension Shape {
+    public var kind: ShapeKind { .custom }
+    public func path(in rect: CGRect) -> Path { Path(kind: kind, in: rect) }
+    /// Custom shapes draw their path (built-in shapes are primitives).
+    public var body: _ShapeView { _ShapeView(kind: kind, square: false, pathMaker: { self.path(in: $0) }) { _ in } }
+
+    var maker: ((CGRect) -> Path)? { kind == .custom ? { self.path(in: $0) } : nil }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let n = ShapeNode(kind)
+        n.square = self is Circle
+        n.pathMaker = maker
+        return n
+    }
+    public func fill(_ c: Color) -> some View { _ShapeView(kind: kind, square: self is Circle, pathMaker: maker) { $0.fill = c } }
+    public func fill(_ g: LinearGradient) -> some View { _ShapeView(kind: kind, square: self is Circle, pathMaker: maker) { $0.gradient = (g.from, g.to, g.angle) } }
+    public func fill(_ m: Material) -> some View { _ShapeView(kind: kind, square: self is Circle, pathMaker: maker) { $0.material = m } }
+    public func stroke(_ c: Color, lineWidth: Double = 1) -> some View { _ShapeView(kind: kind, square: self is Circle, pathMaker: maker) { $0.stroke = (c, lineWidth) } }
+    public func stroke(_ c: Color, style: StrokeStyle) -> some View { stroke(c, lineWidth: style.lineWidth) }
+    public func strokeBorder(_ c: Color, lineWidth: Double = 1) -> some View { stroke(c, lineWidth: lineWidth) }
+    public func glassEffect(_ g: Glass = .regular) -> some View { _ShapeView(kind: kind, square: self is Circle, pathMaker: maker) { $0.glass = g } }
+}
+
+public struct StrokeStyle: Sendable {
+    public var lineWidth: Double
+    public init(lineWidth: Double = 1, lineCap: Any? = nil, lineJoin: Any? = nil, dash: [Double] = []) { self.lineWidth = lineWidth }
+}
+
+public struct _ShapeView: View, PrimitiveView {
+    public typealias Body = Never
+    let kind: ShapeKind
+    let square: Bool
+    var pathMaker: ((CGRect) -> Path)? = nil
+    let configure: (ShapeNode) -> Void
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let n = ShapeNode(kind)
+        n.square = square
+        n.pathMaker = pathMaker
+        configure(n)
+        return n
+    }
+}
+
+extension Color: View, PrimitiveView {
+    public typealias Body = Never
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let n = ShapeNode(.rectangle)
+        n.fill = self
+        return n
+    }
+}
+
+public struct UnitPoint: Sendable, Equatable {
+    public var x: Double, y: Double
+    public init(x: Double, y: Double) { self.x = x; self.y = y }
+    public static let top = UnitPoint(x: 0.5, y: 0), bottom = UnitPoint(x: 0.5, y: 1)
+    public static let leading = UnitPoint(x: 0, y: 0.5), trailing = UnitPoint(x: 1, y: 0.5)
+    public static let center = UnitPoint(x: 0.5, y: 0.5)
+    public static let topLeading = UnitPoint(x: 0, y: 0), topTrailing = UnitPoint(x: 1, y: 0)
+    public static let bottomLeading = UnitPoint(x: 0, y: 1), bottomTrailing = UnitPoint(x: 1, y: 1)
+}
+
+/// Two-color linear gradient (the first and last of `colors`).
+public struct LinearGradient: View, PrimitiveView {
+    public typealias Body = Never
+    let from: Color, to: Color, angle: Double
+    public init(colors: [Color], startPoint: UnitPoint, endPoint: UnitPoint) {
+        from = colors.first ?? .clear
+        to = colors.last ?? .clear
+        let dx = endPoint.x - startPoint.x, dy = endPoint.y - startPoint.y
+        angle = atan2(dy, dx) * 180 / Double.pi
+    }
+    public init(gradient: [Color], startPoint: UnitPoint, endPoint: UnitPoint) {
+        self.init(colors: gradient, startPoint: startPoint, endPoint: endPoint)
+    }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let n = ShapeNode(.rectangle)
+        n.gradient = (from, to, angle)
+        return n
+    }
+}
+
+// MARK: - Stacks
+
+public struct VStack: View, PrimitiveView {
+    public typealias Body = Never
+    let alignment: HorizontalAlignment, spacing: Double?, content: ViewList
+    public init(alignment: HorizontalAlignment = .center, spacing: Double? = nil, @ViewBuilder content: () -> ViewList) {
+        self.alignment = alignment; self.spacing = spacing; self.content = content()
+    }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        StackNode(axis: .vertical, spacing: spacing ?? 8, alignment: Alignment(horizontal: alignment, vertical: .center),
+                  children: ctx.children(of: content))
+    }
+}
+
+public struct HStack: View, PrimitiveView {
+    public typealias Body = Never
+    let alignment: VerticalAlignment, spacing: Double?, content: ViewList
+    public init(alignment: VerticalAlignment = .center, spacing: Double? = nil, @ViewBuilder content: () -> ViewList) {
+        self.alignment = alignment; self.spacing = spacing; self.content = content()
+    }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        StackNode(axis: .horizontal, spacing: spacing ?? 8, alignment: Alignment(horizontal: .center, vertical: alignment),
+                  children: ctx.children(of: content))
+    }
+}
+
+public typealias LazyVStack = VStack
+public typealias LazyHStack = HStack
+
+public struct ZStack: View, PrimitiveView {
+    public typealias Body = Never
+    let alignment: Alignment, content: ViewList
+    public init(alignment: Alignment = .center, @ViewBuilder content: () -> ViewList) {
+        self.alignment = alignment; self.content = content()
+    }
+    func makeNode(_ ctx: inout BuildContext) -> Node { ZStackNode(ctx.children(of: content), alignment: alignment) }
+}
+
+/// Groups views without adding a container (its children join the parent's).
+public struct Group: View, PrimitiveView, _FlatList {
+    public typealias Body = Never
+    let content: ViewList
+    var items: [any View] { content.items }
+    public init(@ViewBuilder content: () -> ViewList) { self.content = content() }
+    func makeNode(_ ctx: inout BuildContext) -> Node { content.makeNode(&ctx) }
+}
+
+// MARK: - Scrolling
+
+public struct ScrollView: View, PrimitiveView {
+    public typealias Body = Never
+    let axes: Axis.Set, indicators: Bool, content: ViewList
+    public init(_ axes: Axis.Set = .vertical, showsIndicators: Bool = true, @ViewBuilder content: () -> ViewList) {
+        self.axes = axes; indicators = showsIndicators; self.content = content()
+    }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let inner = ctx.children(of: content)
+        let child = inner.count == 1 ? inner[0]
+            : StackNode(axis: axes.contains(.horizontal) && !axes.contains(.vertical) ? .horizontal : .vertical,
+                        spacing: 8, alignment: .center, children: inner)
+        return ScrollNode(child, axes: axes, indicators: indicators)
+    }
+}
+
+final class ScrollNode: WrapperNode {
+    let axes: Axis.Set
+    let indicators: Bool
+    var content = Size(width: 0, height: 0)
+    init(_ child: Node, axes: Axis.Set, indicators: Bool) { self.axes = axes; self.indicators = indicators; super.init(child) }
+    override var flexibility: Double { 1e8 }
+    var offset: (Double, Double) {
+        get { Runtime.memory[path + "#scroll"] as? (Double, Double) ?? (0, 0) }
+        set { Runtime.memory[path + "#scroll"] = newValue }
+    }
+    override func size(_ p: Proposal) -> Size {
+        let s = child.measure(Proposal(width: axes.contains(.horizontal) ? nil : p.width, height: axes.contains(.vertical) ? nil : p.height))
+        return Size(width: p.width ?? s.width, height: p.height ?? s.height)
+    }
+    override func place(_ r: Rect) {
+        frame = r
+        let s = child.measure(Proposal(width: axes.contains(.horizontal) ? nil : r.width, height: axes.contains(.vertical) ? nil : r.height))
+        content = Size(width: Swift.max(s.width, axes.contains(.horizontal) ? 0 : r.width), height: Swift.max(s.height, axes.contains(.vertical) ? 0 : r.height))
+        var (ox, oy) = offset
+        ox = Swift.max(0, Swift.min(ox, content.width - r.width))
+        let maxY = Swift.max(0, content.height - r.height)
+        // Anchored at the bottom: stay there as content grows (unless scrolled up).
+        if env.scrollAnchorBottom && (Runtime.memory[path + "#pinned"] as? Bool ?? true) { oy = maxY }
+        oy = Swift.max(0, Swift.min(oy, maxY))
+        offset = (ox, oy)
+        child.place(Rect(x: r.x - ox, y: r.y - oy, width: content.width, height: content.height))
+    }
+    override func draw() {
+        mppui_push_clip(Float(frame.x), Float(frame.y), Float(frame.width), Float(frame.height))
+        child.draw()
+        mppui_pop_clip()
+        if indicators && content.height > frame.height + 0.5 {
+            let h = Swift.max(24, frame.height * frame.height / content.height)
+            let y = frame.y + (frame.height - h) * offset.1 / Swift.max(1, content.height - frame.height)
+            mppui_fill_rounded_rect(Float(frame.x + frame.width - 6), Float(y + 2), 3, Float(h - 4), 1.5, 0x5A00_0000)
+        }
+    }
+    override func stack(at x: Double, _ y: Double, into out: inout [Node]) {
+        guard frame.contains(x, y) else { return }
+        out.append(self)
+        child.stack(at: x, y, into: &out)
+    }
+    override func scroll(_ dx: Double, _ dy: Double) -> Bool {
+        let before = offset
+        var (ox, oy) = offset
+        if axes.contains(.vertical) { oy = Swift.max(0, Swift.min(oy - dy, content.height - frame.height)) }
+        if axes.contains(.horizontal) { ox = Swift.max(0, Swift.min(ox - dx, content.width - frame.width)) }
+        offset = (ox, oy)
+        Runtime.memory[path + "#pinned"] = oy >= content.height - frame.height - 1
+        return before != offset
+    }
+}
+
+// MARK: - Lists and forms
+
+/// A scrolling column of rows with separators, on a rounded background.
+public struct List: View, PrimitiveView {
+    public typealias Body = Never
+    let content: ViewList
+    public init(@ViewBuilder content: () -> ViewList) { self.content = content() }
+    public init<Data: RandomAccessCollection, ID: Hashable>(_ data: Data, id: KeyPath<Data.Element, ID>,
+                                                            @ViewBuilder rowContent: @escaping (Data.Element) -> ViewList) {
+        content = ViewList([ForEach(data, id: id, content: rowContent)])
+    }
+    public init<Data: RandomAccessCollection>(_ data: Data, @ViewBuilder rowContent: @escaping (Data.Element) -> ViewList)
+        where Data.Element: Identifiable {
+        content = ViewList([ForEach(data, content: rowContent)])
+    }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        var rows: [Node] = []
+        for (i, n) in ctx.children(of: content).enumerated() {
+            if i > 0 && !(n is SectionNode) && !(rows.last is SectionNode) { rows.append(DividerNode()) }
+            rows.append(n is SectionNode ? n : PaddingNode(FrameNode.fill(n), EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16)))
+        }
+        let column = StackNode(axis: .vertical, spacing: 0, alignment: .leading, children: rows)
+        let card = LayerNode(column, layer: { let s = ShapeNode(.rounded(12)); s.fill = Color(white: 1, opacity: 0.85); return s }(), behind: true)
+        return ScrollNode(PaddingNode(card, EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)), axes: .vertical, indicators: true)
+    }
+}
+
+public typealias Form = List
+
+public struct Section: View, PrimitiveView {
+    public typealias Body = Never
+    let header: String?
+    let content: ViewList
+    public init(_ header: String, @ViewBuilder content: () -> ViewList) { self.header = header; self.content = content() }
+    public init(@ViewBuilder content: () -> ViewList) { header = nil; self.content = content() }
+    public init(header: Text, @ViewBuilder content: () -> ViewList) { self.header = header.content; self.content = content() }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        var rows: [Node] = []
+        if let header {
+            let t = TextNode(header.uppercased())
+            var env = Runtime.environment
+            env.font = .caption
+            env.foregroundColor = .secondary
+            t.env = env; t.envAssigned = true
+            rows.append(PaddingNode(t, EdgeInsets(top: 14, leading: 16, bottom: 4, trailing: 16)))
+        }
+        for (i, n) in ctx.children(of: content).enumerated() {
+            if i > 0 { rows.append(DividerNode()) }
+            rows.append(PaddingNode(FrameNode.fill(n), EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16)))
+        }
+        return SectionNode(StackNode(axis: .vertical, spacing: 0, alignment: .leading, children: rows))
+    }
+}
+
+final class SectionNode: WrapperNode {}
+
+public struct GroupBox: View {
+    let title: String?
+    let content: ViewList
+    public init(_ title: String, @ViewBuilder content: () -> ViewList) { self.title = title; self.content = content() }
+    public init(@ViewBuilder content: () -> ViewList) { title = nil; self.content = content() }
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let title { Text(title).font(.headline) }
+            content
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(white: 0, opacity: 0.05), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+public struct LabeledContent: View {
+    let label: String
+    let value: ViewList
+    public init(_ label: String, value: String) { self.label = label; self.value = ViewList([Text(value).foregroundColor(.secondary)]) }
+    public init(_ label: String, @ViewBuilder content: () -> ViewList) { self.label = label; value = content() }
+    public var body: some View {
+        HStack {
+            Text(label)
+            Spacer()
+            value
+        }
+    }
+}
+
+// MARK: - Grids
+
+public struct GridItem: Sendable {
+    public enum Size: Sendable { case fixed(Double), flexible(minimum: Double = 10, maximum: Double = .infinity), adaptive(minimum: Double, maximum: Double = .infinity) }
+    let size: Size
+    let spacing: Double?
+    public init(_ size: Size = .flexible(), spacing: Double? = nil, alignment: Alignment? = nil) { self.size = size; self.spacing = spacing }
+}
+
+public struct LazyVGrid: View, PrimitiveView {
+    public typealias Body = Never
+    let columns: [GridItem], spacing: Double?, content: ViewList
+    public init(columns: [GridItem], alignment: HorizontalAlignment = .center, spacing: Double? = nil, @ViewBuilder content: () -> ViewList) {
+        self.columns = columns; self.spacing = spacing; self.content = content()
+    }
+    func makeNode(_ ctx: inout BuildContext) -> Node { GridNode(ctx.children(of: content), columns: columns, spacing: spacing ?? 8) }
+}
+
+final class GridNode: Node {
+    let items: [Node]
+    let columns: [GridItem]
+    let spacing: Double
+    init(_ items: [Node], columns: [GridItem], spacing: Double) { self.items = items; self.columns = columns; self.spacing = spacing }
+    override func children() -> [Node] { items }
+    override var flexibility: Double { 1e7 }
+    func columnCount(_ width: Double) -> Int {
+        if columns.count == 1, case .adaptive(let minimum, _) = columns[0].size {
+            return Swift.max(1, Int((width + spacing) / (minimum + spacing)))
+        }
+        return Swift.max(1, columns.count)
+    }
+    func layout(_ width: Double) -> (cols: Int, cell: Double, rows: [[Size]]) {
+        let cols = columnCount(width)
+        let cell = (width - spacing * Double(cols - 1)) / Double(cols)
+        var rows: [[Size]] = []
+        for (i, it) in items.enumerated() {
+            if i % cols == 0 { rows.append([]) }
+            rows[rows.count - 1].append(it.measure(Proposal(width: cell, height: nil)))
+        }
+        return (cols, cell, rows)
+    }
+    override func size(_ p: Proposal) -> Size {
+        let w = p.width ?? Double(columns.count) * 80
+        let l = layout(w)
+        let h = l.rows.map { $0.map(\.height).max() ?? 0 }.reduce(0, +) + spacing * Double(Swift.max(0, l.rows.count - 1))
+        return Size(width: w, height: h)
+    }
+    override func place(_ r: Rect) {
+        frame = r
+        let l = layout(r.width)
+        var y = r.y
+        for (ri, row) in l.rows.enumerated() {
+            let h = row.map(\.height).max() ?? 0
+            for (ci, s) in row.enumerated() {
+                items[ri * l.cols + ci].place(aligned(s, in: Rect(x: r.x + Double(ci) * (l.cell + spacing), y: y, width: l.cell, height: h), .center))
+            }
+            y += h + spacing
+        }
+    }
+    override func draw() { for i in items { i.draw() } }
+}
+
+// MARK: - Navigation
+
+/// Shows its content with the title set by `.navigationTitle`, and the
+/// destination of the last NavigationLink tapped (with a back button).
+public struct NavigationStack: View, PrimitiveView {
+    public typealias Body = Never
+    let content: ViewList
+    public init(@ViewBuilder content: () -> ViewList) { self.content = content() }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let key = ctx.path + "#nav"
+        Runtime.navigationStacks.append(key)
+        defer { Runtime.navigationStacks.removeLast() }
+        let stack = Runtime.memory[key] as? [AnyView] ?? []
+        Runtime.navigationTitle = nil
+        var nodes: [Node]
+        if let top = stack.last {
+            nodes = [ctx.build(top, index: stack.count, id: "dest\(stack.count)")]
+        } else {
+            nodes = ctx.children(of: content)
+        }
+        var header: [Node] = []
+        if !stack.isEmpty {
+            let back = BackButtonNode(key)
+            back.env = Runtime.environment
+            back.envAssigned = true
+            header.append(back)
+        }
+        if let title = Runtime.navigationTitle {
+            let t = TextNode(title)
+            var env = Runtime.environment
+            env.font = Font(size: 28, bold: true)
+            t.env = env; t.envAssigned = true
+            header.append(t)
+        }
+        let body = nodes.count == 1 ? nodes[0] : StackNode(axis: .vertical, spacing: 8, alignment: .center, children: nodes)
+        if header.isEmpty { return body }
+        return PaddingNode(StackNode(axis: .vertical, spacing: 10, alignment: .leading,
+                                     children: header + [FrameNode.fill(body, vertical: true)]),
+                           EdgeInsets(top: 12, leading: 16, bottom: 0, trailing: 16))
+    }
+}
+public typealias NavigationView = NavigationStack
+
+final class BackButtonNode: Node {
+    let key: String
+    init(_ key: String) { self.key = key }
+    override var acceptsClicks: Bool { true }
+    override func size(_ p: Proposal) -> Size { Size(width: 70, height: 24) }
+    override func draw() {
+        let c = Color.accentColor.argb
+        mppui_icon("chevron.left", Float(frame.x), Float(frame.y + 4), 16, c)
+        mppui_text("Back", Float(frame.x + 18), Float(frame.y + 17), 15, Int32(MPPUI_FONT_SANS.rawValue), c)
+    }
+    override func mouseUp(_ x: Double, _ y: Double, inside: Bool) {
+        guard inside, var s = Runtime.memory[key] as? [AnyView], !s.isEmpty else { return }
+        s.removeLast()
+        Runtime.memory[key] = s
+        Runtime.invalidate()
+    }
+}
+
+public struct NavigationLink: View {
+    let label: ViewList
+    let destination: AnyView
+    public init<D: View>(_ title: String, destination: D) {
+        label = ViewList([Text(title)]); self.destination = AnyView(destination)
+    }
+    public init<D: View>(destination: D, @ViewBuilder label: () -> ViewList) {
+        self.label = label(); self.destination = AnyView(destination)
+    }
+    public var body: some View {
+        let key = Runtime.navigationStacks.last
+        let destination = self.destination
+        return Button(action: {
+            guard let key else { return }
+            var s = Runtime.memory[key] as? [AnyView] ?? []
+            s.append(destination)
+            Runtime.memory[key] = s
+        }) {
+            HStack {
+                label
+                Spacer()
+                Image(systemName: "chevron.right").foregroundColor(.secondary)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+extension FrameNode {
+    /// Fills the proposed width (and height when `vertical`).
+    static func fill(_ n: Node, vertical: Bool = false) -> Node {
+        let f = FrameNode(n)
+        f.maxWidth = .infinity
+        if vertical { f.maxHeight = .infinity }
+        f.alignment = vertical ? .top : .leading
+        return f
+    }
+}
+
+// MARK: - Progress
+
+public struct ProgressView: View, PrimitiveView {
+    public typealias Body = Never
+    let value: Double?
+    let label: String?
+    public init() { value = nil; label = nil }
+    public init(_ label: String) { value = nil; self.label = label }
+    public init(value: Double?, total: Double = 1) { self.value = value.map { $0 / total }; label = nil }
+    public init(_ label: String, value: Double?, total: Double = 1) { self.value = value.map { $0 / total }; self.label = label }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let bar = ProgressNode(value)
+        guard let label else { return bar }
+        let t = TextNode(label)
+        return StackNode(axis: .vertical, spacing: 6, alignment: .leading, children: [t, bar])
+    }
+}
+
+final class ProgressNode: Node {
+    let value: Double?
+    init(_ value: Double?) { self.value = value }
+    override var flexibility: Double { value == nil ? 0 : 1e7 }
+    override func size(_ p: Proposal) -> Size {
+        value == nil ? Size(width: 22, height: 22) : Size(width: Swift.min(p.width ?? 160, 1e6), height: 5)
+    }
+    override func draw() {
+        let tint = env.tint
+        if let v = value {
+            let (x, y, w) = (Float(frame.x), Float(frame.y), Float(frame.width))
+            let f = Float(Springs.value(path + "#v", Swift.max(0, Swift.min(1, v)), response: 0.35))
+            mppui_fill_rounded_rect(x, y, w, 5, 2.5, LG.track.argb)
+            if f > 0 { mppui_fill_rounded_rect(x, y, Swift.max(5, w * f), 5, 2.5, tint.argb) }
+        } else {
+            // Apple's spinner: twelve rounded spokes, fading around the circle, turning.
+            let cx = Float(frame.x + frame.width / 2), cy = Float(frame.y + frame.height / 2)
+            let r = Float(Swift.min(frame.width, frame.height) / 2)
+            let phase = mppui_is_headless() != 0 ? 0 : Int(Springs.now() * 12) % 12
+            if mppui_is_headless() == 0 { Springs.moving = true }
+            for k in 0 ..< 12 {
+                let a = Float(k) * Float.pi / 6 - Float.pi / 2
+                let age = (k - phase + 12) % 12
+                let alpha = 0.18 + 0.82 * Double(11 - age) / 11
+                mppui_line(cx + cos(a) * r * 0.45, cy + sin(a) * r * 0.45, cx + cos(a) * r * 0.92, cy + sin(a) * r * 0.92, 2.2,
+                           Color(white: 0.25, opacity: alpha).argb)
+            }
+        }
+    }
+}
+
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
+// SwiftUI's shape shorthands: `.glassEffect(in: .capsule)`, `.clipShape(.rect(cornerRadius: 12))`.
+extension Shape where Self == Capsule { public static var capsule: Capsule { Capsule() } }
+extension Shape where Self == Circle { public static var circle: Circle { Circle() } }
+extension Shape where Self == Ellipse { public static var ellipse: Ellipse { Ellipse() } }
+extension Shape where Self == Rectangle { public static var rect: Rectangle { Rectangle() } }
+extension Shape where Self == RoundedRectangle {
+    public static func rect(cornerRadius: Double) -> RoundedRectangle { RoundedRectangle(cornerRadius: cornerRadius) }
+}

@@ -1,0 +1,242 @@
+// M++ bootstrap: compiles the M++ driver (MppLang/driver, written in M++)
+// into bin/mpp, using the installed Swift 6 toolchain. After this one
+// build, `mpp` builds everything else, including newer versions of itself.
+//
+//   make     (copies this file to build/bootstrap.swift and runs swiftc on it)
+//
+// This file is M++ written in the subset that is also plain Swift, so
+// swiftc can compile it before any `mpp` exists. The driver's sources use
+// the same subset; this program only orders three swiftc invocations:
+// MppCore (library) -> MppKit (library) -> the driver (executable).
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+#if canImport(Darwin)
+@_silgen_name("_NSGetEnviron")
+private func _nsGetEnviron() -> UnsafeMutablePointer<UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?>
+private var environment: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?> { _nsGetEnviron().pointee! }
+#else
+private var environment: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?> { environ }
+#endif
+
+func fail(_ message: String) -> Never {
+    fputs("bootstrap: \(message)\n", stderr)
+    exit(1)
+}
+
+func say(_ message: String) { fputs(message + "\n", stderr) }
+
+func env(_ name: String) -> String? {
+    guard let p = getenv(name) else { return nil }
+    let s = String(cString: p)
+    return s.isEmpty ? nil : s
+}
+
+func isExecutable(_ path: String) -> Bool { access(path, X_OK) == 0 }
+
+func isDirectory(_ path: String) -> Bool {
+    var st = stat()
+    return stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
+}
+
+func makeDirectories(_ path: String) {
+    var partial = path.hasPrefix("/") ? "" : "."
+    for part in path.split(separator: "/") {
+        partial += "/" + part
+        if !isDirectory(partial) { _ = mkdir(partial, 0o755) }
+    }
+}
+
+/// Runs a program; returns its exit status.
+func run(_ args: [String]) -> Int32 {
+    if env("MPP_VERBOSE") != nil { say(args.joined(separator: " ")) }
+    let argv: [UnsafeMutablePointer<CChar>?] = args.map { strdup($0) } + [nil]
+    defer { for p in argv { free(p) } }
+    var pid: pid_t = 0
+    let rc = posix_spawn(&pid, args[0], nil, nil, argv, environment)
+    if rc != 0 { fail("cannot run \(args[0]): \(String(cString: strerror(rc)))") }
+    var status: Int32 = 0
+    while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
+    return (status & 0x7F) == 0 ? (status >> 8) & 0xFF : 1
+}
+
+/// Runs a program and returns its standard output.
+func output(_ args: [String]) -> String? {
+    var fds: [Int32] = [-1, -1]
+    guard pipe(&fds) == 0 else { return nil }
+    #if canImport(Darwin)
+    var fa: posix_spawn_file_actions_t? = nil
+    #else
+    var fa = posix_spawn_file_actions_t()
+    #endif
+    posix_spawn_file_actions_init(&fa)
+    defer { posix_spawn_file_actions_destroy(&fa) }
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 1)
+    posix_spawn_file_actions_addclose(&fa, fds[0])
+    let argv: [UnsafeMutablePointer<CChar>?] = args.map { strdup($0) } + [nil]
+    defer { for p in argv { free(p) } }
+    var pid: pid_t = 0
+    let rc = posix_spawnp(&pid, args[0], &fa, nil, argv, environment)
+    close(fds[1])
+    if rc != 0 { close(fds[0]); return nil }
+    var bytes: [UInt8] = []
+    var buf = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let n = read(fds[0], &buf, buf.count)
+        if n <= 0 { break }
+        bytes += buf[0 ..< n]
+    }
+    close(fds[0])
+    var status: Int32 = 0
+    while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
+    return String(decoding: bytes, as: UTF8.self)
+}
+
+func findSwiftc() -> String {
+    if let e = env("MPP_SWIFTC") { return e }
+    for dir in (env("PATH") ?? "/usr/bin:/bin").split(separator: ":") {
+        let candidate = "\(dir)/swiftc"
+        if isExecutable(candidate) { return candidate }
+    }
+    #if canImport(Darwin)
+    if let found = output(["xcrun", "--find", "swiftc"]) {
+        let path = found.split(separator: "\n").first.map(String.init) ?? ""
+        if isExecutable(path) { return path }
+    }
+    #endif
+    fail("Swift 6 toolchain not found (install Swift 6 or set MPP_SWIFTC)")
+}
+
+/// `name` on PATH (or itself if not found).
+func tool(_ name: String) -> String {
+    for dir in (env("PATH") ?? "/usr/bin:/bin").split(separator: ":") {
+        let candidate = "\(dir)/\(name)"
+        if isExecutable(candidate) { return candidate }
+    }
+    return name
+}
+
+func findCxx() -> String {
+    if let e = env("MPP_CXX") { return e.contains("/") ? e : tool(e) }
+    #if canImport(Darwin)
+    if isExecutable("/usr/bin/clang++") { return "/usr/bin/clang++" }
+    #endif
+    for name in ["clang++", "c++", "g++"] {
+        for dir in (env("PATH") ?? "/usr/bin:/bin").split(separator: ":") {
+            let candidate = "\(dir)/\(name)"
+            if isExecutable(candidate) { return candidate }
+        }
+    }
+    fail("no C++ compiler found for the MppxxCpp wrapper (install clang, or set MPP_CXX)")
+}
+
+/// Every .mpp/.swift file under `dir`, sorted.
+func sources(in dir: String) -> [String] {
+    var found: [String] = []
+    func walk(_ d: String) {
+        guard let handle = opendir(d) else { return }
+        defer { closedir(handle) }
+        while let entry = readdir(handle) {
+            let name = withUnsafeBytes(of: entry.pointee.d_name) { raw in
+                String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+            }
+            if name == "." || name == ".." { continue }
+            let path = d + "/" + name
+            if isDirectory(path) { walk(path) } else if name.hasSuffix(".mpp") || name.hasSuffix(".swift") { found.append(path) }
+        }
+    }
+    walk(dir)
+    return found.sorted()
+}
+
+/// Copies `files` into `gen` as .swift files (swiftc goes by extension).
+func stage(_ files: [String], into gen: String) -> [String] {
+    makeDirectories(gen)
+    return files.map { src in
+        let base = String(src.split(separator: "/").last!)
+        let stem = base.hasSuffix(".mpp") ? String(base.dropLast(4)) : String(base.dropLast(6))
+        let dst = gen + "/" + stem + ".swift"
+        let input = open(src, O_RDONLY)
+        if input < 0 { fail("cannot read \(src)") }
+        let out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        if out < 0 { fail("cannot write \(dst)") }
+        var buf = [UInt8](repeating: 0, count: 65536)
+        while true {
+            let n = read(input, &buf, buf.count)
+            if n <= 0 { break }
+            _ = buf.withUnsafeBytes { write(out, $0.baseAddress, n) }
+        }
+        close(input)
+        close(out)
+        return dst
+    }
+}
+
+// MARK: Main
+
+let root = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : String(cString: getcwd(nil, 0))
+let out = root + "/build/bootstrap"
+let bin = root + "/bin"
+makeDirectories(out)
+makeDirectories(bin)
+let swiftc = findSwiftc()
+
+var common = [swiftc, "-swift-version", "6", "-O", "-wmo", "-module-cache-path", out + "/module-cache"]
+#if canImport(Darwin)
+#if arch(arm64)
+common += ["-target", "arm64-apple-macos14.0"]
+#else
+common += ["-target", "x86_64-apple-macos14.0"]
+#endif
+#endif
+
+func library(_ name: String, _ dir: String, importCore: Bool) {
+    var cmd = common + ["-module-name", name, "-I", out, "-parse-as-library", "-emit-library", "-static",
+                        "-emit-module", "-module-link-name", name,
+                        "-emit-module-path", out + "/" + name + ".swiftmodule",
+                        "-o", out + "/lib" + name + ".a"]
+    if importCore { cmd += ["-Xfrontend", "-import-module", "-Xfrontend", "MppCore"] }
+    cmd += stage(sources(in: root + "/" + dir), into: out + "/gen/" + name)
+    say("   Compiling \(name) (bootstrap)")
+    if run(cmd) != 0 { fail("\(name) failed to compile") }
+}
+
+library("MppCore", "MppLang/mpp-core/Sources", importCore: false)
+library("MppKit", "MppLang/mpp-kit/Sources", importCore: true)
+
+// The MppxxCpp wrapper: C++23, linked into the driver.
+let wrapperDir = root + "/MppLang/mpp-cpp/wrapper"
+let cxx = findCxx()
+var wrapperObjects: [String] = []
+makeDirectories(out + "/wrapper")
+for file in ["support", "source", "cpp", "interop", "shaders"] {
+    let obj = out + "/wrapper/" + file + ".o"
+    var c = [cxx, "-std=c++23", "-O2", "-Wall", "-Wextra", "-c", wrapperDir + "/" + file + ".cpp", "-o", obj]
+    #if canImport(Darwin)
+    c += ["-mmacosx-version-min=14.0"]
+    #endif
+    say("   Compiling MppxxCpp wrapper: \(file).cpp (C++23)")
+    if run(c) != 0 { fail("the MppxxCpp wrapper failed to compile") }
+    wrapperObjects.append(obj)
+}
+_ = unlink(out + "/libmppxx.a")
+if run([tool("ar"), "rcs", out + "/libmppxx.a"] + wrapperObjects) != 0 { fail("could not archive the MppxxCpp wrapper") }
+
+var cmd = common + ["-module-name", "mpp", "-I", out, "-I", wrapperDir, "-L", out, "-lMppKit", "-lMppCore", "-lmppxx",
+                    "-Xfrontend", "-import-module", "-Xfrontend", "MppCore", "-o", bin + "/mpp"]
+#if canImport(Darwin)
+cmd.append("-lc++")
+#else
+cmd.append("-static-stdlib")   // faster start-up: no shared Swift runtime to load
+cmd.append("-lstdc++")
+#endif
+cmd += stage(sources(in: root + "/MppLang/driver") + sources(in: root + "/MppLang/MppPM/PackageManager"), into: out + "/gen/mpp")
+say("     Linking mpp (bootstrap)")
+if run(cmd) != 0 { fail("the driver failed to compile") }
+say("       Built \(bin)/mpp")

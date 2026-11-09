@@ -1,0 +1,272 @@
+// MppUI (portable engine) — things drawn above the window content: menus,
+// popovers, sheets, alerts and confirmation dialogs.
+//
+// Views ask for an overlay while the tree is built; the app builds, lays out
+// and draws the overlays after the window content, and sends input to the
+// topmost one first.
+
+import MppUIEngine
+
+enum OverlayKind { case menu, popover, sheet, alert }
+
+struct OverlayRequest {
+    let kind: OverlayKind
+    let anchor: String?                  // path of the view a menu/popover hangs from
+    let build: (inout BuildContext) -> Node
+    let dismiss: () -> Void
+}
+
+final class PlacedOverlay {
+    let request: OverlayRequest
+    let node: Node
+    let panel: Rect
+    init(_ r: OverlayRequest, _ n: Node, _ p: Rect) { request = r; node = n; panel = p }
+}
+
+extension Runtime {
+    nonisolated(unsafe) static var overlayRequests: [OverlayRequest] = []
+    nonisolated(unsafe) static var overlays: [PlacedOverlay] = []
+
+    /// Builds, places and draws the requested overlays (after the window content).
+    static func layoutOverlays(tree: Node, width w: Double, height h: Double) {
+        overlays = []
+        for (i, r) in overlayRequests.enumerated() {
+            var ctx = BuildContext(path: "overlay\(i)")
+            let saved = environment
+            environment.menuDismiss = r.kind == .menu || r.kind == .alert ? r.dismiss : nil
+            environment.dismiss = DismissAction(r.dismiss)
+            if r.kind == .alert { environment.buttonStyleKind = .automatic }
+            let node = r.build(&ctx)
+            environment = saved
+            let inset: Double = r.kind == .menu ? 5 : r.kind == .alert ? 20 : 16
+            let maxW = r.kind == .alert ? 260 : w - 60
+            let s = node.measure(Proposal(width: r.kind == .alert ? maxW - 2 * inset : nil, height: nil))
+            let pw = Swift.min(maxW, r.kind == .alert ? maxW : s.width + 2 * inset)
+            let ph = Swift.min(h - 40, s.height + 2 * inset)
+            var px = (w - pw) / 2, py = (h - ph) / 2
+            if r.kind == .sheet { py = 0 }
+            if let a = r.anchor, let anchor = tree.find(path: a) ?? overlays.lazy.compactMap({ $0.node.find(path: a) }).first {
+                px = r.kind == .menu ? anchor.frame.x : anchor.frame.x + (anchor.frame.width - pw) / 2
+                py = anchor.frame.y + anchor.frame.height + 4
+                if py + ph > h - 4 { py = Swift.max(4, anchor.frame.y - ph - 4) }
+                px = Swift.max(4, Swift.min(px, w - pw - 4))
+            }
+            let panel = Rect(x: px, y: py, width: pw, height: ph)
+            node.place(Rect(x: px + inset, y: py + inset, width: pw - 2 * inset, height: ph - 2 * inset))
+            overlays.append(PlacedOverlay(r, node, panel))
+        }
+    }
+
+    static func drawOverlays(width w: Double, height h: Double) {
+        for o in overlays {
+            let p = o.panel
+            let (x, y, pw, ph) = (Float(p.x), Float(p.y), Float(p.width), Float(p.height))
+            switch o.request.kind {
+            case .sheet, .alert:
+                // Liquid Glass: a light dim, then a frosted glass panel with Tahoe's large radius.
+                mppui_fill_rounded_rect(0, 0, Float(w), Float(h), 0, 0x1F_00_00_00)
+                lgPanel(x, y, pw, ph, radius: o.request.kind == .alert ? 24 : 18)
+            case .menu, .popover:
+                lgPanel(x, y, pw, ph, radius: 12, lift: 14)
+            }
+            o.node.draw()
+        }
+    }
+
+    static func findInOverlays(_ path: String) -> Node? {
+        for o in overlays.reversed() { if let n = o.node.find(path: path) { return n } }
+        return nil
+    }
+}
+
+// MARK: - Modifiers
+
+extension View {
+    /// Shows `content` in a sheet while `isPresented` is true.
+    public func sheet<C: View>(isPresented: Binding<Bool>, onDismiss: (() -> Void)? = nil, @ViewBuilder content: @escaping () -> C) -> some View {
+        _wrap { n, _ in
+            if isPresented.wrappedValue {
+                Runtime.overlayRequests.append(OverlayRequest(kind: .sheet, anchor: nil, build: { ctx in ctx.build(content(), index: 0) },
+                                                              dismiss: { isPresented.wrappedValue = false; onDismiss?() }))
+            }
+            return n
+        }
+    }
+
+    /// Shows `content` in a sheet while `item` is non-nil.
+    public func sheet<Item, C: View>(item: Binding<Item?>, @ViewBuilder content: @escaping (Item) -> C) -> some View {
+        _wrap { n, _ in
+            if let value = item.wrappedValue {
+                Runtime.overlayRequests.append(OverlayRequest(kind: .sheet, anchor: nil, build: { ctx in ctx.build(content(value), index: 0) },
+                                                              dismiss: { item.wrappedValue = nil }))
+            }
+            return n
+        }
+    }
+
+    /// A popover hanging from this view while `isPresented` is true.
+    public func popover<C: View>(isPresented: Binding<Bool>, @ViewBuilder content: @escaping () -> C) -> some View {
+        _wrap { n, _ in
+            if isPresented.wrappedValue {
+                Runtime.overlayRequests.append(OverlayRequest(kind: .popover, anchor: n.path.isEmpty ? nil : n.path,
+                                                              build: { ctx in ctx.build(content(), index: 0) },
+                                                              dismiss: { isPresented.wrappedValue = false }))
+            }
+            return n
+        }
+    }
+
+    /// An alert with a title, buttons and an optional message.
+    public func alert<A: View, M: View>(_ title: String, isPresented: Binding<Bool>,
+                                        @ViewBuilder actions: @escaping () -> A, @ViewBuilder message: @escaping () -> M) -> some View {
+        _wrap { n, _ in
+            if isPresented.wrappedValue {
+                Runtime.overlayRequests.append(OverlayRequest(kind: .alert, anchor: nil, build: { ctx in
+                    let saved = Runtime.environment
+                    Runtime.environment.font = Font(size: 13, bold: true)
+                    let t = TextNode(title)
+                    Runtime.environment.font = Font(size: 11)
+                    let msg = ctx.build(message(), index: 1)
+                    Runtime.environment = saved
+                    t.env.font = Font(size: 13, bold: true); t.env.textAlignment = .center; t.envAssigned = true
+                    msg.env.textAlignment = .center
+                    Runtime.environment.buttonStyleKind = .automatic
+                    // macOS alerts stack full-width buttons; the first plain one is the default (blue).
+                    var buttons = ctx.children(of: ViewList([actions()]))
+                    for case let b as ButtonNode in buttons { b.fillWidth = true }
+                    if let i = buttons.firstIndex(where: { ($0 as? ButtonNode)?.isDefaultCandidate ?? false }) {
+                        buttons[i] = (buttons[i] as! ButtonNode).asProminent()
+                    }
+                    let column = StackNode(axis: .vertical, spacing: 8, alignment: .center, children: buttons)
+                    return StackNode(axis: .vertical, spacing: 10, alignment: .center,
+                                     children: [t, msg, SpacerNode(2), FrameNode.fill(column)])
+                }, dismiss: { isPresented.wrappedValue = false }))
+            }
+            return n
+        }
+    }
+
+    public func alert<A: View>(_ title: String, isPresented: Binding<Bool>, @ViewBuilder actions: @escaping () -> A) -> some View {
+        alert(title, isPresented: isPresented, actions: actions, message: { EmptyView() })
+    }
+
+    public func confirmationDialog<A: View>(_ title: String, isPresented: Binding<Bool>, titleVisibility: Any? = nil,
+                                            @ViewBuilder actions: @escaping () -> A) -> some View {
+        alert(title, isPresented: isPresented, actions: actions, message: { EmptyView() })
+    }
+    public func confirmationDialog<A: View, M: View>(_ title: String, isPresented: Binding<Bool>, titleVisibility: Any? = nil,
+                                                     @ViewBuilder actions: @escaping () -> A, @ViewBuilder message: @escaping () -> M) -> some View {
+        alert(title, isPresented: isPresented, actions: actions, message: message)
+    }
+}
+
+// MARK: - Menus
+
+/// A pop-up menu row: hover highlight, optional checkmark.
+final class MenuItemNode: WrapperNode {
+    let checked: Bool
+    let action: () -> Void
+    init(_ child: Node, checked: Bool, action: @escaping () -> Void) {
+        self.checked = checked; self.action = action
+        super.init(child)
+    }
+    override var acceptsClicks: Bool { true }
+    override var flexibility: Double { 1e7 }
+    override func size(_ p: Proposal) -> Size {
+        let s = child.measure(Proposal(width: nil, height: nil))
+        return Size(width: Swift.max(s.width + 28, Swift.min(p.width ?? 0, 1e6)), height: Swift.max(22, s.height + 6))
+    }
+    override func place(_ r: Rect) {
+        frame = r
+        let s = child.measure(Proposal(width: nil, height: nil))
+        child.place(Rect(x: r.x + 22, y: r.y + (r.height - s.height) / 2, width: s.width, height: s.height))
+    }
+    var highlighted: Bool { Runtime.hoverPath == path || Runtime.pressedPath == path }
+    override func draw() {
+        if highlighted {
+            // Tahoe menus highlight a row as an inset accent capsule.
+            mppui_fill_rounded_rect(Float(frame.x), Float(frame.y), Float(frame.width), Float(frame.height), 7, env.tint.argb)
+        }
+        if checked {
+            mppui_icon("checkmark", Float(frame.x + 6), Float(frame.y + (frame.height - 11) / 2), 11, highlighted ? 0xFF_FF_FF_FF : Color.primary.argb)
+        }
+        if highlighted { mppui_push_opacity(1) }
+        child.draw()
+        if highlighted { mppui_pop_opacity() }
+    }
+    override func stack(at x: Double, _ y: Double, into out: inout [Node]) { if frame.contains(x, y) { out.append(self) } }
+    override func mouseUp(_ x: Double, _ y: Double, inside: Bool) {
+        if inside { action(); env.menuDismiss?() }
+        Runtime.invalidate()
+    }
+}
+
+/// The macOS pop-up button: the current value with up/down chevrons.
+final class PopUpButtonNode: WrapperNode {
+    let toggle: () -> Void
+    init(_ label: Node, toggle: @escaping () -> Void) { self.toggle = toggle; super.init(label) }
+    override var acceptsClicks: Bool { env.isEnabled }
+    override func size(_ p: Proposal) -> Size {
+        let s = child.measure(Proposal(width: nil, height: nil))
+        return Size(width: s.width + 40, height: Swift.max(LG.controlHeight, s.height + 8))
+    }
+    override func place(_ r: Rect) {
+        frame = r
+        let s = child.measure(Proposal(width: nil, height: nil))
+        child.place(Rect(x: r.x + 12, y: r.y + (r.height - s.height) / 2, width: s.width, height: s.height))
+    }
+    override func draw() {
+        let (x, y, w, h) = (Float(frame.x), Float(frame.y), Float(frame.width), Float(frame.height))
+        let press = Springs.value(path + "#press", Runtime.pressedPath == path ? 1 : 0, response: 0.2, bounce: 0.2)
+        lgBezel(x, y, w, h, press: press, glassBackdrop: env.mppStyle == .liquidGlass)
+        // Tahoe: gray chevrons on the bezel (no blue box).
+        mppui_icon("chevron.up.chevron.down", x + w - 22, y + h / 2 - 6, 12, Color.secondary.argb)
+        child.draw()
+    }
+    override func stack(at x: Double, _ y: Double, into out: inout [Node]) { if frame.contains(x, y) { out.append(self) } }
+    override func mouseUp(_ x: Double, _ y: Double, inside: Bool) {
+        if inside { toggle() }
+        Runtime.invalidate()
+    }
+}
+
+/// A macOS push button background (white, hairline border, soft shadow).
+func drawPushButton(_ x: Float, _ y: Float, _ w: Float, _ h: Float, pressed: Bool, style: MppStyle) {
+    lgBezel(x, y, w, h, press: pressed ? 1 : 0, glassBackdrop: style == .liquidGlass)
+}
+
+/// `Menu("Actions") { Button("Copy") { ... } ... }`: a pull-down menu.
+public struct Menu: View, PrimitiveView {
+    public typealias Body = Never
+    let label: ViewList
+    let content: ViewList
+    public init(_ title: String, @ViewBuilder content: () -> ViewList) { label = ViewList([Text(title)]); self.content = content() }
+    public init(@ViewBuilder content: () -> ViewList, @ViewBuilder label: () -> ViewList) { self.label = label(); self.content = content() }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let key = ctx.path + "#open"
+        let open = Runtime.memory[key] as? Bool ?? false
+        let kids = ctx.children(of: label)
+        let labelNode = kids.count == 1 ? kids[0] : StackNode(axis: .horizontal, spacing: 6, alignment: .center, children: kids)
+        let button = PopUpButtonNode(labelNode) { Runtime.memory[key] = !open }
+        button.path = ctx.path
+        let content = self.content
+        if open {
+            Runtime.overlayRequests.append(OverlayRequest(kind: .menu, anchor: ctx.path, build: { c in
+                // Buttons in the menu become menu rows.
+                var rows: [Node] = []
+                for (i, v) in content.items.enumerated() {
+                    if let b = v as? Button {
+                        let n = c.build(ViewList(b.label.items), index: i)
+                        rows.append(MenuItemNode(n, checked: false, action: b.action))
+                    } else if v is Divider {
+                        rows.append(PaddingNode(DividerNode(), EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0)))
+                    } else {
+                        rows.append(c.build(v, index: i))
+                    }
+                }
+                return StackNode(axis: .vertical, spacing: 0, alignment: .leading, children: rows)
+            }, dismiss: { Runtime.memory[key] = false }))
+        }
+        return button
+    }
+}

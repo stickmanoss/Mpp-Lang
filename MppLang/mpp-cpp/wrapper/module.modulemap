@@ -1,0 +1,4 @@
+module MppxxWrapper {
+    header "mppxx.h"
+    export *
+}

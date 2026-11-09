@@ -1,0 +1,20 @@
+// MppFoundation (the swift-foundation fork, built as M++): Decimal.
+import MppFoundation
+
+func d(_ s: String) -> Decimal { Decimal(string: s)! }
+
+// Exact decimal arithmetic (0.1 + 0.2 is exactly 0.3, unlike Double).
+precondition(d("0.1") + d("0.2") == d("0.3"))
+precondition((d("12.345") * 3).description == "37.035")
+precondition(d("1e3") == 1000 && d("-2.5").isSignMinus && d("2.5").magnitude == d("2.5"))
+precondition(d("123456789012345678901234567890") + 1 == d("123456789012345678901234567891"))
+precondition(Decimal.nan.isNaN && !d("1").isNaN)
+precondition(Decimal(string: "abc") == nil && Decimal(string: "3,5", decimalSeparator: ",") == d("3.5"))
+precondition(d("3.14159").description == "3.14159" && d("-0.001").description == "-0.001")
+var a = d("2"), b = Decimal(3)
+precondition(NSDecimalCompare(&a, &b) == .orderedAscending)
+var rounded = Decimal(), source = d("10.75")
+NSDecimalRound(&rounded, &source, 1, .plain)
+precondition(rounded == d("10.8"), "rounded \(rounded)")
+precondition(pow(d("1.5"), 3) == d("3.375"))
+print("MppFoundation: all tests passed (Decimal from the swift-foundation fork)")

@@ -1,0 +1,360 @@
+// MppUI (portable engine) — views, builders, state and environment.
+//
+// The same declarative API as MppUI on Apple platforms (which is SwiftUI),
+// implemented in M++ on top of the C++ MppUI engine:
+//
+//   struct Counter: View {
+//       @State var count = 0
+//       var body: some View {
+//           VStack(spacing: 12) {
+//               Text("Count: \(count)").font(.title)
+//               Button("Add") { count += 1 }
+//           }
+//           .padding()
+//       }
+//   }
+//   app("Counter") { Counter() }
+//
+// Every event rebuilds the view tree from the root; @State survives
+// rebuilds because its storage is matched to the view's position in the tree.
+
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
+// CGFloat, CGPoint, CGSize and CGRect come from Foundation, as in SwiftUI.
+@_exported import Foundation
+
+// MARK: - View
+
+public protocol View {
+    associatedtype Body: View
+    @ViewBuilder var body: Body { get }
+}
+
+extension Never: View {
+    public var body: Never { return fatalError("Never has no body") }
+}
+
+/// Views implemented directly by the engine.
+protocol PrimitiveView {
+    func makeNode(_ ctx: inout BuildContext) -> Node
+}
+
+extension View where Body == Never {
+    public var body: Never { return fatalError("\(Self.self) is a primitive view") }
+}
+
+/// Views whose children are spliced into the parent container.
+protocol _FlatList { var items: [any View] { get } }
+
+/// A flattened list of child views (what @ViewBuilder produces).
+public struct ViewList: View, PrimitiveView, _FlatList {
+    let items: [any View]
+    public typealias Body = Never
+    init(_ items: [any View]) { self.items = items }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        // A list on its own (e.g. a body with several views) lays out like a VStack.
+        let kids = ctx.children(of: self)
+        if kids.count == 1 { return kids[0] }
+        return StackNode(axis: .vertical, spacing: 8, alignment: .center, children: kids)
+    }
+}
+
+@resultBuilder
+public enum ViewBuilder {
+    public static func buildExpression(_ v: any View) -> [any View] { [v] }
+    public static func buildBlock(_ parts: [any View]...) -> ViewList { ViewList(parts.flatMap { $0 }) }
+    public static func buildPartialBlock(first: [any View]) -> [any View] { first }
+    public static func buildPartialBlock(accumulated: [any View], next: [any View]) -> [any View] { accumulated + next }
+    public static func buildOptional(_ v: [any View]?) -> [any View] { v ?? [] }
+    public static func buildEither(first: [any View]) -> [any View] { first }
+    public static func buildEither(second: [any View]) -> [any View] { second }
+    public static func buildArray(_ parts: [[any View]]) -> [any View] { parts.flatMap { $0 } }
+    public static func buildLimitedAvailability(_ v: [any View]) -> [any View] { v }
+    public static func buildFinalResult(_ parts: [any View]) -> ViewList { ViewList(parts) }
+    public static func buildBlock() -> ViewList { ViewList([]) }
+}
+
+/// Type-erased view.
+public struct AnyView: View, PrimitiveView {
+    let view: any View
+    public typealias Body = Never
+    public init(_ view: some View) { self.view = view }
+    func makeNode(_ ctx: inout BuildContext) -> Node { ctx.build(view, index: 0) }
+}
+
+public struct EmptyView: View, PrimitiveView {
+    public typealias Body = Never
+    public init() {}
+    func makeNode(_ ctx: inout BuildContext) -> Node { EmptyNode() }
+}
+
+// MARK: - State
+
+protocol AnyStateBox: AnyObject {
+    func adopt(_ other: AnyStateBox) -> Bool
+}
+
+final class StateBox<Value>: AnyStateBox {
+    var stored: Value
+    var forward: StateBox<Value>?
+    init(_ v: Value) { stored = v }
+    var target: StateBox<Value> { forward?.target ?? self }
+    var value: Value {
+        get { target.stored }
+        set { target.stored = newValue }
+    }
+    func adopt(_ other: AnyStateBox) -> Bool {
+        guard let o = other as? StateBox<Value> else { return false }
+        if o !== self { forward = o }
+        return true
+    }
+}
+
+protocol StateProperty { var stateBox: AnyStateBox { get } }
+
+/// View-owned state that survives re-renders (SwiftUI @State).
+@propertyWrapper
+public struct State<Value>: StateProperty {
+    let box: StateBox<Value>
+    public init(wrappedValue: Value) { box = StateBox(wrappedValue) }
+    public init(initialValue: Value) { box = StateBox(initialValue) }
+    public var wrappedValue: Value {
+        get { box.value }
+        nonmutating set { box.value = newValue; Runtime.invalidate() }
+    }
+    public var projectedValue: Binding<Value> {
+        let b = box
+        return Binding(get: { b.value }, set: { b.value = $0; Runtime.invalidate() })
+    }
+    var stateBox: AnyStateBox { box }
+}
+
+/// A read-write reference to state owned elsewhere (SwiftUI @Binding).
+@propertyWrapper
+@dynamicMemberLookup
+public struct Binding<Value> {
+    let get: () -> Value
+    let set: (Value) -> Void
+    public init(get: @escaping () -> Value, set: @escaping (Value) -> Void) { self.get = get; self.set = set }
+    public init(projectedValue: Binding<Value>) { self = projectedValue }
+    public var wrappedValue: Value {
+        get { get() }
+        nonmutating set { set(newValue) }
+    }
+    public var projectedValue: Binding<Value> { self }
+    public static func constant(_ v: Value) -> Binding<Value> { Binding(get: { v }, set: { _ in }) }
+    public subscript<T>(dynamicMember keyPath: WritableKeyPath<Value, T>) -> Binding<T> {
+        Binding<T>(get: { self.get()[keyPath: keyPath] }, set: { v in var x = self.get(); x[keyPath: keyPath] = v; self.set(x) })
+    }
+}
+
+// MARK: - Environment
+
+public struct DismissAction {
+    let action: () -> Void
+    init(_ action: @escaping () -> Void) { self.action = action }
+    public func callAsFunction() { action(); Runtime.invalidate() }
+}
+
+public enum ControlSize: Sendable { case mini, small, regular, large, extraLarge }
+
+public enum MppStyle: Sendable, Equatable { case standard, liquidGlass }
+public enum TextAlignment: Sendable { case leading, center, trailing }
+
+public struct EnvironmentValues {
+    public var font: Font = .body
+    public var foregroundColor: Color = .primary
+    public var mppStyle: MppStyle = .standard
+    public var buttonStyleKind: ButtonStyleKind = .automatic
+    public var isEnabled = true
+    public var tint: Color = .accentColor
+    public var lineLimit: Int? = nil
+    public var textAlignment: TextAlignment = .leading
+    public var textFieldBordered = true
+    public var labelsHidden = false
+    public var onSubmit: (() -> Void)? = nil
+    public var toggleStyleKind: ToggleStyleKind = .automatic
+    public var pickerStyleKind: PickerStyleKind = .automatic
+    public var controlSize: ControlSize = .regular
+    var scrollAnchorBottom = false
+    /// Set inside menus and alerts: buttons close them after running their action.
+    var menuDismiss: (() -> Void)? = nil
+    /// Closes the sheet or popover this view is in (`@Environment(\.dismiss)`).
+    public var dismiss = DismissAction {}
+    var objects: [ObjectIdentifier: AnyObject] = [:]
+    public init() {}
+}
+
+/// Values captured from the environment when a view is built (so actions
+/// that run later still see them).
+protocol _EnvironmentCapturing { func capture(_ env: EnvironmentValues) }
+
+final class _EnvBox<Value> { var value: Value?; init() {} }
+
+/// Reads a value from the environment of the view being built (SwiftUI @Environment).
+@propertyWrapper
+public struct Environment<Value>: _EnvironmentCapturing {
+    let get: (EnvironmentValues) -> Value
+    let box = _EnvBox<Value>()
+    public init(_ keyPath: KeyPath<EnvironmentValues, Value>) { get = { $0[keyPath: keyPath] } }
+    /// An observable object put in the environment with `.environment(object)`.
+    public init(_ type: Value.Type) where Value: AnyObject {
+        get = { env in
+            guard let o = env.objects[ObjectIdentifier(type)] as? Value else {
+                preconditionFailure("No \(type) in the environment: add .environment(object) to an ancestor view")
+            }
+            return o
+        }
+    }
+    public var wrappedValue: Value { box.value ?? get(Runtime.environment) }
+    func capture(_ env: EnvironmentValues) { box.value = get(env) }
+}
+
+struct EnvironmentModifier<Content: View>: View, PrimitiveView {
+    let content: Content
+    let change: (inout EnvironmentValues) -> Void
+    typealias Body = Never
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let saved = Runtime.environment
+        change(&Runtime.environment)
+        defer { Runtime.environment = saved }
+        return ctx.build(content, index: 0)
+    }
+}
+
+extension View {
+    public func environment<V>(_ keyPath: WritableKeyPath<EnvironmentValues, V>, _ value: V) -> some View {
+        EnvironmentModifier(content: self) { $0[keyPath: keyPath] = value }
+    }
+}
+
+// MARK: - Building the node tree
+
+enum Runtime {
+    nonisolated(unsafe) static var environment = EnvironmentValues()
+    nonisolated(unsafe) static var states: [String: AnyStateBox] = [:]
+    nonisolated(unsafe) static var seenStates = Set<String>()
+    nonisolated(unsafe) static var memory: [String: Any] = [:]   // per-position UI memory (scroll offsets, appear flags)
+    nonisolated(unsafe) static var dirty = true
+    nonisolated(unsafe) static var afterRender: [() -> Void] = []
+    nonisolated(unsafe) static var appeared: [String: (() -> Void)?] = [:]
+    nonisolated(unsafe) static var appearedNow: [String: (() -> Void)?] = [:]
+    nonisolated(unsafe) static var pressedPath: String? = nil
+    nonisolated(unsafe) static var hoverPath: String? = nil
+    nonisolated(unsafe) static var focusPath: String? = nil
+    nonisolated(unsafe) static var windowTitle: String? = nil
+    nonisolated(unsafe) static var navigationTitle: String? = nil
+    nonisolated(unsafe) static var navigationStacks: [String] = []
+    static func invalidate() { dirty = true }
+}
+
+struct BuildContext {
+    var path: String
+
+    /// Builds the node for `view`, the `index`-th child at this position.
+    mutating func build(_ view: any View, index: Int, id: String? = nil) -> Node {
+        let saved = path
+        path += "/" + (id ?? "\(index)") + ":" + String(describing: type(of: view))
+        defer { path = saved }
+        if let p = view as? PrimitiveView {
+            let node = p.makeNode(&self)
+            if !node.envAssigned {
+                node.env = Runtime.environment
+                node.envAssigned = true
+            }
+            if node.path.isEmpty { node.path = path }
+            // Nodes this view made itself (not via ctx.build) get stable paths too.
+            func name(_ n: Node, _ prefix: String) {
+                for (i, c) in n.children().enumerated() where c.path.isEmpty {
+                    c.path = prefix + "/~\(i)"
+                    name(c, c.path)
+                }
+            }
+            name(node, node.path)
+            return node
+        }
+        reconcileState(view)
+        return build(view.body, index: 0)
+    }
+
+    /// Points @State properties of a freshly created view at the storage
+    /// that this position in the tree had before.
+    func reconcileState(_ view: any View) {
+        for child in Mirror(reflecting: view).children {
+            if let e = child.value as? _EnvironmentCapturing { e.capture(Runtime.environment); continue }
+            guard let label = child.label, let s = child.value as? StateProperty else { continue }
+            let key = path + "#" + label
+            Runtime.seenStates.insert(key)
+            if let existing = Runtime.states[key], s.stateBox.adopt(existing) { continue }
+            Runtime.states[key] = s.stateBox
+        }
+    }
+
+    /// Child nodes of a ViewList (or a single view).
+    mutating func children(of list: any View) -> [Node] {
+        let items = (list as? _FlatList)?.items ?? [list]
+        var out: [Node] = []
+        for (i, v) in items.enumerated() {
+            if let inner = v as? _FlatList {
+                // Nested lists (from if/else or loops) are flattened.
+                let saved = path
+                path += "/\(i)"
+                out += children(of: inner as! any View)
+                path = saved
+            } else if let each = v as? ForEachProtocol {
+                let saved = path
+                path += "/\(i)"
+                out += each.makeNodes(&self)
+                path = saved
+            } else {
+                out.append(build(v, index: i))
+            }
+        }
+        return out
+    }
+}
+
+// MARK: - ForEach
+
+protocol ForEachProtocol { func makeNodes(_ ctx: inout BuildContext) -> [Node] }
+
+public struct ForEach<Data: RandomAccessCollection, ID: Hashable>: View, PrimitiveView, ForEachProtocol {
+    let data: Data
+    let id: (Data.Element) -> ID
+    let content: (Data.Element) -> ViewList
+    public typealias Body = Never
+
+    public init(_ data: Data, id: KeyPath<Data.Element, ID>, @ViewBuilder content: @escaping (Data.Element) -> ViewList) {
+        self.data = data
+        self.id = { $0[keyPath: id] }
+        self.content = content
+    }
+
+    func makeNodes(_ ctx: inout BuildContext) -> [Node] {
+        data.map { element in ctx.build(content(element), index: 0, id: "\(id(element))") }
+    }
+
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        StackNode(axis: .vertical, spacing: 8, alignment: .center, children: makeNodes(&ctx))
+    }
+}
+
+extension ForEach where Data == Range<Int>, ID == Int {
+    public init(_ range: Range<Int>, @ViewBuilder content: @escaping (Int) -> ViewList) {
+        self.init(range, id: \.self, content: content)
+    }
+}
+
+extension ForEach where Data.Element: Identifiable, ID == Data.Element.ID {
+    public init(_ data: Data, @ViewBuilder content: @escaping (Data.Element) -> ViewList) {
+        self.data = data
+        self.id = { $0.id }
+        self.content = content
+    }
+}

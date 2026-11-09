@@ -1,0 +1,262 @@
+// neural — Data: TabularData-style DataFrame, batching and preprocessing.
+//
+//   let df = try DataFrame(csvFile: "iris.csv")
+//   print(df)                                   // first rows, aligned
+//   let (train, test) = df.randomSplit(0.8, seed: 1)
+//   let x = train.tensor(["sepal_length", "sepal_width"])
+//   for (xb, yb) in batches(x, labels, batchSize: 32, shuffle: true) { ... }
+
+public struct DataFrameError: Error, CustomStringConvertible, Sendable {
+    public let description: String
+}
+
+public struct DataFrame: CustomStringConvertible, Sendable {
+    public enum Column: Sendable, Equatable {
+        case numbers([Double?])
+        case strings([String?])
+
+        public var count: Int {
+            switch self { case .numbers(let v): return v.count; case .strings(let v): return v.count }
+        }
+        func select(_ rows: [Int]) -> Column {
+            switch self {
+            case .numbers(let v): return .numbers(rows.map { v[$0] })
+            case .strings(let v): return .strings(rows.map { v[$0] })
+            }
+        }
+        func text(_ i: Int) -> String {
+            switch self {
+            case .numbers(let v): return v[i].map { format("{:g}", $0) } ?? ""
+            case .strings(let v): return v[i] ?? ""
+            }
+        }
+    }
+
+    public private(set) var columnNames: [String] = []
+    var columns: [String: Column] = [:]
+
+    public init() {}
+
+    public init(_ columns: KeyValuePairs<String, Column>) {
+        for (k, v) in columns { self[k] = v }
+    }
+
+    public var rowCount: Int { columnNames.first.map { columns[$0]!.count } ?? 0 }
+
+    public subscript(name: String) -> Column? {
+        get { columns[name] }
+        set {
+            if let v = newValue {
+                precondition(columnNames.isEmpty || v.count == rowCount || (columnNames == [name]),
+                             "DataFrame: column '\(name)' has \(v.count) rows, frame has \(rowCount)")
+                if columns.updateValue(v, forKey: name) == nil { columnNames.append(name) }
+            } else if columns.removeValue(forKey: name) != nil {
+                columnNames.removeAll { $0 == name }
+            }
+        }
+    }
+
+    /// Numeric column values (missing values become `fill`).
+    public func numbers(_ name: String, fill: Double = 0) throws(DataFrameError) -> [Double] {
+        guard let c = columns[name] else { throw DataFrameError(description: "no column '\(name)' (have \(columnNames))") }
+        guard case .numbers(let v) = c else { throw DataFrameError(description: "column '\(name)' is not numeric") }
+        return v.map { $0 ?? fill }
+    }
+
+    /// Column values as text.
+    public func strings(_ name: String) throws(DataFrameError) -> [String] {
+        guard let c = columns[name] else { throw DataFrameError(description: "no column '\(name)' (have \(columnNames))") }
+        return (0 ..< c.count).map { c.text($0) }
+    }
+
+    /// Rows `indices` as a new frame.
+    public func rows(_ indices: [Int]) -> DataFrame {
+        var out = DataFrame()
+        for n in columnNames { out[n] = columns[n]!.select(indices) }
+        return out
+    }
+
+    /// Rows for which `keep(rowIndex)` is true.
+    public func filter(_ keep: (Int) -> Bool) -> DataFrame { rows((0 ..< rowCount).filter(keep)) }
+
+    /// Shuffled split into (first fraction, rest).
+    public func randomSplit(_ fraction: Double, seed: UInt64 = 0) -> (DataFrame, DataFrame) {
+        var rng = PCG32(seed: seed)
+        let order = Array(0 ..< rowCount).shuffled(using: &rng)
+        let cut = Int((Double(rowCount) * fraction).rounded())
+        return (rows(Array(order[..<cut])), rows(Array(order[cut...])))
+    }
+
+    /// Numeric columns as a [rows, columns.count] tensor.
+    public func tensor(_ names: [String]) throws(DataFrameError) -> Tensor {
+        var cols: [[Double]] = []
+        for n in names { cols.append(try numbers(n)) }
+        var data = [Float]()
+        data.reserveCapacity(rowCount * names.count)
+        for r in 0 ..< rowCount { for c in cols { data.append(Float(c[r])) } }
+        return Tensor(data: data, shape: [rowCount, names.count])
+    }
+
+    // MARK: CSV
+
+    public init(csv text: String, separator: Character = ",") throws(DataFrameError) {
+        var records = DataFrame.parseCSV(text, separator)
+        guard !records.isEmpty else { throw DataFrameError(description: "CSV is empty") }
+        let header = records.removeFirst()
+        for (k, r) in records.enumerated() where r.count != header.count {
+            throw DataFrameError(description: "CSV row \(k + 2) has \(r.count) fields, header has \(header.count)")
+        }
+        for (j, name) in header.enumerated() {
+            let raw = records.map { $0[j] }
+            let parsed = raw.map { $0.isEmpty ? nil : Double($0) }
+            let numeric = zip(raw, parsed).allSatisfy { $0.isEmpty || $1 != nil }
+            self[name] = numeric ? .numbers(parsed) : .strings(raw.map { $0.isEmpty ? nil : $0 })
+        }
+    }
+
+    public init(csvFile path: String, separator: Character = ",") throws {
+        try self.init(csv: try FS.read(path), separator: separator)
+    }
+
+    static func parseCSV(_ text: String, _ sep: Character) -> [[String]] {
+        var rows: [[String]] = [], row: [String] = [], field = ""
+        var quoted = false
+        var it = text.makeIterator()
+        var pending: Character? = nil
+        while let c = pending ?? it.next() {
+            pending = nil
+            if quoted {
+                if c == "\"" {
+                    if let n = it.next() {
+                        if n == "\"" { field.append("\"") } else { quoted = false; pending = n }
+                    } else { quoted = false }
+                } else { field.append(c) }
+            } else if c == "\"" && field.isEmpty {
+                quoted = true
+            } else if c == sep {
+                row.append(field); field = ""
+            } else if c == "\n" || c == "\r\n" {
+                row.append(field); field = ""
+                if !(row.count == 1 && row[0].isEmpty) { rows.append(row) }
+                row = []
+            } else if c != "\r" {
+                field.append(c)
+            }
+        }
+        if !field.isEmpty || !row.isEmpty { row.append(field); rows.append(row) }
+        return rows
+    }
+
+    public func csv() -> String {
+        func esc(_ s: String) -> String {
+            s.contains(",") || s.contains("\"") || s.contains("\n") ? "\"" + s.split(separator: "\"", omittingEmptySubsequences: false).joined(separator: "\"\"") + "\"" : s
+        }
+        var out = columnNames.map(esc).joined(separator: ",") + "\n"
+        for r in 0 ..< rowCount { out += columnNames.map { esc(columns[$0]!.text(r)) }.joined(separator: ",") + "\n" }
+        return out
+    }
+
+    // MARK: Display
+
+    public var description: String { render(maxRows: 10) }
+
+    public func render(maxRows: Int) -> String {
+        let shown = Swift.min(maxRows, rowCount)
+        let cells = columnNames.map { n in [n] + (0 ..< shown).map { columns[n]!.text($0) } }
+        let widths = cells.map { $0.map(\.count).max() ?? 0 }
+        var lines: [String] = []
+        for r in 0 ... shown {
+            lines.append(zip(cells, widths).map { col, w in
+                let s = col[r]
+                return s + String(repeating: " ", count: w - s.count)
+            }.joined(separator: "  "))
+            if r == 0 { lines.append(widths.map { String(repeating: "─", count: $0) }.joined(separator: "  ")) }
+        }
+        if rowCount > shown { lines.append("… \(rowCount - shown) more rows") }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Count, mean, std, min and max of each numeric column.
+    public func describe() -> String {
+        var lines = [format("{:<16} {:>8} {:>12} {:>12} {:>12} {:>12}", "column", "count", "mean", "std", "min", "max")]
+        for n in columnNames {
+            guard case .numbers(let v) = columns[n]! else { continue }
+            let xs = v.compactMap { $0 }
+            let mean = xs.reduce(0, +) / Double(Swift.max(xs.count, 1))
+            let std = (xs.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(Swift.max(xs.count, 1))).squareRoot()
+            lines.append(format("{:<16} {:>8} {:>12.4f} {:>12.4f} {:>12.4f} {:>12.4f}", n, xs.count, mean, std,
+                                xs.min() ?? 0, xs.max() ?? 0))
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+// MARK: - Batching
+
+/// Mini-batches of (inputs, labels) rows, optionally shuffled each call.
+public func batches(_ x: Tensor, _ y: [Int], batchSize: Int, shuffle: Bool = false, seed: UInt64 = 0) -> [(Tensor, [Int])] {
+    precondition(x.shape[0] == y.count, "batches: \(x.shape[0]) inputs but \(y.count) labels")
+    var order = Array(0 ..< y.count)
+    if shuffle { var rng = PCG32(seed: seed); order.shuffle(using: &rng) }
+    return order.chunks(of: batchSize).map { idx in (x.rows(Array(idx)), idx.map { y[$0] }) }
+}
+
+/// Mini-batches of (inputs, targets) tensor rows.
+public func batches(_ x: Tensor, _ y: Tensor, batchSize: Int, shuffle: Bool = false, seed: UInt64 = 0) -> [(Tensor, Tensor)] {
+    precondition(x.shape[0] == y.shape[0], "batches: \(x.shape[0]) inputs but \(y.shape[0]) targets")
+    var order = Array(0 ..< x.shape[0])
+    if shuffle { var rng = PCG32(seed: seed); order.shuffle(using: &rng) }
+    return order.chunks(of: batchSize).map { idx in (x.rows(Array(idx)), y.rows(Array(idx))) }
+}
+
+// MARK: - Preprocessing
+
+/// Standardizes columns to zero mean and unit variance (scikit-learn StandardScaler).
+public struct StandardScaler: Sendable, Codable {
+    public private(set) var mean: [Float] = []
+    public private(set) var std: [Float] = []
+    public init() {}
+
+    public mutating func fit(_ x: Tensor) {
+        let c = x.shape[1], n = x.shape[0]
+        var sums = [Float](repeating: 0, count: c), squares = [Float](repeating: 0, count: c)
+        for i in 0 ..< n { for j in 0 ..< c { sums[j] += x.data[i * c + j] } }
+        mean = sums.map { $0 / Float(n) }
+        for i in 0 ..< n { for j in 0 ..< c { let d = x.data[i * c + j] - mean[j]; squares[j] += d * d } }
+        std = squares.map { Swift.max(($0 / Float(n)).squareRoot(), 1e-8) }
+    }
+
+    public func transform(_ x: Tensor) -> Tensor {
+        let c = x.shape[1]
+        var out = x.data
+        for i in out.indices { out[i] = (out[i] - mean[i % c]) / std[i % c] }
+        return Tensor(data: out, shape: x.shape)
+    }
+
+    public mutating func fitTransform(_ x: Tensor) -> Tensor { fit(x); return transform(x) }
+}
+
+/// Maps labels to 0..<classes and back.
+public struct LabelEncoder: Sendable, Codable {
+    public private(set) var classes: [String] = []
+    public init() {}
+    public init(classes: [String]) { self.classes = classes }
+
+    public mutating func fit(_ labels: [String]) { classes = Array(Set(labels)).sorted() }
+    public func transform(_ labels: [String]) -> [Int] {
+        let index = Dictionary(uniqueKeysWithValues: classes.enumerated().map { ($1, $0) })
+        return labels.map { l in
+            guard let i = index[l] else { preconditionFailure("LabelEncoder: unknown label '\(l)'") }
+            return i
+        }
+    }
+    public func inverse(_ ids: [Int]) -> [String] { ids.map { classes[$0] } }
+    public mutating func fitTransform(_ labels: [String]) -> [Int] { fit(labels); return transform(labels) }
+}
+
+/// One-hot rows for class indices.
+public func oneHot(_ labels: [Int], classes: Int) -> Tensor {
+    var d = [Float](repeating: 0, count: labels.count * classes)
+    for (i, l) in labels.enumerated() { d[i * classes + l] = 1 }
+    return Tensor(data: d, shape: [labels.count, classes])
+}

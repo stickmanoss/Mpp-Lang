@@ -1,0 +1,452 @@
+// Accelarate — the eager engine and the VM.
+//
+// VM pipeline for an expression such as relu(a * b + c * 2 - d):
+//
+//   1. linearize: walk the graph once (shared subexpressions once), giving a
+//      structural key, the input arrays and the scalar immediates;
+//   2. compile (once per key, then cached): fuse multiply-adds and
+//      scale-and-shift pairs into single instructions, give every value a
+//      register, reuse registers as soon as a value is dead;
+//   3. run: split the output into blocks of 512 floats (2 KB, so all live
+//      registers fit in the L1 cache), spread the blocks over every core,
+//      and run the instruction list on each block. Each instruction is a
+//      tight loop the compiler vectorizes.
+
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Darwin)
+import Darwin
+#endif
+import Dispatch
+
+@usableFromInline
+struct _AccelPtr: @unchecked Sendable {
+    @usableFromInline let p: UnsafeMutablePointer<Float>
+    @usableFromInline init(_ p: UnsafeMutablePointer<Float>) { self.p = p }
+}
+
+let _accelThreads = Swift.max(1, Int(sysconf(Int32(_SC_NPROCESSORS_ONLN))))
+
+/// Splits 0..<n into contiguous ranges across cores.
+@usableFromInline
+func _accelParallel(_ n: Int, minimumPerThread: Int, _ body: @Sendable (Range<Int>) -> Void) {
+    let parts = Swift.min(_accelThreads * 4, Swift.max(1, n / Swift.max(1, minimumPerThread)))
+    if parts <= 1 { body(0 ..< n); return }
+    DispatchQueue.concurrentPerform(iterations: parts) { c in
+        let lo = n * c / parts, hi = n * (c + 1) / parts
+        if lo < hi { body(lo ..< hi) }
+    }
+}
+
+// MARK: - Element kernels (shared by both engines)
+
+@inline(__always)
+func applyUnary(_ op: Op, _ x: Float, _ s: Float) -> Float {
+    switch op {
+    case .neg: return -x
+    case .sqrt: return x.squareRoot()
+    case .exp: return expf(x)
+    case .log: return logf(x)
+    case .sin: return sinf(x)
+    case .cos: return cosf(x)
+    case .tanh: return tanhf(x)
+    case .abs: return Swift.abs(x)
+    case .relu: return x > 0 ? x : 0
+    case .sigmoid: return 1 / (1 + expf(-x))
+    case .square: return x * x
+    case .recip: return 1 / x
+    case .floor: return x.rounded(.down)
+    case .ceil: return x.rounded(.up)
+    case .addS: return x + s
+    case .mulS: return x * s
+    case .subFromS: return s - x
+    case .divS: return x / s
+    case .divIntoS: return s / x
+    case .maxS: return Swift.max(x, s)
+    case .minS: return Swift.min(x, s)
+    case .powS: return powf(x, s)
+    default: preconditionFailure("not unary: \(op)")
+    }
+}
+
+@inline(__always)
+func applyBinary(_ op: Op, _ x: Float, _ y: Float) -> Float {
+    switch op {
+    case .add: return x + y
+    case .sub: return x - y
+    case .mul: return x * y
+    case .div: return x / y
+    case .max: return Swift.max(x, y)
+    case .min: return Swift.min(x, y)
+    default: preconditionFailure("not binary: \(op)")
+    }
+}
+
+/// Unary op over n floats; one specialized loop per op so each vectorizes.
+@inline(__always)
+func unaryLoop(_ op: Op, _ x: UnsafePointer<Float>, _ o: UnsafeMutablePointer<Float>, _ n: Int, _ s: Float, _ t: Float = 0) {
+    switch op {
+    case .neg: for i in 0 ..< n { o[i] = -x[i] }
+    case .abs: for i in 0 ..< n { o[i] = Swift.abs(x[i]) }
+    case .relu: for i in 0 ..< n { let v = x[i]; o[i] = v > 0 ? v : 0 }
+    case .square: for i in 0 ..< n { o[i] = x[i] * x[i] }
+    case .sqrt: for i in 0 ..< n { o[i] = x[i].squareRoot() }
+    case .recip: for i in 0 ..< n { o[i] = 1 / x[i] }
+    case .addS: for i in 0 ..< n { o[i] = x[i] + s }
+    case .mulS: for i in 0 ..< n { o[i] = x[i] * s }
+    case .subFromS: for i in 0 ..< n { o[i] = s - x[i] }
+    case .divIntoS: for i in 0 ..< n { o[i] = s / x[i] }
+    case .maxS: for i in 0 ..< n { o[i] = Swift.max(x[i], s) }
+    case .minS: for i in 0 ..< n { o[i] = Swift.min(x[i], s) }
+    case .affine: for i in 0 ..< n { o[i] = x[i] * s + t }
+    default: for i in 0 ..< n { o[i] = applyUnary(op, x[i], s) }
+    }
+}
+
+@inline(__always)
+func binaryLoop(_ op: Op, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ o: UnsafeMutablePointer<Float>, _ n: Int) {
+    switch op {
+    case .add: for i in 0 ..< n { o[i] = a[i] + b[i] }
+    case .sub: for i in 0 ..< n { o[i] = a[i] - b[i] }
+    case .mul: for i in 0 ..< n { o[i] = a[i] * b[i] }
+    case .div: for i in 0 ..< n { o[i] = a[i] / b[i] }
+    case .max: for i in 0 ..< n { o[i] = Swift.max(a[i], b[i]) }
+    case .min: for i in 0 ..< n { o[i] = Swift.min(a[i], b[i]) }
+    default: preconditionFailure("not binary: \(op)")
+    }
+}
+
+// MARK: - Eager engine
+
+enum Eager {
+    /// One operation over inputs that are already arrays.
+    static func run(_ node: Node) -> [Float] {
+        for i in node.inputs { i.materialize() }
+        let n = node.count
+        return [Float](unsafeUninitializedCapacity: n) { out, done in
+            let o = out.baseAddress!
+            if node.inputs.count == 1 {
+                let x = node.inputs[0].data
+                x.withUnsafeBufferPointer { xp in
+                    if x.count == n { unaryLoop(node.op, xp.baseAddress!, o, n, node.imm) }
+                    else { for i in 0 ..< n { o[i] = applyUnary(node.op, xp[i % x.count], node.imm) } }
+                }
+            } else {
+                let a = node.inputs[0].data, b = node.inputs[1].data
+                a.withUnsafeBufferPointer { ap in
+                    b.withUnsafeBufferPointer { bp in
+                        if a.count == n && b.count == n { binaryLoop(node.op, ap.baseAddress!, bp.baseAddress!, o, n) }
+                        else { for i in 0 ..< n { o[i] = applyBinary(node.op, ap[i % a.count], bp[i % b.count]) } }
+                    }
+                }
+            }
+            done = n
+        }
+    }
+
+    static func reduce(_ v: [Float], _ r: Reduction) -> Float {
+        switch r {
+        case .sum:
+            var s: Double = 0
+            for x in v { s += Double(x) }
+            return Float(s)
+        case .max: return v.max() ?? -.infinity
+        case .min: return v.min() ?? .infinity
+        }
+    }
+}
+
+// MARK: - VM
+
+/// Where an instruction reads a value.
+enum Operand: Equatable {
+    case none
+    case reg(Int)
+    case input(Int)        // an input array as long as the output: read in place
+}
+
+struct Instruction {
+    var op: Op
+    var dst: Int           // register, or -1: the output array
+    var a = Operand.none, b = Operand.none, c = Operand.none
+    var imm = -1, imm2 = -1   // indexes into the immediates
+    var gather = -1        // `.leaf` instructions: input to repeat (broadcast) into dst
+}
+
+final class Program: @unchecked Sendable {   // immutable once compiled
+    var code: [Instruction] = []
+    var registers = 0
+    var listing = ""
+}
+
+enum VM {
+    static let block = 512
+    nonisolated(unsafe) static var cache: [String: Program] = [:]
+    nonisolated(unsafe) static var compiled = 0
+
+    /// The graph in evaluation order, with its structural key.
+    struct Linear {
+        var order: [Node] = []            // inner nodes, post-order
+        var leaves: [Node] = []
+        var imms: [Float] = []
+        var key = ""
+        var index: [ObjectIdentifier: Int] = [:]   // node -> value id (leaves first: L<k>, inner: V<k>)
+        var uses: [ObjectIdentifier: Int] = [:]
+    }
+
+    static func linearize(_ root: Node) -> Linear {
+        var l = Linear()
+        var ids: [ObjectIdentifier: String] = [:]
+        func visit(_ n: Node) {
+            let id = ObjectIdentifier(n)
+            l.uses[id, default: 0] += 1
+            if ids[id] != nil { return }
+            if n.op == .leaf {
+                ids[id] = "L\(l.leaves.count)"
+                l.key += "L\(n.count == root.count ? "" : "%" + String(n.count));"
+                l.leaves.append(n)
+                return
+            }
+            for i in n.inputs { visit(i) }
+            ids[id] = "V\(l.order.count)"
+            l.key += "\(n.op.rawValue)(" + n.inputs.map { ids[ObjectIdentifier($0)]! }.joined(separator: ",") + ");"
+            l.order.append(n)
+            if n.inputs.count == 1 && n.op != .leaf { l.imms.append(n.imm) }
+        }
+        visit(root)
+        for (k, n) in l.leaves.enumerated() { l.index[ObjectIdentifier(n)] = k }
+        for (k, n) in l.order.enumerated() { l.index[ObjectIdentifier(n)] = l.leaves.count + k }
+        return l
+    }
+
+    // MARK: Compile
+
+    static func compile(_ l: Linear, rootCount: Int, toOutput: Bool) -> Program {
+        let p = Program()
+        let nLeaves = l.leaves.count
+        func vid(_ n: Node) -> Int { l.index[ObjectIdentifier(n)]! }
+        func uses(_ n: Node) -> Int { l.uses[ObjectIdentifier(n)] ?? 0 }
+
+        // Immediates in linearize order.
+        var immIndex: [Int: Int] = [:]       // inner value id -> imm slot
+        var slot = 0
+        for (k, n) in l.order.enumerated() where n.inputs.count == 1 { immIndex[nLeaves + k] = slot; slot += 1 }
+
+        // 1) Fuse: add(mul(a,b), c) -> fma; mulS followed by addS -> affine.
+        struct Pending { var op: Op; var args: [Int]; var imm = -1, imm2 = -1; let id: Int }
+        var pending: [Pending] = []
+        var absorbed = Set<Int>()                 // values folded into a later instruction
+        var defining: [Int: Int] = [:]            // value id -> index in pending
+        for (k, n) in l.order.enumerated() {
+            let id = nLeaves + k
+            var ins = Pending(op: n.op, args: n.inputs.map(vid), id: id)
+            if n.inputs.count == 1 { ins.imm = immIndex[id]! }
+            if n.op == .add {
+                for side in 0 ..< 2 {
+                    let m = n.inputs[side]
+                    if m.op == .mul && uses(m) == 1 && m.count == n.count, let di = defining[vid(m)] {
+                        let mulArgs = pending[di].args
+                        ins = Pending(op: .fma, args: mulArgs + [vid(n.inputs[1 - side])], id: id)
+                        absorbed.insert(vid(m))
+                        _ = di
+                        break
+                    }
+                }
+            } else if n.op == .addS, let m = n.inputs.first, m.op == .mulS && uses(m) == 1, let di = defining[vid(m)] {
+                ins = Pending(op: .affine, args: pending[di].args, imm: pending[di].imm, imm2: immIndex[id]!, id: id)
+                absorbed.insert(vid(m))
+            }
+            defining[id] = pending.count
+            pending.append(ins)
+        }
+        pending.removeAll { absorbed.contains($0.id) }
+
+        // 2) Registers: leaves read in place unless they must be repeated.
+        var lastUse: [Int: Int] = [:]
+        for (k, ins) in pending.enumerated() { for a in ins.args { lastUse[a] = k } }
+        var location: [Int: Operand] = [:]
+        var free: [Int] = []
+        func alloc() -> Int { if let r = free.popLast() { return r }; p.registers += 1; return p.registers - 1 }
+        for (k, leaf) in l.leaves.enumerated() where leaf.count == rootCount { location[k] = .input(k) }
+        let rootId = nLeaves + l.order.count - 1
+        for (k, ins) in pending.enumerated() {
+            // Broadcast inputs are repeated into a register right before use.
+            for a in ins.args where location[a] == nil && a < nLeaves {
+                let r = alloc()
+                p.code.append(Instruction(op: .leaf, dst: r, gather: a))
+                location[a] = .reg(r)
+                p.listing += "  r\(r) = repeat(in\(a))\n"
+            }
+            let operands = ins.args.map { location[$0]! }
+            // Free registers whose value dies here (they can be the destination).
+            for a in Set(ins.args) where lastUse[a] == k { if case .reg(let r)? = location[a] { free.append(r) } }
+            let dst = (ins.id == rootId && toOutput) ? -1 : alloc()
+            location[ins.id] = dst < 0 ? Operand.none : Operand.reg(dst)
+            var instr = Instruction(op: ins.op, dst: dst, imm: ins.imm, imm2: ins.imm2)
+            if operands.count > 0 { instr.a = operands[0] }
+            if operands.count > 1 { instr.b = operands[1] }
+            if operands.count > 2 { instr.c = operands[2] }
+            p.code.append(instr)
+            func show(_ o: Operand) -> String {
+                switch o { case .reg(let r): return "r\(r)"; case .input(let i): return "in\(i)"; case .none: return "" }
+            }
+            let args = operands.map(show).joined(separator: ", ")
+            let usesImm: Set<Op> = [.addS, .mulS, .subFromS, .divS, .divIntoS, .maxS, .minS, .powS, .affine]
+            let imms = usesImm.contains(ins.op) ? [ins.imm, ins.imm2].filter { $0 >= 0 }.map { "#\($0)" }.joined(separator: ", ") : ""
+            p.listing += "  \(dst < 0 ? "out" : "r\(dst)") = \(ins.op == .affine ? "affine" : "\(ins.op)")(\(args)\(imms.isEmpty ? "" : (args.isEmpty ? "" : ", ") + imms))\n"
+        }
+        p.registers = Swift.max(p.registers, 1)
+        return p
+    }
+
+    static func program(for l: Linear, rootCount: Int, toOutput: Bool) -> Program {
+        let key = (toOutput ? "o|" : "r|") + l.key
+        if let p = cache[key] { return p }
+        let p = compile(l, rootCount: rootCount, toOutput: toOutput)
+        compiled += 1
+        cache[key] = p
+        if Accelarate.trace {
+            let text = "accelarate vm: compiled \(p.code.count) instruction(s), \(p.registers) register(s) of \(block) floats\n" + p.listing
+            _ = text.withCString { write(2, $0, strlen($0)) }
+        }
+        return p
+    }
+
+    // MARK: Run
+
+    /// Executes `p` on output elements [start, start+n), block by block.
+    static func execute(_ p: Program, _ inputs: [_AccelPtr], _ counts: [Int], _ imms: [Float],
+                        _ regs: UnsafeMutablePointer<Float>, start: Int, n: Int, out: UnsafeMutablePointer<Float>?,
+                        reduce: Reduction?, acc: inout Double) {
+        var s = start
+        let end = start + n
+        while s < end {
+            let len = Swift.min(block, end - s)
+            func ptr(_ o: Operand) -> UnsafeMutablePointer<Float> {
+                switch o {
+                case .reg(let r): return regs + r * block
+                case .input(let i): return inputs[i].p + s
+                case .none: preconditionFailure("missing operand")
+                }
+            }
+            var last: UnsafeMutablePointer<Float> = regs
+            for ins in p.code {
+                let o = ins.dst < 0 ? out! + s : regs + ins.dst * block
+                switch ins.op {
+                case .leaf:
+                    let src = inputs[ins.gather].p, c = counts[ins.gather]
+                    if c == 1 { let v = src[0]; for i in 0 ..< len { o[i] = v } }
+                    else { var j = s % c; for i in 0 ..< len { o[i] = src[j]; j += 1; if j == c { j = 0 } } }
+                case .fma:
+                    let a = ptr(ins.a), b = ptr(ins.b), c = ptr(ins.c)
+                    for i in 0 ..< len { o[i] = a[i] * b[i] + c[i] }
+                case .affine:
+                    unaryLoop(.affine, ptr(ins.a), o, len, imms[ins.imm], imms[ins.imm2])
+                case .add, .sub, .mul, .div, .max, .min:
+                    binaryLoop(ins.op, ptr(ins.a), ptr(ins.b), o, len)
+                default:
+                    unaryLoop(ins.op, ptr(ins.a), o, len, ins.imm >= 0 ? imms[ins.imm] : 0)
+                }
+                last = o
+            }
+            if let reduce {
+                switch reduce {
+                case .sum:
+                    var part: Float = 0     // per-block float partial, accumulated in Double
+                    for i in 0 ..< len { part += last[i] }
+                    acc += Double(part)
+                case .max: for i in 0 ..< len { acc = Swift.max(acc, Double(last[i])) }
+                case .min: for i in 0 ..< len { acc = Swift.min(acc, Double(last[i])) }
+                }
+            }
+            s += len
+        }
+    }
+
+    /// Evaluates the whole expression into a new array.
+    static func run(_ root: Node) -> [Float] {
+        let l = linearize(root)
+        let p = program(for: l, rootCount: root.count, toOutput: true)
+        let n = root.count
+        var out = [Float](unsafeUninitializedCapacity: n) { _, done in done = n }
+        withInputs(l.leaves) { inputs, counts in
+            out.withUnsafeMutableBufferPointer { ob in
+                let o = _AccelPtr(ob.baseAddress!)
+                let imms = l.imms
+                parallelBlocks(n) { range in
+                    let regs = UnsafeMutablePointer<Float>.allocate(capacity: p.registers * block)
+                    defer { regs.deallocate() }
+                    var unused = 0.0
+                    execute(p, inputs, counts, imms, regs, start: range.lowerBound, n: range.count, out: o.p, reduce: nil, acc: &unused)
+                }
+            }
+        }
+        return out
+    }
+
+    /// Evaluates the expression and reduces it, without writing it anywhere.
+    static func reduce(_ root: Node, _ r: Reduction) -> Float {
+        let l = linearize(root)
+        let p = program(for: l, rootCount: root.count, toOutput: false)
+        let n = root.count
+        let start: Double = r == .sum ? 0 : (r == .max ? -.infinity : .infinity)
+        let parts = Swift.min(_accelThreads * 4, Swift.max(1, n / 65_536))
+        let partials = UnsafeMutablePointer<Double>.allocate(capacity: parts)
+        partials.initialize(repeating: start, count: parts)
+        defer { partials.deallocate() }
+        let pp = _AccelDoublePtr(partials)
+        withInputs(l.leaves) { inputs, counts in
+            let imms = l.imms
+            let work: @Sendable (Int) -> Void = { c in
+                let lo = n * c / parts, hi = n * (c + 1) / parts
+                guard lo < hi else { return }
+                let regs = UnsafeMutablePointer<Float>.allocate(capacity: p.registers * block)
+                defer { regs.deallocate() }
+                var acc = start
+                execute(p, inputs, counts, imms, regs, start: lo, n: hi - lo, out: nil, reduce: r, acc: &acc)
+                pp.p[c] = acc
+            }
+            if parts == 1 { work(0) } else { DispatchQueue.concurrentPerform(iterations: parts, execute: work) }
+        }
+        var total = start
+        for c in 0 ..< parts {
+            switch r {
+            case .sum: total += partials[c]
+            case .max: total = Swift.max(total, partials[c])
+            case .min: total = Swift.min(total, partials[c])
+            }
+        }
+        return Float(total)
+    }
+
+    static func parallelBlocks(_ n: Int, _ body: @Sendable (Range<Int>) -> Void) {
+        _accelParallel(n, minimumPerThread: 65_536, body)
+    }
+
+    /// Pins every input array for the duration of `body`.
+    static func withInputs(_ leaves: [Node], _ body: ([_AccelPtr], [Int]) -> Void) {
+        var ptrs: [_AccelPtr] = []
+        ptrs.reserveCapacity(leaves.count)
+        func next(_ i: Int) {
+            if i == leaves.count { body(ptrs, leaves.map(\.count)); return }
+            leaves[i].data.withUnsafeBufferPointer { b in
+                ptrs.append(_AccelPtr(UnsafeMutablePointer(mutating: b.baseAddress ?? UnsafePointer(bitPattern: 16)!)))
+                next(i + 1)
+            }
+        }
+        next(0)
+    }
+}
+
+struct _AccelDoublePtr: @unchecked Sendable {
+    let p: UnsafeMutablePointer<Double>
+    init(_ p: UnsafeMutablePointer<Double>) { self.p = p }
+}
+
+/// Program and run statistics.
+extension Accelarate {
+    /// How many distinct programs the VM has compiled so far.
+    public static var compiledPrograms: Int { VM.compiled }
+}

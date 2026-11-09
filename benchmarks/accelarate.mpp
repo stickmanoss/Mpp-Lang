@@ -1,0 +1,46 @@
+// Accelarate: eager evaluation vs the fusing VM vs a hand-written loop.
+//   mpp benchmarks/accelarate.mpp          (runs all three)
+import Accelarate
+
+func seconds(_ body: () -> Void) -> Double {
+    var best = Double.infinity
+    for _ in 0 ..< 5 {
+        let t0 = ContinuousClock.now
+        body()
+        let d = ContinuousClock.now - t0
+        best = Swift.min(best, Double(d.components.seconds) + Double(d.components.attoseconds) * 1e-18)
+    }
+    return best
+}
+
+func ms(_ s: Double) -> String { "\(Int((s * 1000).rounded())) ms" }
+
+@MainActor func run() {
+    let n = 16_000_000
+    let a = Tensor.random(count: n, in: -1 ... 1, seed: 1).evaluated()
+    let b = Tensor.random(count: n, in: -1 ... 1, seed: 2).evaluated()
+    let c = Tensor.random(count: n, in: -1 ... 1, seed: 3).evaluated()
+    let (av, bv, cv) = (a.array, b.array, c.array)
+    print("\(n / 1_000_000)M floats per array")
+
+    print("y = relu(a * b + c * 2 - 1) * 0.5 + sqrt(abs(a))")
+    let e1 = seconds { _ = Accelarate.with(.eager) { (relu(a * b + c * 2 - 1) * 0.5 + sqrt(abs(a))).array } }
+    let v1 = seconds { _ = Accelarate.with(.vm) { (relu(a * b + c * 2 - 1) * 0.5 + sqrt(abs(a))).array } }
+    let h1 = seconds {
+        var y = [Float](repeating: 0, count: n)
+        for i in 0 ..< n { let t = av[i] * bv[i] + cv[i] * 2 - 1; y[i] = (t > 0 ? t : 0) * 0.5 + Swift.abs(av[i]).squareRoot() }
+        precondition(y.count == n)
+    }
+    print("  eager \(ms(e1))   vm \(ms(v1))   hand-written loop \(ms(h1))")
+
+    print("s = sum((a - b) * (a - b))")
+    let e2 = seconds { _ = Accelarate.with(.eager) { sum((a - b) * (a - b)) } }
+    let v2 = seconds { _ = Accelarate.with(.vm) { sum((a - b) * (a - b)) } }
+    let h2 = seconds {
+        var s: Float = 0
+        for i in 0 ..< n { let d = av[i] - bv[i]; s += d * d }
+        precondition(s.isFinite)
+    }
+    print("  eager \(ms(e2))   vm \(ms(v2))   hand-written loop \(ms(h2))")
+}
+run()

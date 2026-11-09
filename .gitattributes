@@ -1,0 +1,16 @@
+# How GitHub (Linguist) shows this repository.
+
+# M++ is Swift syntax: highlight .mpp files as Swift and count them as code.
+*.mpp            linguist-language=Swift linguist-detectable=true
+
+# .mppgnore uses .gitignore syntax.
+.mppgnore        linguist-language=gitignore
+
+# The embedded font atlas is data (a base64 blob): collapse it in diffs, leave it out of stats.
+MppLang/mpp-ui/Engine/FontData.mpp  linguist-generated=true
+
+# The swift-foundation fork is third-party source kept for reference.
+MppLang/mpp-lib/**  linguist-vendored
+
+# Normalize line endings for text.
+* text=auto

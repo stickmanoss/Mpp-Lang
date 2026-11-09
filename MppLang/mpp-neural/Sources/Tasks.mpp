@@ -1,0 +1,257 @@
+// neural — Tasks: Create ML-style one-call training on tables.
+//
+//   let classifier = try MLClassifier(trainingData: train, targetColumn: "species")
+//   print(classifier.trainingMetrics)                 // accuracy, per-class precision/recall
+//   let metrics = try classifier.evaluation(on: test)
+//   let labels = try classifier.predictions(from: newRows)
+//
+//   let regressor = try MLRegressor(trainingData: houses, targetColumn: "price")
+//   print(try regressor.evaluation(on: test))         // RMSE, MAE, R²
+//
+// Feature columns default to every other column. Numeric features are
+// standardized; text features are one-hot encoded. Under the hood it is
+// an MLP trained with Adam on mini-batches.
+
+public struct TrainingParameters: Sendable {
+    public var hiddenLayers: [Int] = [64, 64]
+    public var epochs = 200
+    public var batchSize = 32
+    public var learningRate: Float = 1e-2
+    public var weightDecay: Float = 1e-4
+    public var seed: UInt64 = 0
+    public init() {}
+    public init(hiddenLayers: [Int] = [64, 64], epochs: Int = 200, batchSize: Int = 32,
+                learningRate: Float = 1e-2, weightDecay: Float = 1e-4, seed: UInt64 = 0) {
+        self.hiddenLayers = hiddenLayers; self.epochs = epochs; self.batchSize = batchSize
+        self.learningRate = learningRate; self.weightDecay = weightDecay; self.seed = seed
+    }
+}
+
+/// Turns table columns into a standardized feature tensor (fit once on training data).
+public struct FeatureEncoder: Sendable {
+    enum Kind: Sendable { case numeric(mean: Double, std: Double), categorical([String]) }
+    let columns: [(String, Kind)]
+    public var width: Int {
+        columns.reduce(0) { w, c in if case .categorical(let v) = c.1 { return w + v.count }; return w + 1 }
+    }
+
+    init(fitting df: DataFrame, features: [String]) throws(DataFrameError) {
+        var cols: [(String, Kind)] = []
+        for f in features {
+            switch df[f] {
+            case .numbers?:
+                let v = try df.numbers(f)
+                let mean = v.reduce(0, +) / Double(Swift.max(v.count, 1))
+                let std = (v.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(Swift.max(v.count, 1))).squareRoot()
+                cols.append((f, .numeric(mean: mean, std: Swift.max(std, 1e-8))))
+            case .strings?:
+                cols.append((f, .categorical(Array(Set(try df.strings(f))).sorted())))
+            case nil:
+                throw DataFrameError(description: "no feature column '\(f)' (have \(df.columnNames))")
+            }
+        }
+        columns = cols
+    }
+
+    func encode(_ df: DataFrame) throws(DataFrameError) -> Tensor {
+        var data = [Float](repeating: 0, count: df.rowCount * width)
+        var offset = 0
+        for (name, kind) in columns {
+            switch kind {
+            case .numeric(let mean, let std):
+                let v = try df.numbers(name, fill: mean)
+                for r in 0 ..< df.rowCount { data[r * width + offset] = Float((v[r] - mean) / std) }
+                offset += 1
+            case .categorical(let values):
+                let v = try df.strings(name)
+                let index = Dictionary(uniqueKeysWithValues: values.enumerated().map { ($1, $0) })
+                for r in 0 ..< df.rowCount { if let k = index[v[r]] { data[r * width + offset + k] = 1 } }
+                offset += values.count
+            }
+        }
+        return Tensor(data: data, shape: [df.rowCount, width])
+    }
+}
+
+func _mlp(_ inputs: Int, _ hidden: [Int], _ outputs: Int) -> Sequential {
+    var layers: [Module] = []
+    var width = inputs
+    for h in hidden { layers.append(Linear(width, h)); layers.append(ReLU()); width = h }
+    layers.append(Linear(width, outputs))
+    return Sequential(layers: layers)
+}
+
+// MARK: - Classification
+
+public struct ClassifierMetrics: CustomStringConvertible, Sendable {
+    public let classes: [String]
+    /// confusion[actual][predicted]
+    public let confusion: [[Int]]
+
+    public var accuracy: Double {
+        let total = confusion.flatMap { $0 }.reduce(0, +)
+        return total == 0 ? 0 : Double((0 ..< classes.count).reduce(0) { $0 + confusion[$1][$1] }) / Double(total)
+    }
+    public func precision(_ k: Int) -> Double {
+        let p = (0 ..< classes.count).reduce(0) { $0 + confusion[$1][k] }
+        return p == 0 ? 0 : Double(confusion[k][k]) / Double(p)
+    }
+    public func recall(_ k: Int) -> Double {
+        let a = confusion[k].reduce(0, +)
+        return a == 0 ? 0 : Double(confusion[k][k]) / Double(a)
+    }
+    public func f1(_ k: Int) -> Double {
+        let p = precision(k), r = recall(k)
+        return p + r == 0 ? 0 : 2 * p * r / (p + r)
+    }
+    public var macroF1: Double { (0 ..< classes.count).map(f1).reduce(0, +) / Double(Swift.max(classes.count, 1)) }
+
+    public var description: String {
+        var lines = [format("accuracy {:.2%}   macro-F1 {:.3f}", accuracy, macroF1),
+                     format("{:<16} {:>9} {:>9} {:>9}", "class", "precision", "recall", "f1")]
+        for (k, c) in classes.enumerated() {
+            lines.append(format("{:<16} {:>9.3f} {:>9.3f} {:>9.3f}", c, precision(k), recall(k), f1(k)))
+        }
+        lines.append("confusion (rows = actual):")
+        for row in confusion { lines.append("  " + row.map { format("{:>5}", $0) }.joined()) }
+        return lines.joined(separator: "\n")
+    }
+
+    init(actual: [Int], predicted: [Int], classes: [String]) {
+        self.classes = classes
+        var m = [[Int]](repeating: [Int](repeating: 0, count: classes.count), count: classes.count)
+        for (a, p) in zip(actual, predicted) { m[a][p] += 1 }
+        confusion = m
+    }
+}
+
+public final class MLClassifier {
+    public let targetColumn: String
+    public let featureColumns: [String]
+    public let model: Sequential
+    public let labels: LabelEncoder
+    let features: FeatureEncoder
+    public private(set) var trainingMetrics: ClassifierMetrics
+    public private(set) var lossHistory: [Float] = []
+
+    public init(trainingData df: DataFrame, targetColumn: String, featureColumns: [String]? = nil,
+                parameters p: TrainingParameters = TrainingParameters()) throws {
+        self.targetColumn = targetColumn
+        self.featureColumns = featureColumns ?? df.columnNames.filter { $0 != targetColumn }
+        features = try FeatureEncoder(fitting: df, features: self.featureColumns)
+        var enc = LabelEncoder()
+        let y = enc.fitTransform(try df.strings(targetColumn))
+        labels = enc
+        Init.seed(p.seed)
+        let net = _mlp(features.width, p.hiddenLayers, enc.classes.count)
+        model = net
+        let x = try features.encode(df)
+        let optimizer = Adam(schedule: .cosineDecay(p.learningRate, steps: p.epochs * ((y.count + p.batchSize - 1) / p.batchSize)),
+                             weightDecay: p.weightDecay)
+        let step = valueAndGrad(net) { (m: Sequential, xb: Tensor, yb: [Int]) in crossEntropy(m(xb), yb) }
+        var history: [Float] = []
+        for epoch in 0 ..< p.epochs {
+            var total: Float = 0
+            for (xb, yb) in batches(x, y, batchSize: p.batchSize, shuffle: true, seed: p.seed &+ UInt64(epoch)) {
+                total += step(net, xb, yb) * Float(yb.count)
+                optimizer.update(net)
+            }
+            history.append(total / Float(y.count))
+        }
+        lossHistory = history
+        net.eval()
+        let predicted = withNoGrad { net(x).argmax() }
+        trainingMetrics = ClassifierMetrics(actual: y, predicted: predicted, classes: enc.classes)
+    }
+
+    public func predictions(from df: DataFrame) throws -> [String] {
+        let x = try features.encode(df)
+        return labels.inverse(withNoGrad { model(x).argmax() })
+    }
+
+    /// Class probabilities per row, columns in `labels.classes` order.
+    public func probabilities(from df: DataFrame) throws -> Tensor {
+        let x = try features.encode(df)
+        return withNoGrad { model(x).softmax() }
+    }
+
+    public func evaluation(on df: DataFrame) throws -> ClassifierMetrics {
+        let actual = labels.transform(try df.strings(targetColumn))
+        let x = try features.encode(df)
+        return ClassifierMetrics(actual: actual, predicted: withNoGrad { model(x).argmax() }, classes: labels.classes)
+    }
+}
+
+// MARK: - Regression
+
+public struct RegressorMetrics: CustomStringConvertible, Sendable {
+    public let rmse: Double
+    public let mae: Double
+    public let r2: Double
+    public var description: String { format("RMSE {:.4f}   MAE {:.4f}   R² {:.4f}", rmse, mae, r2) }
+
+    init(actual: [Double], predicted: [Double]) {
+        let n = Double(Swift.max(actual.count, 1))
+        let errors = zip(actual, predicted).map { $0 - $1 }
+        rmse = (errors.map { $0 * $0 }.reduce(0, +) / n).squareRoot()
+        mae = errors.map { Swift.abs($0) }.reduce(0, +) / n
+        let mean = actual.reduce(0, +) / n
+        let total = actual.map { ($0 - mean) * ($0 - mean) }.reduce(0, +)
+        r2 = total == 0 ? 0 : 1 - errors.map { $0 * $0 }.reduce(0, +) / total
+    }
+}
+
+public final class MLRegressor {
+    public let targetColumn: String
+    public let featureColumns: [String]
+    public let model: Sequential
+    let features: FeatureEncoder
+    let targetMean: Double
+    let targetStd: Double
+    public private(set) var trainingMetrics: RegressorMetrics
+    public private(set) var lossHistory: [Float] = []
+
+    public init(trainingData df: DataFrame, targetColumn: String, featureColumns: [String]? = nil,
+                parameters p: TrainingParameters = TrainingParameters()) throws {
+        self.targetColumn = targetColumn
+        self.featureColumns = featureColumns ?? df.columnNames.filter { $0 != targetColumn }
+        features = try FeatureEncoder(fitting: df, features: self.featureColumns)
+        let raw = try df.numbers(targetColumn)
+        let tMean = raw.reduce(0, +) / Double(Swift.max(raw.count, 1))
+        var sq = 0.0
+        for v in raw { sq += (v - tMean) * (v - tMean) }
+        let tStd = Swift.max((sq / Double(Swift.max(raw.count, 1))).squareRoot(), 1e-8)
+        targetMean = tMean
+        targetStd = tStd
+        let y = Tensor(data: raw.map { Float(($0 - tMean) / tStd) }, shape: [raw.count, 1])
+        Init.seed(p.seed)
+        let net = _mlp(features.width, p.hiddenLayers, 1)
+        model = net
+        let x = try features.encode(df)
+        let optimizer = Adam(schedule: .cosineDecay(p.learningRate, steps: p.epochs * ((raw.count + p.batchSize - 1) / p.batchSize)),
+                             weightDecay: p.weightDecay)
+        let step = valueAndGrad(net) { (m: Sequential, xb: Tensor, yb: Tensor) in mse(m(xb), yb) }
+        var history: [Float] = []
+        for epoch in 0 ..< p.epochs {
+            var total: Float = 0
+            for (xb, yb) in batches(x, y, batchSize: p.batchSize, shuffle: true, seed: p.seed &+ UInt64(epoch)) {
+                total += step(net, xb, yb) * Float(yb.shape[0])
+                optimizer.update(net)
+            }
+            history.append(total / Float(raw.count))
+        }
+        lossHistory = history
+        net.eval()
+        let fitted = withNoGrad { net(x) }.data.map { Double($0) * tStd + tMean }
+        trainingMetrics = RegressorMetrics(actual: raw, predicted: fitted)
+    }
+
+    public func predictions(from df: DataFrame) throws -> [Double] {
+        let x = try features.encode(df)
+        return withNoGrad { model(x) }.data.map { Double($0) * targetStd + targetMean }
+    }
+
+    public func evaluation(on df: DataFrame) throws -> RegressorMetrics {
+        RegressorMetrics(actual: try df.numbers(targetColumn), predicted: try predictions(from: df))
+    }
+}

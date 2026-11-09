@@ -1,0 +1,49 @@
+// Every MppUI control in Liquid Glass: `mpp examples/liquidglass-controls.mpp`.
+// Hold a switch, a slider or the segmented control to see its knob turn to glass.
+import MppUI
+
+struct Controls: View {
+    @State private var wifi = true
+    @State private var bluetooth = false
+    @State private var airdrop = true
+    @State private var brightness = 0.62
+    @State private var volume = 0.35
+    @State private var mode = "Auto"
+    @State private var size = 3
+    @State private var name = "Omar's MacBook Pro"
+    @State private var agree = true
+    @State private var accent = 1
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 18) {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Control Center").font(.title2.bold())
+                Toggle("Wi-Fi", isOn: $wifi).toggleStyle(.switch)
+                Toggle("Bluetooth", isOn: $bluetooth).toggleStyle(.switch)
+                Toggle("AirDrop", isOn: $airdrop).toggleStyle(.switch)
+                HStack { Image(systemName: "sun.max"); Slider(value: $brightness) }
+                HStack { Image(systemName: "speaker.wave.2"); Slider(value: $volume, in: 0 ... 1, step: 0.1) }
+                Picker("", selection: $mode) {
+                    Text("Light").tag("Light"); Text("Dark").tag("Dark"); Text("Auto").tag("Auto")
+                }.pickerStyle(.segmented)
+            }
+            .frame(width: 270)
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Sharing").font(.title2.bold())
+                TextField("Computer name", text: $name)
+                Stepper("Text size: \(size)", value: $size, in: 1 ... 7)
+                Toggle("I agree to the terms", isOn: $agree)
+                ProgressView(value: brightness)
+                HStack(spacing: 10) {
+                    Button("Cancel") {}
+                    Button("Share") {}.buttonStyle(.glassProminent)
+                    ProgressView()
+                }
+            }
+            .frame(width: 270)
+        }
+        .padding(24)
+    }
+}
+
+app("Liquid Glass", width: 640, height: 380) { Controls() }

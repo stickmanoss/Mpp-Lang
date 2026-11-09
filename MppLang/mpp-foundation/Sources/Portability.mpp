@@ -1,0 +1,41 @@
+// MppFoundation — what the swift-foundation sources need from Swift 6.2
+// (Span, MutableRawSpan, InlineArray, `[unchecked:]`), provided for the
+// Swift 6.0 toolchain M++ builds with. Everything else in this module is
+// the fork's own code, converted to M++ (see README in this folder).
+
+/// A writable view of raw bytes (Swift 6.2's MutableRawSpan, the subset used here).
+struct MutableRawSpan {
+    var base: UnsafeMutableRawPointer
+    var byteCount: Int
+    @inline(__always) func storeBytes<T>(of value: T, toUncheckedByteOffset offset: Int, as type: T.Type) {
+        base.storeBytes(of: value, toByteOffset: offset, as: T.self)
+    }
+    @inline(__always) func _mutatingExtracting(unchecked r: Range<Int>) -> MutableRawSpan {
+        MutableRawSpan(base: base + r.lowerBound, byteCount: r.count)
+    }
+}
+
+extension Array {
+    /// The element at `i`; in M++ this is still bounds-checked (the name is kept from the original).
+    @inline(__always) subscript(unchecked i: Int) -> Element { self[i] }
+}
+extension UnsafeBufferPointer {
+    @inline(__always) subscript(unchecked i: Int) -> Element { self[i] }
+}
+
+extension UInt8 {
+    static let _plus = UInt8(ascii: "+")
+    static let _minus = UInt8(ascii: "-")
+}
+
+// The NSDecimal C-style API under its usual names (in the fork these are
+// Apple-framework-only, with `_`-prefixed SPI versions for corelibs).
+@discardableResult public func NSDecimalAdd(_ r: UnsafeMutablePointer<Decimal>, _ a: UnsafePointer<Decimal>, _ b: UnsafePointer<Decimal>, _ m: Decimal.RoundingMode) -> Decimal.CalculationError { _NSDecimalAdd(r, a, b, m) }
+@discardableResult public func NSDecimalSubtract(_ r: UnsafeMutablePointer<Decimal>, _ a: UnsafePointer<Decimal>, _ b: UnsafePointer<Decimal>, _ m: Decimal.RoundingMode) -> Decimal.CalculationError { _NSDecimalSubtract(r, a, b, m) }
+@discardableResult public func NSDecimalMultiply(_ r: UnsafeMutablePointer<Decimal>, _ a: UnsafePointer<Decimal>, _ b: UnsafePointer<Decimal>, _ m: Decimal.RoundingMode) -> Decimal.CalculationError { _NSDecimalMultiply(r, a, b, m) }
+@discardableResult public func NSDecimalDivide(_ r: UnsafeMutablePointer<Decimal>, _ a: UnsafePointer<Decimal>, _ b: UnsafePointer<Decimal>, _ m: Decimal.RoundingMode) -> Decimal.CalculationError { _NSDecimalDivide(r, a, b, m) }
+@discardableResult public func NSDecimalPower(_ r: UnsafeMutablePointer<Decimal>, _ d: UnsafePointer<Decimal>, _ e: Int, _ m: Decimal.RoundingMode) -> Decimal.CalculationError { _NSDecimalPower(r, d, e, m) }
+public func NSDecimalCompare(_ a: UnsafePointer<Decimal>, _ b: UnsafePointer<Decimal>) -> ComparisonResult { _NSDecimalCompare(a, b) }
+public func NSDecimalRound(_ r: UnsafeMutablePointer<Decimal>, _ d: UnsafePointer<Decimal>, _ scale: Int, _ m: Decimal.RoundingMode) { _NSDecimalRound(r, d, scale, m) }
+public func NSDecimalCompact(_ d: UnsafeMutablePointer<Decimal>) { _NSDecimalCompact(d) }
+public func NSDecimalString(_ d: UnsafePointer<Decimal>, _ separator: String = ".") -> String { _NSDecimalString(d, separator) }

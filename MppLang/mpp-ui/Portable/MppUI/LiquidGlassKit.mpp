@@ -1,0 +1,204 @@
+// MppUI — the Liquid Glass look (macOS Tahoe / iOS 26), drawn by MppUI's
+// own engine.
+//
+// The details follow Apple's controls:
+//   • capsule shapes and concentric corners; controls a little taller than before;
+//   • switches with a wide track and a capsule knob that slides on a spring,
+//     and while pressed swells into a clear glass lens that refracts the track;
+//   • slider knobs and the segmented control's selection do the same;
+//   • the selection glides between segments;
+//   • push buttons are soft glass bezels that brighten and swell slightly when
+//     pressed; prominent buttons are tinted glass;
+//   • pop-up buttons lose the blue box: gray chevrons on the bezel;
+//   • sheets, alerts and menus are frosted glass panels with large radii;
+//   • fills use Apple's system grays (118, 118, 128 at 12–20%).
+// Animations settle immediately in headless renders, so screenshots repeat.
+
+import MppUIEngine
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+// MARK: - Design values
+
+enum LG {
+    /// Apple's tertiary system fill: tracks, the segmented control.
+    static let track = Color(red: 118 / 255, green: 118 / 255, blue: 128 / 255, opacity: 0.18)
+    static let trackStrong = Color(red: 118 / 255, green: 118 / 255, blue: 128 / 255, opacity: 0.26)
+    static let hairline: UInt32 = 0x1A_00_00_00
+    static let windowBackground: UInt32 = 0xFF_F3_F3_F5
+    /// Regular control height on macOS Tahoe.
+    static let controlHeight: Double = 26
+    nonisolated(unsafe) static let switchSize = Size(width: 42, height: 24)
+}
+
+// MARK: - Springs
+
+/// A critically damped spring per key, advanced once per frame.
+enum Springs {
+    nonisolated(unsafe) static var state: [String: (value: Double, velocity: Double, target: Double)] = [:]
+    nonisolated(unsafe) static var lastTime: Double = 0
+    nonisolated(unsafe) static var dt: Double = 1.0 / 60
+    /// True while some spring hasn't settled (the app keeps drawing frames).
+    nonisolated(unsafe) static var moving = false
+
+    static func now() -> Double {
+        var ts = timespec()
+        clock_gettime(CLOCK_MONOTONIC, &ts)
+        return Double(ts.tv_sec) + Double(ts.tv_nsec) / 1e9
+    }
+
+    /// Call at the start of each frame.
+    static func beginFrame() {
+        let t = now()
+        dt = lastTime == 0 ? 1.0 / 60 : Swift.min(1.0 / 20, Swift.max(1.0 / 240, t - lastTime))
+        lastTime = t
+        moving = false
+    }
+
+    /// The value at `key` moving toward `target`. `response` is the time to
+    /// mostly get there (seconds); `bounce` adds a little overshoot.
+    static func value(_ key: String, _ target: Double, response: Double = 0.28, bounce: Double = 0) -> Double {
+        if mppui_is_headless() != 0 { return target }
+        guard var s = state[key] else {
+            state[key] = (target, 0, target)
+            return target
+        }
+        s.target = target
+        let omega = 2 * Double.pi / Swift.max(0.05, response)
+        let zeta = Swift.max(0.2, 1 - bounce)
+        // Semi-implicit Euler in a few substeps.
+        let steps = 4
+        let h = dt / Double(steps)
+        for _ in 0 ..< steps {
+            let a = -2 * zeta * omega * s.velocity - omega * omega * (s.value - target)
+            s.velocity += a * h
+            s.value += s.velocity * h
+        }
+        if abs(s.value - target) < 0.0005 && abs(s.velocity) < 0.005 { s.value = target; s.velocity = 0 } else { moving = true }
+        state[key] = s
+        return s.value
+    }
+}
+
+// MARK: - Drawing
+
+func lgMix(_ a: Color, _ b: Color, _ t: Double) -> Color {
+    let t = Swift.max(0, Swift.min(1, t))
+    func c(_ v: UInt32, _ shift: UInt32) -> Double { Double((v >> shift) & 255) }
+    func m(_ s: UInt32) -> UInt32 { UInt32((c(a.argb, s) + (c(b.argb, s) - c(a.argb, s)) * t).rounded()) << s }
+    return Color(argb: m(24) | m(16) | m(8) | m(0))
+}
+
+func lgLighter(_ c: Color, _ amount: Double) -> Color { lgMix(c, Color(argb: (c.argb & 0xFF00_0000) | 0x00FF_FFFF), amount) }
+
+/// A clear glass lens: what knobs turn into while held.
+func lgLens(_ x: Float, _ y: Float, _ w: Float, _ h: Float, strength: Float) {
+    guard strength > 0.01 else { return }
+    var g = MppUIGlass()
+    g.refraction = 0.02 * strength
+    g.bevelDepth = 0.10 * strength
+    g.bevelWidth = 0.35
+    g.aberration = 0.12 * strength
+    g.magnify = 1 + 0.12 * strength
+    g.specular = true
+    g.shadow = true
+    g.opacity = strength
+    mppui_glass_effect(x, y, w, h, Swift.min(w, h) / 2, g)
+    mppui_stroke_rounded_rect(x + 0.5, y + 0.5, w - 1, h - 1, Swift.min(w, h) / 2 - 0.5, 1, Color(white: 1, opacity: 0.55 * Double(strength)).argb)
+}
+
+/// A white capsule knob that becomes a glass lens as `lens` goes 0 → 1,
+/// swelling by up to `grow`.
+func lgKnob(cx: Float, cy: Float, w: Float, h: Float, lens: Double, grow: Float = 0.45) {
+    let l = Float(Swift.max(0, Swift.min(1, lens)))
+    let s = 1 + grow * l
+    let kw = w * s, kh = h * s
+    let x = cx - kw / 2, y = cy - kh / 2
+    let r = Swift.min(kw, kh) / 2
+    if l < 0.999 {
+        mppui_push_opacity(1 - l)
+        mppui_shadow(x, y + 1, kw, kh, r, 3, 0x33_00_00_00)
+        mppui_shadow(x, y, kw, kh, r, 0.8, 0x14_00_00_00)
+        mppui_fill_rounded_rect(x, y, kw, kh, r, 0xFF_FF_FF_FF)
+        mppui_pop_opacity()
+    }
+    lgLens(x, y, kw, kh, strength: l)
+}
+
+/// A Tahoe push-button bezel: a soft, slightly glassy white capsule-ish
+/// rounded rectangle that brightens and swells a touch when pressed.
+func lgBezel(_ x: Float, _ y: Float, _ w: Float, _ h: Float, radius: Float? = nil, press: Double = 0, glassBackdrop: Bool = false) {
+    let p = Float(press)
+    let grow = 1.5 * p
+    let (bx, by, bw, bh) = (x - grow, y - grow * 0.5, w + 2 * grow, h + grow)
+    let r = radius ?? Swift.min(bh / 2, 9)
+    mppui_shadow(bx, by + 0.5, bw, bh, r, 2.5, 0x22_00_00_00)
+    mppui_shadow(bx, by + 2, bw, bh, r, 8, 0x0C_00_00_00)
+    if glassBackdrop {
+        var g = MppUIGlass()
+        g.frost = 1.5
+        g.bevelDepth = 0.04
+        g.bevelWidth = 0.3
+        g.shadow = false
+        mppui_glass_effect(bx, by, bw, bh, r, g)
+        mppui_fill_rounded_rect(bx, by, bw, bh, r, lgMix(Color(argb: 0x8C_FF_FF_FF), Color(argb: 0xA6_FF_FF_FF), Double(p)).argb)
+    } else {
+        mppui_linear_gradient(bx, by, bw, bh, r, lgMix(Color(argb: 0xFF_FF_FF_FF), Color(argb: 0xFF_F0_F0_F2), Double(p)).argb,
+                              lgMix(Color(argb: 0xFF_F8_F8_FA), Color(argb: 0xFF_E6_E6_EA), Double(p)).argb, 90)
+    }
+    // The glass rim: a bright upper edge, a faint dark outline.
+    mppui_stroke_rounded_rect(bx + 0.5, by + 0.5, bw - 1, bh - 1, r - 0.5, 1, 0x99_FF_FF_FF)
+    mppui_stroke_rounded_rect(bx, by, bw, bh, r, 0.5, LG.hairline)
+}
+
+/// A prominent (tinted) bezel: the accent color as glass.
+func lgProminentBezel(_ x: Float, _ y: Float, _ w: Float, _ h: Float, tint: Color, radius: Float? = nil, press: Double = 0) {
+    let p = Float(press)
+    let grow = 1.5 * p
+    let (bx, by, bw, bh) = (x - grow, y - grow * 0.5, w + 2 * grow, h + grow)
+    let r = radius ?? Swift.min(bh / 2, 9)
+    mppui_shadow(bx, by + 0.5, bw, bh, r, 2, tint.opacity(0.28).argb)
+    let top = lgLighter(tint, 0.12 + 0.1 * Double(p)), bottom = lgMix(tint, Color(argb: 0xFF_00_00_00), 0.03)
+    mppui_linear_gradient(bx, by, bw, bh, r, top.argb, bottom.argb, 90)
+    // A glass sheen on the upper half.
+    mppui_linear_gradient(bx + 1, by + 1, bw - 2, bh / 2, Swift.max(0, r - 1), 0x2E_FF_FF_FF, 0x00_FF_FF_FF, 90)
+}
+
+/// A Liquid Glass control surface (`.glass` buttons, glass fields).
+func lgGlass(_ x: Float, _ y: Float, _ w: Float, _ h: Float, radius: Float, tint: Color? = nil, press: Double = 0) {
+    let p = Float(press)
+    let grow = 2 * p
+    var g = MppUIGlass()
+    g.frost = 1
+    g.bevelDepth = 0.06
+    g.bevelWidth = 0.25
+    g.refraction = 0.01
+    g.specular = true
+    g.magnify = 1 + 0.04 * p
+    mppui_glass_effect(x - grow, y - grow * 0.5, w + 2 * grow, h + grow, radius + grow * 0.5, g)
+    // A wash over the glass: white for clear glass, the tint for prominent glass.
+    let wash = tint ?? Color(white: 1, opacity: 0.22 + 0.16 * Double(p))
+    mppui_fill_rounded_rect(x - grow, y - grow * 0.5, w + 2 * grow, h + grow, radius + grow * 0.5, wash.argb)
+    mppui_stroke_rounded_rect(x - grow + 0.5, y - grow * 0.5 + 0.5, w + 2 * grow - 1, h + grow - 1, radius + grow * 0.5 - 0.5, 1,
+                              tint == nil ? 0x8C_FF_FF_FF : 0x47_FF_FF_FF)
+}
+
+/// A frosted glass panel: sheets, alerts, menus, popovers.
+func lgPanel(_ x: Float, _ y: Float, _ w: Float, _ h: Float, radius: Float, lift: Float = 24) {
+    mppui_shadow(x, y + lift / 4, w, h, radius, lift, 0x38_00_00_00)
+    var g = MppUIGlass()
+    g.frost = 12
+    g.bevelDepth = 0.02
+    g.bevelWidth = 0.08
+    g.shadow = false
+    g.specular = false
+    mppui_glass_effect(x, y, w, h, radius, g)
+    mppui_fill_rounded_rect(x, y, w, h, radius, 0xB8_F7_F7_F9)
+    mppui_stroke_rounded_rect(x + 0.5, y + 0.5, w - 1, h - 1, radius - 0.5, 1, 0x80_FF_FF_FF)
+    mppui_stroke_rounded_rect(x, y, w, h, radius, 0.5, 0x24_00_00_00)
+}

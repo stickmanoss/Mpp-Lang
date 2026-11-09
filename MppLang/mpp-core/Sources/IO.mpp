@@ -1,0 +1,836 @@
+// MppCore — I/O.
+//
+// File            move-only file handle; closes itself; errors are typed
+// FS              one-line whole-file helpers, including atomic writes
+// BufferedWriter  fast buffered output (stdout or any file)
+// TokenReader     fast whitespace-token / line input (cin >> x, done right)
+// ByteWriter      binary encoding with explicit endianness
+// ByteReader      bounds-checked binary decoding
+// MappedFile      read-only memory-mapped file
+//
+// Built directly on POSIX, with no Foundation dependency, so it is small
+// and fast. Every failure is an `IOError` carrying errno, the operation
+// and the path.
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+// MARK: - Errors
+
+public struct IOError: Error, CustomStringConvertible, Sendable, Equatable {
+    public enum Kind: Sendable, Equatable {
+        case system(errno: Int32)
+        case unexpectedEndOfData
+        case invalidData(String)
+    }
+    public let kind: Kind
+    public let operation: String
+    public let path: String?
+
+    public init(_ kind: Kind, operation: String, path: String? = nil) {
+        self.kind = kind; self.operation = operation; self.path = path
+    }
+
+    @usableFromInline
+    static func errno(_ op: String, _ path: String?) -> IOError {
+        IOError(.system(errno: Glibc_or_Darwin_errno()), operation: op, path: path)
+    }
+
+    public var errno: Int32? { if case .system(let e) = kind { return e } else { return nil } }
+
+    /// Portable checks for the common cases, so callers don't need errno constants.
+    public var isNotFound: Bool { errno == ENOENT }
+    public var isAlreadyExists: Bool { errno == EEXIST }
+    public var isPermissionDenied: Bool { errno == EACCES || errno == EPERM }
+    public var isDirectory: Bool { errno == EISDIR }
+
+    public var description: String {
+        let what: String
+        switch kind {
+        case .system(let e): what = String(cString: strerror(e))
+        case .unexpectedEndOfData: what = "unexpected end of data"
+        case .invalidData(let msg): what = "invalid data: \(msg)"
+        }
+        if let path { return "\(operation) '\(path)': \(what)" }
+        return "\(operation): \(what)"
+    }
+}
+
+// The stdlib's withUnsafe* helpers are untyped `rethrows`; these two keep
+// errors typed as IOError across them.
+@usableFromInline @inline(__always)
+func _typedIO<R>(_ body: (inout IOError?) -> R) throws(IOError) -> R {
+    var error: IOError? = nil
+    let r = body(&error)
+    if let error { throw error }
+    return r
+}
+
+@usableFromInline @inline(__always) @discardableResult
+func _capture<R>(_ error: inout IOError?, _ body: () throws(IOError) -> R) -> R? {
+    do { return try body() } catch let e { error = e; return nil }
+}
+
+@usableFromInline @inline(__always)
+func Glibc_or_Darwin_errno() -> Int32 { errno }
+
+// MARK: - File
+
+/// An open file. Move-only: it cannot be copied, it is closed exactly once
+/// when it goes out of scope, and using it after `close()` does not compile.
+public struct File: ~Copyable {
+    public enum Mode: Sendable {
+        /// Read an existing file.
+        case read
+        /// Create or truncate, then write.
+        case write
+        /// Create if needed, write at the end.
+        case append
+        /// Read and write an existing file.
+        case readWrite
+        /// Create a new file; fails if it already exists.
+        case createNew
+    }
+
+    public private(set) var descriptor: Int32
+    public let path: String
+
+    public init(_ path: String, _ mode: Mode = .read, permissions: UInt32 = 0o644) throws(IOError) {
+        var flags: Int32 = O_CLOEXEC
+        switch mode {
+        case .read: flags |= O_RDONLY
+        case .write: flags |= O_WRONLY | O_CREAT | O_TRUNC
+        case .append: flags |= O_WRONLY | O_CREAT | O_APPEND
+        case .readWrite: flags |= O_RDWR
+        case .createNew: flags |= O_WRONLY | O_CREAT | O_EXCL
+        }
+        var fd: Int32
+        repeat { fd = open(path, flags, mode_t(permissions)) } while fd < 0 && errno == EINTR
+        guard fd >= 0 else { throw IOError.errno("open", path) }
+        self.descriptor = fd
+        self.path = path
+    }
+
+    /// Wraps an existing descriptor (e.g. 0, 1, 2). The File takes ownership.
+    public init(adopting descriptor: Int32, path: String = "<fd>") {
+        self.descriptor = descriptor
+        self.path = path
+    }
+
+    deinit { if descriptor >= 0 { _ = Glibc_or_Darwin_close(descriptor) } }
+
+    /// Closes now and reports errors that a silent close would hide.
+    public consuming func close() throws(IOError) {
+        let fd = descriptor
+        descriptor = -1
+        if Glibc_or_Darwin_close(fd) != 0 { throw IOError.errno("close", path) }
+    }
+
+    /// Reads up to `buffer.count` bytes. Returns 0 at end of file.
+    public borrowing func read(into buffer: UnsafeMutableRawBufferPointer) throws(IOError) -> Int {
+        guard let base = buffer.baseAddress, buffer.count > 0 else { return 0 }
+        while true {
+            let n = Glibc_or_Darwin_read(descriptor, base, buffer.count)
+            if n >= 0 { return n }
+            if errno != EINTR { throw IOError.errno("read", path) }
+        }
+    }
+
+    /// Reads the rest of the file.
+    public borrowing func readAll() throws(IOError) -> [UInt8] {
+        var result: [UInt8] = []
+        var chunk = 64 * 1024
+        if let s = try? size(), s > 0 { result.reserveCapacity(Int(s)); chunk = max(chunk, Int(s) + 1) }
+        var buf = [UInt8](repeating: 0, count: chunk)
+        while true {
+            let n = try _typedIO { (e: inout IOError?) in
+                buf.withUnsafeMutableBytes { b in _capture(&e) { () throws(IOError) in try read(into: b) } ?? 0 }
+            }
+            if n == 0 { return result }
+            result.append(contentsOf: buf[0..<n])
+        }
+    }
+
+    /// Reads the rest of the file as UTF-8 text (invalid bytes become U+FFFD).
+    public borrowing func readText() throws(IOError) -> String {
+        String(decoding: try readAll(), as: UTF8.self)
+    }
+
+    /// Writes every byte, retrying short writes and EINTR.
+    public borrowing func write(_ bytes: UnsafeRawBufferPointer) throws(IOError) {
+        guard var p = bytes.baseAddress else { return }
+        var left = bytes.count
+        while left > 0 {
+            let n = Glibc_or_Darwin_write(descriptor, p, left)
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw IOError.errno("write", path)
+            }
+            p += n; left -= n
+        }
+    }
+
+    public borrowing func write(_ bytes: [UInt8]) throws(IOError) {
+        try _typedIO { (e: inout IOError?) in bytes.withUnsafeBytes { b in _capture(&e) { () throws(IOError) in try write(b) } } }
+    }
+
+    public borrowing func write(_ text: String) throws(IOError) {
+        var t = text
+        try _typedIO { (e: inout IOError?) in t.withUTF8 { u in _capture(&e) { () throws(IOError) in try write(UnsafeRawBufferPointer(u)) } } }
+    }
+
+    /// Moves the read/write position; returns the new absolute offset.
+    @discardableResult
+    public borrowing func seek(to offset: Int64, from whence: Int32 = SEEK_SET) throws(IOError) -> Int64 {
+        let r = lseek(descriptor, off_t(offset), whence)
+        if r < 0 { throw IOError.errno("seek", path) }
+        return Int64(r)
+    }
+
+    public borrowing func position() throws(IOError) -> Int64 { try seek(to: 0, from: SEEK_CUR) }
+
+    public borrowing func size() throws(IOError) -> Int64 {
+        var st = stat()
+        if fstat(descriptor, &st) != 0 { throw IOError.errno("stat", path) }
+        return Int64(st.st_size)
+    }
+
+    /// Flushes OS buffers to the device (fsync).
+    public borrowing func sync() throws(IOError) {
+        if fsync(descriptor) != 0 { throw IOError.errno("sync", path) }
+    }
+
+    /// Calls `body` for each line, without the line terminator. Streams, so
+    /// memory use stays small for huge files.
+    public borrowing func forEachLine(_ body: (String) throws -> Void) throws {
+        var reader = TokenReader(descriptor: descriptor, path: path)
+        while let line = try reader.readLine() { try body(line) }
+    }
+}
+
+@usableFromInline @inline(__always) func Glibc_or_Darwin_close(_ fd: Int32) -> Int32 { close(fd) }
+@usableFromInline @inline(__always) func Glibc_or_Darwin_read(_ fd: Int32, _ p: UnsafeMutableRawPointer, _ n: Int) -> Int { read(fd, p, n) }
+@usableFromInline @inline(__always) func Glibc_or_Darwin_write(_ fd: Int32, _ p: UnsafeRawPointer, _ n: Int) -> Int { write(fd, p, n) }
+
+// MARK: - FS: whole-file helpers
+
+public enum FS {
+    public static func read(_ path: String) throws(IOError) -> String {
+        try File(path).readText()
+    }
+
+    public static func readBytes(_ path: String) throws(IOError) -> [UInt8] {
+        try File(path).readAll()
+    }
+
+    /// Writes `text` to `path`. With `atomic: true` (the default) readers see
+    /// either the old file or the complete new one, never a partial write:
+    /// data goes to a temporary file, is synced, then renamed into place.
+    public static func write(_ path: String, _ text: String, atomic: Bool = true) throws(IOError) {
+        var t = text
+        try _typedIO { (e: inout IOError?) in t.withUTF8 { u in _capture(&e) { () throws(IOError) in try writeBytes(path, UnsafeRawBufferPointer(u), atomic: atomic) } } }
+    }
+
+    public static func write(_ path: String, bytes: [UInt8], atomic: Bool = true) throws(IOError) {
+        try _typedIO { (e: inout IOError?) in bytes.withUnsafeBytes { b in _capture(&e) { () throws(IOError) in try writeBytes(path, b, atomic: atomic) } } }
+    }
+
+    static func writeBytes(_ path: String, _ bytes: UnsafeRawBufferPointer, atomic: Bool) throws(IOError) {
+        guard atomic else {
+            try File(path, .write).write(bytes)
+            return
+        }
+        let tmp = "\(path).mpp-tmp-\(getpid())"
+        do {
+            let f = try File(tmp, .createNew)
+            try f.write(bytes)
+            try f.sync()
+            try f.close()
+        } catch {
+            _ = unlink(tmp)
+            throw error
+        }
+        if rename(tmp, path) != 0 {
+            let e = IOError.errno("rename", path)
+            _ = unlink(tmp)
+            throw e
+        }
+    }
+
+    public static func append(_ path: String, _ text: String) throws(IOError) {
+        try File(path, .append).write(text)
+    }
+
+    public static func exists(_ path: String) -> Bool { access(path, F_OK) == 0 }
+
+    public static func remove(_ path: String) throws(IOError) {
+        if unlink(path) != 0 { throw IOError.errno("remove", path) }
+    }
+
+    public static func makeDirectory(_ path: String, permissions: UInt32 = 0o755) throws(IOError) {
+        if mkdir(path, mode_t(permissions)) != 0 && errno != EEXIST { throw IOError.errno("mkdir", path) }
+    }
+
+    public static func size(_ path: String) throws(IOError) -> Int64 {
+        var st = stat()
+        if stat(path, &st) != 0 { throw IOError.errno("stat", path) }
+        return Int64(st.st_size)
+    }
+
+    /// Streams the lines of a file.
+    public static func forEachLine(_ path: String, _ body: (String) throws -> Void) throws {
+        try File(path).forEachLine(body)
+    }
+}
+
+// MARK: - BufferedWriter
+
+/// Buffered output. Much faster than `print` in loops; flushes when full,
+/// on `flush()`, when it goes out of scope, and (for stdout/stderr) at
+/// program exit, so a top-level writer never loses output.
+///
+///     var out = BufferedWriter.standardOutput()
+///     for i in 0..<1_000_000 { out.line(i) }
+public struct BufferedWriter: ~Copyable {
+    @usableFromInline let sink: _WriteSink
+    // The hot path touches only these trivially-copyable fields and raw
+    // memory: no reference counting, no dynamic exclusivity checks.
+    @usableFromInline let storage: UnsafeMutablePointer<UInt8>
+    @usableFromInline let usedPointer: UnsafeMutablePointer<Int>
+    @usableFromInline let capacity: Int
+
+    public init(descriptor: Int32, ownsDescriptor: Bool = false, capacity: Int = 64 * 1024) {
+        sink = _WriteSink(descriptor: descriptor, owns: ownsDescriptor, capacity: capacity)
+        storage = sink.storage
+        usedPointer = sink.usedStorage
+        self.capacity = sink.capacity
+    }
+
+    /// Pointer to at least `n` free bytes (flushing first if needed).
+    @inlinable @inline(__always)
+    mutating func reserve(_ n: Int) -> UnsafeMutablePointer<UInt8> {
+        if _slowPath(usedPointer.pointee &+ n > capacity) { flushNow() }
+        return storage + usedPointer.pointee
+    }
+
+    @usableFromInline @inline(never)
+    mutating func flushNow() { sink.flush() }
+
+    /// Takes ownership of `file`; the file is closed when the writer ends.
+    public init(_ file: consuming File, capacity: Int = 64 * 1024) {
+        let fd = file.descriptor
+        file.releaseDescriptor()
+        self.init(descriptor: fd, ownsDescriptor: true, capacity: capacity)
+    }
+
+    public static func standardOutput(capacity: Int = 64 * 1024) -> BufferedWriter {
+        fflush(nil) // keep ordering with anything already printed via print()
+        let w = BufferedWriter(descriptor: 1, capacity: capacity)
+        _WriteSink.flushAtExit(w.sink)
+        return w
+    }
+
+    public static func standardError(capacity: Int = 4 * 1024) -> BufferedWriter {
+        fflush(nil)
+        let w = BufferedWriter(descriptor: 2, capacity: capacity)
+        _WriteSink.flushAtExit(w.sink)
+        return w
+    }
+
+    /// The last write error, if any (writes never throw, so check this
+    /// after `flush()` when it matters).
+    public mutating func lastError() -> IOError? { sink.lastError }
+
+    @inlinable
+    public mutating func write(_ bytes: UnsafeRawBufferPointer) {
+        let n = bytes.count
+        if n < capacity, let src = bytes.baseAddress {
+            let p = reserve(n)
+            UnsafeMutableRawPointer(p).copyMemory(from: src, byteCount: n)
+            usedPointer.pointee &+= n
+        } else {
+            sink.write(bytes)
+        }
+    }
+
+    @inlinable
+    public mutating func write(_ text: String) {
+        var t = text
+        t.withUTF8 { write(UnsafeRawBufferPointer($0)) }
+    }
+
+    /// Writes an integer in decimal straight into the buffer: digit count
+    /// from the leading-zero count, then two digits per division from a
+    /// lookup table, written back to front in place (no String, no reversal).
+    @inlinable @inline(__always)
+    public mutating func write<T: FixedWidthInteger>(_ value: T) {
+        guard T.bitWidth <= 64 else { write(String(value)); return }
+        let negative = value < 0
+        let magnitude = negative ? 0 &- UInt64(truncatingIfNeeded: value) : UInt64(truncatingIfNeeded: value)
+        let digits = Bits.digitCount(magnitude)
+        let sign = negative ? 1 : 0
+        let p = reserve(digits &+ 1)
+        p[0] = UInt8(ascii: "-")   // overwritten by digits when positive
+        Bits.writeDigits(magnitude, endingAt: p + sign + digits)
+        usedPointer.pointee &+= sign &+ digits
+    }
+
+    @inlinable @inline(__always)
+    public mutating func write(_ byte: UInt8) {
+        let p = reserve(1)
+        p[0] = byte
+        usedPointer.pointee &+= 1
+    }
+
+    /// Writes `items` separated by `separator`, then a newline.
+    public mutating func line(_ items: Any..., separator: String = " ") {
+        for (i, item) in items.enumerated() {
+            if i > 0 { write(separator) }
+            write(String(describing: item))
+        }
+        write(UInt8(ascii: "\n"))
+    }
+
+    @inlinable
+    public mutating func flush() { sink.flush() }
+
+    deinit { sink.finish() }
+}
+
+/// Storage behind BufferedWriter (a class so stdout writers can be flushed
+/// from an exit handler).
+public final class _WriteSink: @unchecked Sendable {
+    @usableFromInline let descriptor: Int32
+    @usableFromInline let owns: Bool
+    @usableFromInline let storage: UnsafeMutablePointer<UInt8>
+    // Kept in raw memory: class `var`s pay a dynamic exclusivity check per
+    // access, which dominated the hot write path.
+    @usableFromInline let usedStorage: UnsafeMutablePointer<Int>
+    @usableFromInline var used: Int {
+        @inline(__always) get { usedStorage.pointee }
+        @inline(__always) set { usedStorage.pointee = newValue }
+    }
+    @usableFromInline let capacity: Int
+    @usableFromInline var lastError: IOError? = nil
+    @usableFromInline var finished = false
+
+    init(descriptor: Int32, owns: Bool, capacity: Int) {
+        self.descriptor = descriptor
+        self.owns = owns
+        self.capacity = max(capacity, 64)
+        storage = .allocate(capacity: self.capacity)
+        usedStorage = .allocate(capacity: 1)
+        usedStorage.initialize(to: 0)
+    }
+
+    deinit { storage.deallocate(); usedStorage.deallocate() }
+
+    @inlinable
+    func write(_ bytes: UnsafeRawBufferPointer) {
+        if used + bytes.count > capacity { flush() }
+        if bytes.count >= capacity { writeThrough(bytes); return }
+        if let src = bytes.baseAddress {
+            UnsafeMutableRawPointer(storage + used).copyMemory(from: src, byteCount: bytes.count)
+            used += bytes.count
+        }
+    }
+
+    @inlinable
+    func write(_ byte: UInt8) {
+        if used == capacity { flush() }
+        storage[used] = byte
+        used += 1
+    }
+
+    /// Room for at least `n` bytes, flushing if needed; caller advances `used`.
+    @inlinable
+    func reserve(_ n: Int) -> UnsafeMutablePointer<UInt8> {
+        if used + n > capacity { flush() }
+        return storage + used
+    }
+
+    @inlinable
+    func flush() {
+        if used == 0 { return }
+        writeThrough(UnsafeRawBufferPointer(start: storage, count: used))
+        used = 0
+    }
+
+    @usableFromInline
+    func writeThrough(_ bytes: UnsafeRawBufferPointer) {
+        guard var p = bytes.baseAddress else { return }
+        var left = bytes.count
+        while left > 0 {
+            let n = Glibc_or_Darwin_write(descriptor, p, left)
+            if n < 0 {
+                if errno == EINTR { continue }
+                lastError = IOError.errno("write", nil)
+                return
+            }
+            p += n; left -= n
+        }
+    }
+
+    @usableFromInline
+    func finish() {
+        flush()
+        if owns && !finished { _ = Glibc_or_Darwin_close(descriptor) }
+        finished = true
+    }
+
+    // Exit-time flushing for standard streams.
+    nonisolated(unsafe) static var atExit: [_WriteSink] = []
+    nonisolated(unsafe) static var registered = false
+    nonisolated(unsafe) static let lock: UnsafeMutablePointer<pthread_mutex_t> = {
+        let m = UnsafeMutablePointer<pthread_mutex_t>.allocate(capacity: 1)
+        pthread_mutex_init(m, nil)
+        return m
+    }()
+
+    static func flushAtExit(_ sink: _WriteSink) {
+        pthread_mutex_lock(lock)
+        atExit.append(sink)
+        if !registered {
+            registered = true
+            atexit { _WriteSink.flushAll() }
+        }
+        pthread_mutex_unlock(lock)
+    }
+
+    static func flushAll() {
+        pthread_mutex_lock(lock)
+        let sinks = atExit
+        pthread_mutex_unlock(lock)
+        for s in sinks { s.flush() }
+    }
+}
+
+extension File {
+    /// Gives up ownership without closing (used when another owner takes over).
+    @usableFromInline
+    consuming func releaseDescriptor() { descriptor = -1 }
+
+    /// Turns this file into a buffered writer that owns it.
+    public consuming func buffered(capacity: Int = 64 * 1024) -> BufferedWriter {
+        BufferedWriter(self, capacity: capacity)
+    }
+}
+
+// MARK: - TokenReader
+
+/// Fast buffered input, the M++ answer to `std::cin >> x`.
+///
+///     var input = TokenReader.standardInput()
+///     let n = try input.next(Int.self)!          // whitespace-separated token
+///     let name = try input.readLine()           // whole line
+public struct TokenReader: ~Copyable {
+    @usableFromInline let descriptor: Int32
+    @usableFromInline let path: String?
+    @usableFromInline var buffer: UnsafeMutableRawBufferPointer
+    @usableFromInline var start = 0
+    @usableFromInline var end = 0
+    @usableFromInline var atEOF = false
+
+    public init(descriptor: Int32, path: String? = nil, capacity: Int = 64 * 1024) {
+        self.descriptor = descriptor
+        self.path = path
+        buffer = Self.allocateBuffer(capacity)
+    }
+
+    public static func standardInput() -> TokenReader { TokenReader(descriptor: 0, path: "<stdin>") }
+
+    // 8 spare bytes past the end so SWAR code can always load a full word.
+    @usableFromInline
+    static func allocateBuffer(_ capacity: Int) -> UnsafeMutableRawBufferPointer {
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: capacity + 8, alignment: 16)
+        raw.initializeMemory(as: UInt8.self, repeating: 0, count: capacity + 8)
+        return UnsafeMutableRawBufferPointer(start: raw, count: capacity)
+    }
+
+    deinit { buffer.baseAddress!.deallocate() }
+
+    @usableFromInline
+    mutating func fill() throws(IOError) -> Bool {
+        if atEOF { return false }
+        if start > 0 {
+            let live = end - start
+            if live > 0 { buffer.baseAddress!.copyMemory(from: buffer.baseAddress! + start, byteCount: live) }
+            start = 0; end = live
+        }
+        if end == buffer.count {  // a single token or line larger than the buffer: grow
+            let bigger = Self.allocateBuffer(buffer.count * 2)
+            bigger.baseAddress!.copyMemory(from: buffer.baseAddress!, byteCount: end)
+            buffer.baseAddress!.deallocate()
+            buffer = bigger
+        }
+        while true {
+            let n = Glibc_or_Darwin_read(descriptor, buffer.baseAddress! + end, buffer.count - end)
+            if n > 0 { end += n; return true }
+            if n == 0 { atEOF = true; return false }
+            if errno != EINTR { throw IOError.errno("read", path) }
+        }
+    }
+
+    @inline(__always) @usableFromInline
+    static func isSpace(_ b: UInt8) -> Bool { b == 32 || (b &- 9) < 5 }  // ' ', \t \n \v \f \r
+
+    /// Next whitespace-separated token, or nil at end of input.
+    public mutating func next() throws(IOError) -> String? {
+        while true {
+            while start < end && Self.isSpace(buffer[start]) { start += 1 }
+            if start < end { break }
+            if !(try fill()) { return nil }
+        }
+        var i = start
+        while true {
+            while i < end && !Self.isSpace(buffer[i]) { i += 1 }
+            if i < end || atEOF { break }
+            let offset = i - start
+            if !(try fill()) { i = start + offset; break }
+            i = start + offset
+        }
+        let s = String(decoding: UnsafeRawBufferPointer(rebasing: buffer[start..<i]), as: UTF8.self)
+        start = i
+        return s
+    }
+
+    /// Next token parsed as `T`. Returns nil at end of input; throws
+    /// `.invalidData` if the token is not a valid `T`.
+    public mutating func next<T: LosslessStringConvertible>(_ type: T.Type) throws(IOError) -> T? {
+        guard let tok = try next() else { return nil }
+        guard let v = T(tok) else {
+            throw IOError(.invalidData("'\(tok)' is not a valid \(T.self)"), operation: "read", path: path)
+        }
+        return v
+    }
+
+    /// Next token parsed as an integer straight from the input bytes, with
+    /// no intermediate String. Digits are classified and combined 8 at a time
+    /// (SWAR), so a typical number costs one load and a few multiplies.
+    /// Throws `.invalidData` on malformed numbers or overflow (C++
+    /// `cin >> x` silently sets a fail bit instead).
+    @inlinable
+    public mutating func next<T: FixedWidthInteger>(_ type: T.Type) throws(IOError) -> T? {
+        guard T.bitWidth <= 64 else { return try nextWide(T.self) }
+        while true {
+            while start < end && Self.isSpace(buffer[start]) { start &+= 1 }
+            if start < end { break }
+            if !(try fill()) { return nil }
+        }
+        // Make sure a whole number is buffered so the fast path can run.
+        while end &- start < 32 && !atEOF { if !(try fill()) { break } }
+        let base = buffer.baseAddress!
+        var negative = false
+        let first = buffer[start]
+        if first == UInt8(ascii: "-") || first == UInt8(ascii: "+") {
+            negative = first == UInt8(ascii: "-")
+            start &+= 1
+        }
+        var acc: UInt64 = 0
+        var digits = 0
+        var overflow = false
+        // Fast path: up to 19 digits, 8 per step.
+        while true {
+            let avail = end &- start
+            if avail <= 0 { break }
+            let chunk = UInt64(littleEndian: (base + start).loadUnaligned(as: UInt64.self))
+            let run = Swift.min(Bits.digitRun(chunk), avail)
+            if run == 0 || digits &+ run > 19 { break }
+            acc = acc &* Bits.pow10(run) &+ Bits.parse8(chunk, count: run)
+            digits &+= run
+            start &+= run
+            if run < 8 { break }
+        }
+        // Slow path: digits beyond 19 or beyond the buffer (overflow-checked).
+        while true {
+            if start == end { if !(try fill()) { break } }
+            let d = buffer[start] &- 48
+            if d > 9 { break }
+            let (m, o1) = acc.multipliedReportingOverflow(by: 10)
+            let (v, o2) = m.addingReportingOverflow(UInt64(d))
+            overflow = overflow || o1 || o2
+            acc = v
+            digits &+= 1
+            start &+= 1
+        }
+        // The token must end here.
+        var junk = false
+        while true {
+            if start == end { if !(try fill()) { break } }
+            if Self.isSpace(buffer[start]) { break }
+            junk = true
+            start &+= 1
+        }
+        let limit: UInt64 = negative
+            ? (T.isSigned ? UInt64(truncatingIfNeeded: T.max) &+ 1 : 0)
+            : UInt64(truncatingIfNeeded: T.max)
+        if junk || digits == 0 || overflow || acc > limit {
+            throw IOError(.invalidData("token is not a valid \(T.self)"), operation: "read", path: path)
+        }
+        return negative ? T(truncatingIfNeeded: 0 &- acc) : T(truncatingIfNeeded: acc)
+    }
+
+    @usableFromInline
+    mutating func nextWide<T: FixedWidthInteger>(_ type: T.Type) throws(IOError) -> T? {
+        guard let tok = try next() else { return nil }
+        guard let v = T(tok) else {
+            throw IOError(.invalidData("'\(tok)' is not a valid \(T.self)"), operation: "read", path: path)
+        }
+        return v
+    }
+
+    /// Next line without its terminator ("\n" or "\r\n"), or nil at end of input.
+    public mutating func readLine() throws(IOError) -> String? {
+        var i = start
+        while true {
+            while i < end && buffer[i] != 10 { i += 1 }
+            if i < end { break }
+            let offset = i - start
+            if !(try fill()) {
+                if end == start { return nil }
+                i = end
+                break
+            }
+            i = start + offset
+        }
+        var j = i
+        if j > start && buffer[j - 1] == 13 { j -= 1 }
+        let s = String(decoding: UnsafeRawBufferPointer(rebasing: buffer[start..<j]), as: UTF8.self)
+        start = min(i + 1, end)
+        if i == end { start = end }
+        return s
+    }
+}
+
+// MARK: - Binary I/O
+
+public enum Endian: Sendable {
+    case little, big
+    public static var native: Endian { 1.littleEndian == 1 ? .little : .big }
+}
+
+/// Builds a binary blob with explicit byte order — no reinterpret_cast,
+/// no struct padding surprises.
+public struct ByteWriter: Sendable {
+    @usableFromInline var storage: [UInt8] = []
+    public var bytes: [UInt8] { storage }
+    public var defaultEndian: Endian
+
+    public init(endian: Endian = .little, reserving capacity: Int = 0) {
+        defaultEndian = endian
+        storage.reserveCapacity(capacity)
+    }
+
+    @inlinable
+    public mutating func write<T: FixedWidthInteger>(_ value: T, _ endian: Endian? = nil) {
+        let v = (endian ?? defaultEndian) == .little ? value.littleEndian : value.bigEndian
+        withUnsafeBytes(of: v) { storage.append(contentsOf: $0) }
+    }
+
+    public mutating func write(_ value: Double, _ endian: Endian? = nil) { write(value.bitPattern, endian) }
+    public mutating func write(_ value: Float, _ endian: Endian? = nil) { write(value.bitPattern, endian) }
+    public mutating func write(_ value: Bool) { storage.append(value ? 1 : 0) }
+    public mutating func write(bytes more: some Sequence<UInt8>) { storage.append(contentsOf: more) }
+
+    /// UTF-8 string prefixed with its byte length as UInt32.
+    public mutating func write(_ text: String, _ endian: Endian? = nil) {
+        let utf8 = Array(text.utf8)
+        write(UInt32(utf8.count), endian)
+        storage.append(contentsOf: utf8)
+    }
+}
+
+/// Reads binary data with bounds checks; running off the end throws
+/// `.unexpectedEndOfData` instead of reading garbage.
+public struct ByteReader: Sendable {
+    public let bytes: [UInt8]
+    public private(set) var offset: Int = 0
+    public var defaultEndian: Endian
+
+    public init(_ bytes: [UInt8], endian: Endian = .little) {
+        self.bytes = bytes
+        defaultEndian = endian
+    }
+
+    public var remaining: Int { bytes.count - offset }
+    public var isAtEnd: Bool { offset >= bytes.count }
+
+    @usableFromInline
+    mutating func take(_ n: Int) throws(IOError) -> ArraySlice<UInt8> {
+        guard n >= 0, n <= remaining else {
+            throw IOError(.unexpectedEndOfData, operation: "decode")
+        }
+        defer { offset += n }
+        return bytes[offset..<(offset + n)]
+    }
+
+    @inlinable
+    public mutating func read<T: FixedWidthInteger>(_ type: T.Type, _ endian: Endian? = nil) throws(IOError) -> T {
+        let slice = try take(MemoryLayout<T>.size)
+        var raw: T = 0
+        withUnsafeMutableBytes(of: &raw) { dst in
+            slice.withUnsafeBytes { dst.copyMemory(from: $0) }
+        }
+        return (endian ?? defaultEndian) == .little ? T(littleEndian: raw) : T(bigEndian: raw)
+    }
+
+    public mutating func read(_ type: Double.Type, _ endian: Endian? = nil) throws(IOError) -> Double {
+        Double(bitPattern: try read(UInt64.self, endian))
+    }
+
+    public mutating func read(_ type: Float.Type, _ endian: Endian? = nil) throws(IOError) -> Float {
+        Float(bitPattern: try read(UInt32.self, endian))
+    }
+
+    public mutating func read(_ type: Bool.Type) throws(IOError) -> Bool { try take(1).first! != 0 }
+
+    public mutating func read(bytes count: Int) throws(IOError) -> [UInt8] { Array(try take(count)) }
+
+    public mutating func read(_ type: String.Type, _ endian: Endian? = nil) throws(IOError) -> String {
+        let n = Int(try read(UInt32.self, endian))
+        return String(decoding: try take(n), as: UTF8.self)
+    }
+
+    public mutating func skip(_ n: Int) throws(IOError) { _ = try take(n) }
+}
+
+// MARK: - MappedFile
+
+/// A read-only memory-mapped file: the OS pages it in on demand, so huge
+/// files can be scanned without reading them into memory first.
+public struct MappedFile: ~Copyable {
+    @usableFromInline let base: UnsafeMutableRawPointer?
+    public let count: Int
+    public let path: String
+
+    public init(_ path: String) throws(IOError) {
+        let file = try File(path)
+        let size = Int(try file.size())
+        var mapped: UnsafeMutableRawPointer? = nil
+        if size > 0 {
+            let p = mmap(nil, size, PROT_READ, MAP_PRIVATE, file.descriptor, 0)
+            guard let p, p != UnsafeMutableRawPointer(bitPattern: -1) else { throw IOError.errno("mmap", path) }
+            mapped = p
+        }
+        self.path = path
+        self.count = size
+        self.base = mapped
+    }
+
+    deinit { if let base { _ = munmap(base, count) } }
+
+    /// The file's bytes, valid only inside `body`.
+    public borrowing func withBytes<R>(_ body: (UnsafeRawBufferPointer) throws -> R) rethrows -> R {
+        try body(UnsafeRawBufferPointer(start: base, count: count))
+    }
+
+    public subscript(i: Int) -> UInt8 {
+        precondition(i >= 0 && i < count, "MappedFile: index \(i) out of range 0..<\(count)")
+        return base!.load(fromByteOffset: i, as: UInt8.self)
+    }
+}

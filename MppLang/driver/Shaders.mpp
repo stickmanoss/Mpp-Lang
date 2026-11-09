@@ -1,0 +1,273 @@
+// mpp — front end: Metallic's Metal-style shader syntax.
+//
+//   @kernel func blur(_ src: texture2d<float> [[texture(0)]],
+//                     _ gid: uint2 [[thread_position_in_grid]]) { ... }
+//
+// becomes the plain function (attributes removed) plus, on its closing
+// line, a `blurFunction` that binds the arguments once per dispatch and
+// returns the loop that runs the shader over a band of rows:
+//
+//   let blurFunction = MetallicFunction(kernel: "blur") { __a in
+//       let __b0: texture2d<float> = __a.texture(0)
+//       return { __r in var __t = MetallicThread(); ...
+//                for __y in __r.y0 ..< __r.y1 { for __x in 0 ..< __r.width {
+//                    __t.threadPosition = ...; blur(__b0, __t.threadPosition) } } } }
+//
+// A fragment shader becomes `{ __s in __s.shade { __t, __in in shade(...) } }`:
+// one call per row of a triangle, with the shader inlined into the loop.
+//
+// A struct with a `[[position]]` member gets a `Varyings` conformance that
+// interpolates its float members (perspective-correct, in the rasterizer);
+// `[[flat]]` members are taken from the first vertex. Line numbers are kept.
+
+extension Lowerer {
+    struct ShaderParam {
+        var label: String?          // external label (nil: `_`)
+        var type: String
+        var attribute: String       // "texture(0)", "stage_in", ... ("" if none)
+        var name: String
+    }
+
+    /// Metal attributes Metallic understands (anything else in `[[ ]]` is
+    /// ordinary code, like the nested array type `[[Int]]`).
+    static func isShaderAttribute(_ inner: String) -> Bool {
+        let plain: Set<String> = ["position", "flat", "stage_in", "vertex_id", "instance_id", "thread_position_in_grid",
+                                  "threads_per_grid", "center_perspective", "center_no_perspective"]
+        if plain.contains(inner) { return true }
+        for f in ["texture", "buffer", "sampler", "user", "color"] where inner.hasPrefix(f + "(") && inner.hasSuffix(")") {
+            let arg = inner.dropFirst(f.count + 1).dropLast()
+            return f == "user" || (!arg.isEmpty && arg.allSatisfy(\.isNumber))
+        }
+        return false
+    }
+
+    mutating func expandShaders(native: [String: NativeShader] = [:]) -> String? {
+        let src = String(decoding: s, as: UTF8.self)
+        guard src.contains("[[") || src.contains("@kernel") || src.contains("@vertex") || src.contains("@fragment") else { return nil }
+        let toks = tokens(0, n)
+        var edits: [Edit] = []
+        func blank(_ a: Int, _ b: Int) { edits.append(Edit(start: a, end: b, text: String(s[a ..< b].map { $0 == 10 ? "\n" : " " }))) }
+        func appendAtLine(_ end: Int, _ gen: String) {      // `end`: just after a closing brace
+            edits.append(Edit(start: end, end: end, text: "; " + gen))
+        }
+        /// `[[ ... ]]` starting at token k: (inner text, end offset, next token index).
+        func attribute(at k: Int) -> (String, Int, Int)? {
+            guard k + 1 < toks.count, toks[k].text == "[", toks[k + 1].text == "[", toks[k + 1].start == toks[k].end else { return nil }
+            var j = k + 2
+            var inner = ""
+            while j + 1 < toks.count && !(toks[j].text == "]" && toks[j + 1].text == "]") { inner += toks[j].text; j += 1 }
+            guard j + 1 < toks.count, Lowerer.isShaderAttribute(inner) else { return nil }
+            return (inner, toks[j + 1].end, j + 2)
+        }
+
+        var k = 0
+        while k < toks.count {
+            // MARK: @kernel / @vertex / @fragment func
+            if toks[k].text == "@", k + 2 < toks.count, ["kernel", "vertex", "fragment"].contains(toks[k + 1].text),
+               toks[k + 1].start == toks[k].end {
+                let kind = toks[k + 1].text
+                var j = k + 2
+                while j < toks.count && toks[j].text != "func" { j += 1 }
+                guard j + 1 < toks.count else { k += 1; continue }
+                let name = toks[j + 1].text
+                blank(toks[k].start, toks[k + 1].end)
+                var p = j + 2
+                while p < toks.count && toks[p].text != "(" { p += 1 }
+                guard p < toks.count else { k += 1; continue }
+                let close = balanced(toks[p].start)
+                guard close > 0 else { k += 1; continue }
+                // Parameters: split at top-level commas.
+                var params: [ShaderParam] = []
+                var current: [Token] = []
+                var depth = 0
+                var q = p + 1
+                func finish() {
+                    guard !current.isEmpty else { return }
+                    var attr = ""
+                    var typeToks: [String] = []
+                    var idents: [String] = []
+                    var seenColon = false
+                    var m = 0
+                    while m < current.count {
+                        if let (inner, end, next) = attributeIn(current, m) {
+                            attr = inner
+                            blank(current[m].start, end)
+                            m = next
+                            continue
+                        }
+                        let t = current[m].text
+                        if t == "\"…\"" { m += 1; continue }          // a comment
+                        if !seenColon { if t == ":" { seenColon = true } else { idents.append(t) } }
+                        else if t == "=" { break }
+                        else { typeToks.append(t) }
+                        m += 1
+                    }
+                    let label: String? = idents.count >= 2 ? (idents[0] == "_" ? nil : idents[0]) : idents.first
+                    let pname = idents.last ?? "_"
+                    params.append(ShaderParam(label: label, type: joinType(typeToks), attribute: attr, name: pname))
+                    current.removeAll()
+                }
+                func attributeIn(_ ts: [Token], _ m: Int) -> (String, Int, Int)? {
+                    guard m + 1 < ts.count, ts[m].text == "[", ts[m + 1].text == "[", ts[m + 1].start == ts[m].end else { return nil }
+                    var j = m + 2
+                    var inner = ""
+                    while j + 1 < ts.count && !(ts[j].text == "]" && ts[j + 1].text == "]") { inner += ts[j].text; j += 1 }
+                    guard j + 1 < ts.count, Lowerer.isShaderAttribute(inner) else { return nil }
+                    return (inner, ts[j + 1].end, j + 2)
+                }
+                while q < toks.count && toks[q].start < close - 1 {
+                    let t = toks[q].text
+                    if (t == "(" || t == "[" || t == "<") { depth += 1 }
+                    if (t == ")" || t == "]" || t == ">") { depth -= 1 }
+                    if t == "," && depth == 0 { finish() } else { current.append(toks[q]) }
+                    q += 1
+                }
+                finish()
+                // Body
+                var b = q
+                while b < toks.count && toks[b].text != "{" { b += 1 }
+                guard b < toks.count else { k += 1; continue }
+                let bodyEnd = balanced(toks[b].start)
+                guard bodyEnd > 0 else { k += 1; continue }
+
+                var binds = ""
+                var args: [String] = []
+                var stageIn: String? = nil
+                var unbound: [String] = []
+                for (i, prm) in params.enumerated() {
+                    let a = prm.attribute
+                    var value: String
+                    func index(_ prefix: String) -> String { String(a.dropFirst(prefix.count + 1).dropLast()) }
+                    if a.hasPrefix("texture(") { binds += "let __b\(i): \(prm.type) = __a.texture(\(index("texture"))); "; value = "__b\(i)" }
+                    else if a.hasPrefix("buffer(") { binds += "let __b\(i): \(prm.type) = __a.buffer(\(index("buffer"))); "; value = "__b\(i)" }
+                    else if a.hasPrefix("sampler(") { binds += "let __b\(i): \(prm.type) = __a.sampler(\(index("sampler"))); "; value = "__b\(i)" }
+                    else if a == "thread_position_in_grid" { value = "__t.threadPosition" }
+                    else if a == "threads_per_grid" { value = "__t.threadsPerGrid" }
+                    else if a == "vertex_id" { value = "__t.vertexID" }
+                    else if a == "instance_id" { value = "__t.instanceID" }
+                    else if a == "position" { value = "__t.position" }
+                    else if a == "stage_in" { value = "__in"; stageIn = prm.type }
+                    else { unbound.append(prm.name); value = "fatalError()" }
+                    args.append((prm.label.map { "\($0): " } ?? "") + value)
+                }
+                let call = "\(name)(\(args.joined(separator: ", ")))"
+                var gen: String
+                if let nat = native[name], kind != "vertex", unbound.isEmpty {
+                    // Compiled to C++ (ShaderCpp.mpp): bind the C entry point.
+                    let checks = "buffers: [" + nat.buffers.map { "(\($0.0), MemoryLayout<\($0.1)>.size)" }.joined(separator: ", ") + "], textures: \(nat.textures)"
+                    let ext = "@_extern(c, \"\(nat.symbol)\") func __mtl_\(name)(_ b: UnsafeRawPointer, _ w: UnsafeRawPointer); "
+                    if kind == "kernel" {
+                        gen = ext + "let \(name)Function = MetallicFunction(kernel: \"\(name)\", native: { __mtl_\(name)($0, $1) }, \(checks))"
+                    } else if let stageIn {
+                        gen = ext + "let \(name)Function = MetallicFunction(fragment: \"\(name)\", stageIn: \(stageIn).self, native: { __mtl_\(name)($0, $1) }, \(checks))"
+                    } else {
+                        gen = ext + "let \(name)Function = MetallicFunction(fragment: \"\(name)\", native: { __mtl_\(name)($0, $1) }, \(checks))"
+                    }
+                } else if !unbound.isEmpty {
+                    gen = "#error(\"Metallic: parameter `\(unbound[0])` of shader `\(name)` needs an attribute such as [[buffer(0)]], [[texture(0)]] or [[stage_in]]\")"
+                } else {
+                    switch kind {
+                    case "kernel":
+                        let loop = "var __t = MetallicThread(); __t.threadsPerGrid = __r.grid; for __y in __r.y0 ..< __r.y1 { for __x in 0 ..< __r.width { __t.threadPosition = uint2(UInt32(truncatingIfNeeded: __x), UInt32(truncatingIfNeeded: __y)); \(call) } }"
+                        gen = "let \(name)Function = MetallicFunction(kernel: \"\(name)\") { __a in \(binds)return { __r in \(loop) } }"
+                    case "vertex":
+                        gen = "let \(name)Function = MetallicFunction(vertex: \"\(name)\") { __a in \(binds)return { __t in \(call) } }"
+                    default:
+                        if let stageIn {
+                            gen = "let \(name)Function = MetallicFunction(fragment: \"\(name)\", stageIn: \(stageIn).self) { __a in \(binds)return { __s in __s.shade { __t, __in in \(call) } } }"
+                        } else {
+                            gen = "let \(name)Function = MetallicFunction(fragment: \"\(name)\") { __a in \(binds)return { __s in __s.shade { __t in \(call) } } }"
+                        }
+                    }
+                }
+                appendAtLine(bodyEnd, gen)
+                k = b + 1
+                continue
+            }
+
+            // MARK: struct with [[position]] -> Varyings
+            if toks[k].text == "struct", k + 1 < toks.count {
+                let name = toks[k + 1].text
+                var b = k + 2
+                while b < toks.count && toks[b].text != "{" { b += 1 }
+                guard b < toks.count else { k += 1; continue }
+                let end = balanced(toks[b].start)
+                guard end > 0 else { k += 1; continue }
+                var e = b + 1
+                var fields: [(name: String, type: String, flat: Bool)] = []
+                var position: String? = nil
+                var depth = 0
+                var sawAttribute = false
+                while e < toks.count && toks[e].start < end - 1 {
+                    let t = toks[e].text
+                    if t == "{" || t == "(" { depth += 1 }
+                    if t == "}" || t == ")" { depth -= 1 }
+                    if depth == 0 && t == "var" && e + 1 < toks.count {
+                        let fname = toks[e + 1].text
+                        var m = e + 2
+                        var typeToks: [String] = []
+                        if m < toks.count && toks[m].text == ":" { m += 1 }
+                        var attr = ""
+                        while m < toks.count && toks[m].start < end - 1 && toks[m].text != "var" && toks[m].text != "let"
+                                && toks[m].text != ";" && toks[m].text != "=" && toks[m].text != "}" && toks[m].text != "func" {
+                            if let (inner, aEnd, next) = attribute(at: m) {
+                                attr = inner
+                                blank(toks[m].start, aEnd)
+                                sawAttribute = true
+                                m = next
+                                continue
+                            }
+                            // stop at the next line's declaration
+                            if !typeToks.isEmpty && lineOf(toks[m].start) != lineOf(toks[m - 1].start) { break }
+                            if toks[m].text != "\"…\"" { typeToks.append(toks[m].text) }     // skip comments
+                            m += 1
+                        }
+                        if attr == "position" { position = fname }
+                        fields.append((fname, joinType(typeToks), attr == "flat"))
+                        e = m
+                        continue
+                    }
+                    e += 1
+                }
+                if sawAttribute, let position {
+                    let interpolable: Set<String> = ["float", "half", "Float", "float2", "float3", "float4", "half2", "half3", "half4",
+                                                     "SIMD2<Float>", "SIMD3<Float>", "SIMD4<Float>"]
+                    var body = "var r = a; "
+                    for f in fields where !f.flat && interpolable.contains(f.type) {
+                        body += "r.\(f.name) = a.\(f.name) * w.x + b.\(f.name) * w.y + c.\(f.name) * w.z; "
+                    }
+                    let gen = "extension \(name): Varyings { public var clipPosition: float4 { \(position) }; public static func interpolate(_ a: Self, _ b: Self, _ c: Self, _ w: float3) -> Self { \(body)return r } }"
+                    appendAtLine(end, gen)
+                }
+                k = b + 1
+                continue
+            }
+            k += 1
+        }
+        guard !edits.isEmpty else { return nil }
+        var out = [UInt8]()
+        out.reserveCapacity(n + edits.count * 200)
+        var last = 0
+        for e in edits.sorted(by: { $0.start < $1.start || ($0.start == $1.start && $0.end < $1.end) }) {
+            guard e.start >= last else { continue }
+            out += s[last ..< e.start]
+            out += Array(e.text.utf8)
+            last = e.end
+        }
+        out += s[last ..< n]
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    /// Joins type tokens back into source text ("texture2d<float>", "[Float]").
+    func joinType(_ ts: [String]) -> String {
+        var out = ""
+        var lastWasWord = false
+        for t in ts {
+            let isWord = t.utf8.first.map { Lowerer.identStart($0) || ($0 >= 48 && $0 <= 57) } ?? false
+            if lastWasWord && isWord { out += " " }
+            out += t
+            lastWasWord = isWord
+        }
+        return out
+    }
+}

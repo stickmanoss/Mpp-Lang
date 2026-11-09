@@ -1,0 +1,121 @@
+// MppCore — runtime for automatically parallelized loops.
+//
+// `mpp` lowers a provably independent `for i in a..<b { ... }` to
+// `_mppAutoFor(a..<b) { i in ... }`. The closure is @Sendable, so the
+// Swift 6 compiler verifies it is free of data races. At run time the
+// first iterations are timed; if the whole loop would finish in well
+// under the cost of waking other cores, it simply continues in order.
+
+import Dispatch
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+/// Shares a value across parallel iterations that touch disjoint parts of it.
+public struct _MppSendable<T>: @unchecked Sendable {
+    public let value: T
+    @inlinable public init(_ value: T) { self.value = value }
+}
+
+@usableFromInline
+let _mppCores: Int = Swift.max(1, Int(sysconf(Int32(_SC_NPROCESSORS_ONLN))))
+
+@inlinable @inline(__always)
+func _mppNanos() -> UInt64 {
+    var ts = timespec()
+    clock_gettime(CLOCK_MONOTONIC, &ts)
+    return UInt64(ts.tv_sec) &* 1_000_000_000 &+ UInt64(ts.tv_nsec)
+}
+
+/// Runs `body(i)` for every i in `range`, in parallel when it pays off.
+/// `bounds` are the sizes of arrays written as `array[i]`; the range must lie inside each.
+@inlinable
+public func _mppAutoFor(_ range: Range<Int>, bounds: [Int] = [], _ body: @Sendable (Int) -> Void) {
+    for b in bounds {
+        _mppRequire(range.isEmpty || (range.lowerBound >= 0 && range.upperBound <= b),
+                    "parallel loop: indices \(range) are outside an array of \(b) elements")
+    }
+    let n = range.count
+    if n == 0 { return }
+    // Time a few iterations to decide whether parallelism is worth it.
+    let probe = Swift.min(n, 8)
+    let t0 = _mppNanos()
+    for i in range.lowerBound ..< range.lowerBound + probe { body(i) }
+    let remaining = n - probe
+    if remaining == 0 { return }
+    let perIteration = Double(_mppNanos() &- t0) / Double(probe)
+    let start = range.lowerBound + probe
+    if _mppCores == 1 || perIteration * Double(remaining) < 50_000 {      // < 50 µs left: stay serial
+        for i in start ..< range.upperBound { body(i) }
+        return
+    }
+    let chunks = Swift.min(remaining, _mppCores * 4)
+    DispatchQueue.concurrentPerform(iterations: chunks) { c in
+        let lo = start + remaining * c / chunks, hi = start + remaining * (c + 1) / chunks
+        for i in lo ..< hi { body(i) }
+    }
+}
+
+@inlinable
+public func _mppAutoFor(_ range: ClosedRange<Int>, bounds: [Int] = [], _ body: @Sendable (Int) -> Void) {
+    _mppAutoFor(range.lowerBound ..< range.upperBound + 1, bounds: bounds, body)
+}
+
+// MARK: - Proven-safe sequential loops
+//
+// The front end lowers a range loop whose arrays are indexed only as
+// `a[i ± k]` to two specializations of one body: `_MppUnchecked` when a
+// single check before the loop has proven every access in bounds, and
+// `_MppChecked` (every access checked, exactly like Array) otherwise.
+
+public protocol _MppBoundsPolicy { static var enabled: Bool { get } }
+public enum _MppChecked: _MppBoundsPolicy { @inlinable public static var enabled: Bool { true } }
+public enum _MppUnchecked: _MppBoundsPolicy { @inlinable public static var enabled: Bool { false } }
+
+/// Array storage seen through a bounds policy (read-write).
+@frozen public struct _MppSpan<Element, Policy: _MppBoundsPolicy> {
+    public let base: UnsafeMutablePointer<Element>
+    public let count: Int
+
+    @inlinable @inline(__always)
+    public init(_ b: UnsafeMutableBufferPointer<Element>, _: Policy.Type) {
+        base = b.baseAddress ?? UnsafeMutablePointer(bitPattern: MemoryLayout<Element>.alignment)!
+        count = b.count
+    }
+
+    @inlinable
+    public subscript(_ i: Int) -> Element {
+        @inline(__always) get {
+            if Policy.enabled { precondition(UInt(bitPattern: i) < UInt(bitPattern: count), "Index out of range") }
+            return base[i]
+        }
+        @inline(__always) nonmutating _modify {
+            if Policy.enabled { precondition(UInt(bitPattern: i) < UInt(bitPattern: count), "Index out of range") }
+            yield &base[i]
+        }
+    }
+}
+
+/// Array storage seen through a bounds policy (read-only).
+@frozen public struct _MppReadSpan<Element, Policy: _MppBoundsPolicy> {
+    public let base: UnsafePointer<Element>
+    public let count: Int
+
+    @inlinable @inline(__always)
+    public init(_ b: UnsafeBufferPointer<Element>, _: Policy.Type) {
+        base = b.baseAddress ?? UnsafePointer(bitPattern: MemoryLayout<Element>.alignment)!
+        count = b.count
+    }
+
+    @inlinable
+    public subscript(_ i: Int) -> Element {
+        @inline(__always) get {
+            if Policy.enabled { precondition(UInt(bitPattern: i) < UInt(bitPattern: count), "Index out of range") }
+            return base[i]
+        }
+    }
+}

@@ -1,0 +1,15 @@
+import liquidglass.mpp
+
+struct Counter: View {
+    @State var count = 0
+    var body: some View {
+        Card {
+            Text("Count: \(count)")
+            MppButton("Add", systemImage: "plus") { count += 1 }
+            Button("Plain SwiftUI button") { count += 10 }   // glass too
+        }
+        .padding()
+    }
+}
+
+app("Glass Counter") { Counter() }

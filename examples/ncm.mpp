@@ -1,0 +1,52 @@
+// Next-Concept Modeling (Stanford, arXiv:2610.14162) at toy scale:
+// `mpp examples/ncm.mpp`. Trains the multiscale tokenizer and the
+// generator on short phrases, then writes new ones coarse-to-fine:
+// one pass per level (log2(L) + 1 of them), not one per character.
+import neural
+
+let phrases = ["the cat sat on a mat", "a dog ran in the sun", "the sun is warm", "a cat ran to a dog",
+               "the dog sat in a box", "a box is on the mat", "the cat is in the sun", "a dog is warm"]
+let L = 32
+let alphabet = Array(Set(phrases.joined())).sorted() + ["."]
+let pad = alphabet.count - 1
+func encode(_ s: String) -> [Int] {
+    var t = s.map { alphabet.firstIndex(of: $0)! }
+    while t.count < L { t.append(pad) }
+    return t
+}
+func text(_ t: [Int]) -> String { String(t.filter { $0 != pad }.map { alphabet[$0] }) }
+
+var config = NCMConfig(vocabulary: alphabet.count, length: L)
+config.dims = 48
+config.codebookSize = 32
+Init.seed(1)
+let tokenizer = NCMTokenizer(config)
+let generator = NCMGenerator(config)
+let data = phrases.map(encode)
+
+print("levels:", config.levelLengths, "→", config.levels + 1, "passes to write", L, "characters")
+let tokOpt = Adam(learningRate: 3e-3)
+for step in 0 ..< 2000 {
+    let x = data[step % data.count]
+    tokenizer.zeroGrad()
+    let loss = tokenizer.loss(x, cutoff: 1 + step % config.levels)          // nested dropout
+    loss.backward()
+    tokOpt.update(tokenizer)
+    if step % 500 == 0 { print("tokenizer step", step, "loss", loss.item) }
+}
+let full = data.map { tokenizer.reconstruct(codes: tokenizer.codes(for: $0).codes) }
+print("reconstruction from all levels:", text(full[0]), "|", text(full[1]))
+
+let genOpt = Adam(learningRate: 3e-3)
+for step in 0 ..< 800 {
+    generator.zeroGrad()
+    let loss = generator.loss(data[step % data.count], tokenizer: tokenizer)
+    loss.backward()
+    genOpt.update(generator)
+    if step % 200 == 0 { print("generator step", step, "loss", loss.item) }
+}
+for seed in 1 ... 4 {
+    let (tokens, passes) = generator.generate(tokenizer: tokenizer, temperature: 0.7, seed: UInt64(seed))
+    print("sample (\(passes) passes):", text(tokens))
+}
+print(NCMBandwidth(parameters: 16_000_000_000 / 2, length: 1024, levels: 11))

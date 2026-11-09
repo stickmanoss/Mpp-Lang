@@ -1,0 +1,17 @@
+// MppxxCpp: M++ calling C++ (part of `make test`).
+import cpp "cpp/checks.hpp"
+
+#cpp {
+    inline mpp::Int square(mpp::Int x) { return x * x; }
+    inline mpp::Int digits(mpp::Int x) { return x < 10 ? 1 : 1 + digits(x / 10); }
+}
+
+precondition(checks.sumTo(100) == 5050, "C++ function from a .cpp file")
+precondition(square(12) == 144, "inline #cpp function")
+precondition(digits(1_000_000) == 7, "recursive inline function")
+var c = checks.Counter()
+c.bump(3)
+c.bump(4)
+precondition(c.value == 7, "C++ struct with a mutating method")
+precondition(String(cpp: checks.joined("M++", "C++")) == "M+++C++", "strings both ways")
+print("C++ interop: all tests passed")

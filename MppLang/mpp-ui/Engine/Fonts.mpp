@@ -1,0 +1,96 @@
+// MppUI engine — glyph atlases (the embedded fonts in FontData.mpp, or the
+// system font on macOS) and fast glyph lookup.
+
+/// A font as an atlas of 8-bit coverage glyphs rendered at 32 px.
+final class _Font {
+    struct Glyph {
+        var codepoint: UInt32
+        var width: Int, height: Int, left: Int, top: Int, advance: Int
+        var offset: Int                               // into `pixels`
+    }
+
+    var glyphs: [Glyph]
+    var pixels: [UInt8]
+    let ascent: Int, descent: Int, lineHeight: Int
+    /// Index into `glyphs` for code points below 256 (-1: none); others by dictionary.
+    private var latin = [Int32](repeating: -1, count: 256)
+    private var others: [UInt32: Int32] = [:]
+    private var fallback: Int32 = -1
+
+    init(glyphs: [Glyph], pixels: [UInt8], ascent: Int, descent: Int, lineHeight: Int) {
+        self.glyphs = glyphs
+        self.pixels = pixels
+        self.ascent = ascent
+        self.descent = descent
+        self.lineHeight = lineHeight
+        for (i, g) in glyphs.enumerated() {
+            if g.codepoint < 256 { if latin[Int(g.codepoint)] < 0 { latin[Int(g.codepoint)] = Int32(i) } }
+            else if others[g.codepoint] == nil { others[g.codepoint] = Int32(i) }
+        }
+        fallback = latin[Int(UInt8(ascii: "?"))]
+    }
+
+    /// The glyph for `cp`, else the font's "?".
+    @inline(__always) func glyph(_ cp: UInt32) -> Glyph? {
+        let i = cp < 256 ? latin[Int(cp)] : (others[cp] ?? -1)
+        if i >= 0 { return glyphs[Int(i)] }
+        return fallback >= 0 ? glyphs[Int(fallback)] : nil
+    }
+
+    nonisolated(unsafe) static var embedded: [_Font] = _Font.decodeEmbedded()
+    static var sans: _Font { embedded[0] }
+    static var bold: _Font { embedded[1] }
+    static var mono: _Font { embedded[2] }
+
+    /// Reads the three fonts from `_mppEmbeddedFonts` (see FontData.mpp for the layout).
+    static func decodeEmbedded() -> [_Font] {
+        let bytes = _base64Decode(_mppEmbeddedFonts)
+        var at = 0
+        func i32() -> Int {
+            let v = UInt32(bytes[at]) | UInt32(bytes[at + 1]) << 8 | UInt32(bytes[at + 2]) << 16 | UInt32(bytes[at + 3]) << 24
+            at += 4
+            return Int(Int32(bitPattern: v))
+        }
+        func i16() -> Int {
+            let v = UInt16(bytes[at]) | UInt16(bytes[at + 1]) << 8
+            at += 2
+            return Int(Int16(bitPattern: v))
+        }
+        var fonts: [_Font] = []
+        for _ in 0 ..< 3 {
+            let count = i32(), ascent = i32(), descent = i32(), lineHeight = i32(), pixelBytes = i32()
+            var glyphs: [Glyph] = []
+            glyphs.reserveCapacity(count)
+            for _ in 0 ..< count {
+                let cp = UInt32(i32())
+                let w = i16(), h = i16(), l = i16(), t = i16(), adv = i16()
+                let off = i32()
+                glyphs.append(Glyph(codepoint: cp, width: w, height: h, left: l, top: t, advance: adv, offset: off))
+            }
+            let pixels = Array(bytes[at ..< at + pixelBytes])
+            at += pixelBytes
+            fonts.append(_Font(glyphs: glyphs, pixels: pixels, ascent: ascent, descent: descent, lineHeight: lineHeight))
+        }
+        return fonts
+    }
+}
+
+/// Base64 (standard alphabet); characters outside it, like newlines, are skipped.
+func _base64Decode(_ text: String) -> [UInt8] {
+    var table = [UInt8](repeating: 255, count: 256)
+    for (i, c) in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".utf8.enumerated() { table[Int(c)] = UInt8(i) }
+    var out: [UInt8] = []
+    out.reserveCapacity(text.utf8.count * 3 / 4)
+    var acc: UInt32 = 0, bits = 0
+    for c in text.utf8 {
+        let v = table[Int(c)]
+        if v == 255 { continue }
+        acc = acc << 6 | UInt32(v)
+        bits += 6
+        if bits >= 8 {
+            bits -= 8
+            out.append(UInt8((acc >> UInt32(bits)) & 255))
+        }
+    }
+    return out
+}

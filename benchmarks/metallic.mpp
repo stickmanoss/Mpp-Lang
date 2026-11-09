@@ -1,0 +1,107 @@
+// Metallic benchmark: `mpp benchmarks/metallic.mpp`
+// Four workloads, each timed as the best of several runs.
+import Metallic
+import MppUIEngine
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+func now() -> Double {
+    var ts = timespec()
+    clock_gettime(CLOCK_MONOTONIC, &ts)
+    return Double(ts.tv_sec) + Double(ts.tv_nsec) / 1e9
+}
+func best(_ runs: Int, _ body: () -> Void) -> Double {
+    var b = Double.infinity
+    for _ in 0 ..< runs { let t = now(); body(); b = min(b, now() - t) }
+    return b * 1000
+}
+func ms(_ v: Double) -> String { String(Double(Int(v * 100)) / 100) + " ms" }
+
+@kernel func ripple(_ src: texture2d<float> [[texture(0)]],
+                    _ dst: texture2d<float> [[texture(1)]],
+                    _ gid: uint2 [[thread_position_in_grid]]) {
+    let p = float2(gid) / float2(Float(dst.get_width()), Float(dst.get_height()))
+    let d = length(p - 0.5)
+    let c = src.read(gid)
+    dst.write(float4(c.rgb * (0.75 + 0.25 * sin(d * 40)), 1), gid)
+}
+
+struct Screen { var position: float4 [[position]]; var uv: float2 }
+@vertex func screenQuad(_ id: uint [[vertex_id]]) -> Screen {
+    let c = float2(id & 1 == 0 ? 0 : 1, id & 2 == 0 ? 0 : 1)
+    return Screen(position: float4(c.x * 2 - 1, 1 - c.y * 2, 0, 1), uv: c)
+}
+@fragment func textured(_ v: Screen [[stage_in]], _ t: texture2d<float> [[texture(0)]], _ s: sampler [[sampler(0)]]) -> float4 {
+    t.sample(s, v.uv * 0.9 + 0.05) * 0.5 + t.sample(s, v.uv + float2(0.001, 0.002)) * 0.5
+}
+
+let device = MetallicCreateSystemDefaultDevice()!
+let queue = device.makeCommandQueue()!
+let N = 2048
+let desc = MetallicTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: N, height: N, mipmapped: false)
+let src = device.makeTexture(descriptor: desc)!, dst = device.makeTexture(descriptor: desc)!
+for y in 0 ..< N { for x in 0 ..< N { src.write(float4(Float(x % 256) / 255, Float(y % 256) / 255, 0.5, 1), uint2(uint(x), uint(y))) } }
+print(device.name)
+
+@kernel func boxBlur(_ src: texture2d<float> [[texture(0)]],
+                     _ dst: texture2d<float> [[texture(1)]],
+                     _ gid: uint2 [[thread_position_in_grid]]) {
+    var sum = float4(0)
+    for dy in -1 ... 1 {
+        for dx in -1 ... 1 { sum += src.read(Int(gid.x) + dx, Int(gid.y) + dy) }
+    }
+    dst.write(sum / 9, gid)
+}
+
+let kernel = try device.makeComputePipelineState(function: rippleFunction)
+let tKernel = best(5) {
+    let cb = queue.makeCommandBuffer()!, e = cb.makeComputeCommandEncoder()!
+    e.setComputePipelineState(kernel); e.setTexture(src, index: 0); e.setTexture(dst, index: 1)
+    e.dispatchThreads(MetallicSize(width: N, height: N), threadsPerThreadgroup: MetallicSize(width: 16, height: 16))
+    e.endEncoding(); cb.commit()
+}
+print("compute kernel  2048×2048:", ms(tKernel))
+let blur = try device.makeComputePipelineState(function: boxBlurFunction)
+let tBlur = best(5) {
+    let cb = queue.makeCommandBuffer()!, e = cb.makeComputeCommandEncoder()!
+    e.setComputePipelineState(blur); e.setTexture(src, index: 0); e.setTexture(dst, index: 1)
+    e.dispatchThreads(MetallicSize(width: N, height: N), threadsPerThreadgroup: MetallicSize(width: 16, height: 16))
+    e.endEncoding(); cb.commit()
+}
+print("3×3 blur kernel 2048×2048:", ms(tBlur))
+
+var rd = MetallicRenderPipelineDescriptor()
+rd.vertexFunction = screenQuadFunction
+rd.fragmentFunction = texturedFunction
+let render = try device.makeRenderPipelineState(descriptor: rd)
+let tRender = best(5) {
+    let cb = queue.makeCommandBuffer()!
+    var pass = MetallicRenderPassDescriptor()
+    pass.colorAttachments[0].texture = dst
+    let e = cb.makeRenderCommandEncoder(descriptor: pass)!
+    e.setRenderPipelineState(render); e.setFragmentTexture(src, index: 0); e.setFragmentSamplerState(.linear, index: 0)
+    e.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+    e.endEncoding(); cb.commit()
+}
+print("textured quad   2048×2048:", ms(tRender))
+
+// Liquid Glass frames in a 1600×1000 window (headless engine).
+setenv("MPP_UI_HEADLESS", "/tmp/claude-0/bench-glass.png", 1)
+_ = mppui_open("bench", 1600, 1000)
+func backdrop() {
+    mppui_begin_frame(0xFF20_3040)
+    for i in 0 ..< 40 { mppui_fill_rounded_rect(Float(i * 40), Float((i * 97) % 900), 120, 80, 16, 0xFF00_0000 | UInt32(i * 0x05_0B_13 & 0xFF_FFFF)) }
+}
+var clear = MppUIGlass(); clear.frost = 0
+var frosted = MppUIGlass(); frosted.frost = 2
+let tClear = best(5) { backdrop(); mppui_glass_effect(400, 300, 800, 240, 40, clear) }
+print("glass, clear    800×240 in 1600×1000:", ms(tClear))
+let tFrost = best(5) { backdrop(); mppui_glass_effect(400, 300, 800, 240, 40, frosted) }
+print("glass, frosted  800×240 in 1600×1000:", ms(tFrost))
+let tBar = best(5) { backdrop(); for k in 0 ..< 6 { mppui_glass_effect(40 + Float(k) * 250, 900, 220, 60, 30, frosted) } }
+print("glass, 6 frosted pills:", ms(tBar))
+let tBackdrop = best(5) { backdrop() }
+print("(backdrop alone:", ms(tBackdrop) + ")")

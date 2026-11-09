@@ -1,0 +1,169 @@
+// mpp — the M++ driver (written in M++).
+//
+//   mpp <file>.mpp [<window title>] [-- <args>...]
+//        build (optimized, cached) and run. With a window title, an MppUI
+//        app opens its window under that title, and any other program's
+//        output is shown in a window of that name.
+//   mpp build <file>.mpp [<dir>]     build and place the binary in <dir>
+//   mpp pm <command> ...             MppPM, the package manager (SwiftPM-style)
+//   mpp --emit-swift <file>.mpp      print the lowered Swift
+
+import MppKit
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+let usage = """
+M++ — Swift syntax, native speed
+
+usage:
+  mpp <file>.mpp [<window title>] [-- <args>...]
+                                    build (optimized, cached) and run; with a title,
+                                    show the app (or the program's output) in a window
+  mpp build <file>.mpp [<dir>]      build an optimized binary and place it in <dir> (default: .)
+  mpp pm <command>                  MppPM, the package manager; see `mpp pm --help`
+  mpp <file>.cpp [-- <args>...]     MppxxCpp: build C++ with M++'s safety and I/O, and run it
+  mpp build <file>.cpp [<dir>]      the same, placing the binary in <dir>
+  mpp <file>.kt [-- <args>...]      MppxxKotlin: Kotlin with M++'s I/O and checks (needs Kotlin + a JDK)
+  mpp highlight [--html] <file>     print a file with Xcode-style syntax colors
+  mpp --emit-swift <file>.mpp       print the lowered Swift
+  mpp --self-test                   run the front end's own tests
+  mpp --version
+
+options:
+  --debug              build without optimizations (debug info, faster compile)
+  -vm                  run Accelarate math on its fusing VM (see `import Accelarate`)
+  --no-auto-parallel   keep every loop sequential
+  --std=c++NN          C++ files: the ISO standard (17, 20, 23, 26; default 20)
+  --iso-strict         C++: ISO-conformance warnings are errors; Kotlin: warnings are errors
+  --kotlin=2.x         Kotlin files: the language version
+
+"""
+
+func requireSource(_ path: String) throws(DriverError) -> String {
+    guard path.hasSuffix(".mpp") || Cpp.isSource(path) || Kotlin.isSource(path) else {
+        throw DriverError("source files must end in .mpp (.cpp for MppxxCpp, .kt for MppxxKotlin): \(path)")
+    }
+    guard Files.isFile(path) else { throw DriverError("file not found: \(path)") }
+    return path
+}
+
+func buildCommand(_ args: [String], release: Bool, autoParallel: Bool) throws(DriverError) -> Int32 {
+    guard (1 ... 2).contains(args.count) else { throw DriverError("usage: mpp build <file>.mpp [<dir>]") }
+    let src = try requireSource(args[0])
+    let dir = args.count == 2 ? args[1] : Path.cwd
+    if Files.exists(dir) && !Files.isDirectory(dir) { throw DriverError("\(dir) is not a directory") }
+    Files.makeDirectories(dir)
+    if Kotlin.isSource(src) {
+        let dest = try Kotlin.build(src, into: dir)
+        if !Env.quiet { status("Built", Path.display(dest)) }
+        return 0
+    }
+    let exe = Cpp.isSource(src) ? try Cpp.program(src, release: release)
+        : try Builder.singleFile(src, release: release, autoParallel: autoParallel)
+    let dest = Path.join(dir, Path.stem(src))
+    try Files.copy(exe, dest)
+    status("Placed", dest)
+    return 0
+}
+
+/// Runs a program, optionally in a window titled `title`.
+func runCommand(_ source: String, title: String?, args: [String], release: Bool, autoParallel: Bool) throws(DriverError) -> Never {
+    let src = try requireSource(source)
+    if Kotlin.isSource(src) {
+        let cmd = Kotlin.command(try Kotlin.program(src), args)
+        try Process.exec(cmd[0], Array(cmd.dropFirst()))
+    }
+    let exe = Cpp.isSource(src) ? try Cpp.program(src, release: release)
+        : try Builder.singleFile(src, release: release, autoParallel: autoParallel)
+    guard let title else { try Process.exec(exe, args) }
+    let imports = Cpp.isSource(src) ? [] : Frontend.importedModules(try Files.read(src))
+    if imports.contains("MppUI") || imports.contains("liquidglass") || imports.contains("MppUIKit") {
+        // UI apps read the title from the environment.
+        _ = setenv("MPP_WINDOW_TITLE", title, 1)
+        try Process.exec(exe, args)
+    }
+    // Any other program: show its output in a window.
+    let home = try Locations.requireHome()
+    let viewer = try Builder.singleFile(Path.join(home, "MppLang/mpp-ui/Tools/OutputWindowKit.mpp"), release: true, autoParallel: false)
+    try Process.exec(viewer, [title, exe] + args)
+}
+
+func driverMain(_ argv: [String]) throws(DriverError) -> Int32 {
+    if argv.isEmpty || ["-h", "--help", "help"].contains(argv[0]) {
+        if argv.isEmpty { writeStderr(usage); return 2 }
+        writeStdout(usage)
+        return 0
+    }
+    if argv[0] == "--version" || argv[0] == "version" {
+        writeStdout("mpp 0.4.0 (self-hosted)\nbootstrap: \((try? Toolchain.version())?.split(separator: "\n").first.map(String.init) ?? "Swift toolchain not found")\n"
+                    + "c++ (MppxxCpp): \(Cpp.describe())\n"
+                    + "kotlin (MppxxKotlin): \((try? Kotlin.toolchain.get()).map { "\($0.version) (\($0.home)), JDK \($0.jdkMajor)" } ?? "not found")\n")
+        return 0
+    }
+    if argv[0] == "highlight" { return try highlightCommand(Array(argv.dropFirst())) }
+    if argv[0] == "pm" || argv[0] == "lib" { return try PackageManager.main(Array(argv.dropFirst())) }
+    if argv[0] == "--self-test" { return SelfTest.run() }
+
+    var release = true, autoParallel = true
+    var i = 0
+    while i < argv.count && argv[i].hasPrefix("-") && argv[i] != "--" {
+        switch argv[i] {
+        case "--debug": release = false
+        case "-O", "--release": release = true
+        case "-Ofast", "--fast", "-Ounchecked":
+            throw DriverError("\(argv[i]) was removed: M++ now drops a check only where it proves the check can never fail (see the README section on speed and safety)")
+        case "-vm", "--vm":
+            // Accelarate reads this at startup and runs on its fusing VM.
+            _ = setenv("MPP_VM", "1", 1)
+        case "--no-auto-parallel": autoParallel = false
+        case _ where try Cpp.parseOption(argv[i]): break
+        case _ where Kotlin.parseOption(argv[i]): break
+        case "--emit-swift":
+            guard i + 1 < argv.count else { throw DriverError("usage: mpp --emit-swift <file>.mpp") }
+            let path = try requireSource(argv[i + 1])
+            let text = try Files.read(path)
+            writeStdout(Frontend.lower(CppInterop.mentionsCpp(text) ? CppInterop.extract(text, file: Path.absolute(path)).text : text,
+                                       LoweringOptions(autoParallel: autoParallel)).text)
+            return 0
+        default: throw DriverError("unknown option \(argv[i]) (see `mpp --help`)")
+        }
+        i += 1
+    }
+    var rest = Array(argv[i...])
+    if rest.isEmpty { throw DriverError("no input file (see `mpp --help`)") }
+    if rest[0] == "build" {
+        var b = Array(rest.dropFirst())
+        while let opt = b.first, opt.hasPrefix("-") {
+            switch opt {
+            case "--debug": release = false
+            case "-O", "--release": release = true
+            case _ where try Cpp.parseOption(opt): break
+            case _ where Kotlin.parseOption(opt): break
+            default: throw DriverError("unknown build option \(opt) (see `mpp --help`)")
+            }
+            b.removeFirst()
+        }
+        return try buildCommand(b, release: release, autoParallel: autoParallel)
+    }
+    let source = rest.removeFirst()
+    var programArgs: [String] = []
+    if let dd = rest.firstIndex(of: "--") {
+        programArgs = Array(rest[(dd + 1)...])
+        rest.removeSubrange(dd...)
+    }
+    if rest.count > 1 { throw DriverError("too many arguments before `--`: the word after the file is a window title; program arguments go after --") }
+    try runCommand(source, title: rest.first, args: programArgs, release: release, autoParallel: autoParallel)
+}
+
+do {
+    let code = try driverMain(Array(CommandLine.arguments.dropFirst()))
+    exitProcess(code)
+} catch {
+    writeStderr(Env.stderrIsTTY ? "\u{1B}[1;31merror:\u{1B}[0m \(error)\n" : "error: \(error)\n")
+    exitProcess(1)
+}

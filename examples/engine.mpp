@@ -1,0 +1,95 @@
+// MppUI's own engine (no SwiftUI): `mpp examples/engine.mpp`.
+// On macOS this is AppKit + the engine; elsewhere `import MppUI` gives the same thing.
+import MppUIKit
+
+
+final class Model: ObservableObject { @Published var name = "Omar"; @Published var taps = 0 }
+
+struct Triangle: Shape {
+    func path(in r: CGRect) -> Path {
+        Path { p in
+            p.move(to: CGPoint(x: r.midX, y: r.minY))
+            p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
+            p.addLine(to: CGPoint(x: r.minX, y: r.maxY))
+            p.closeSubpath()
+        }
+    }
+}
+
+struct ContentView: View {
+    @StateObject private var model = Model()
+    @State private var notify = true
+    @State private var dark = false
+    @State private var volume = 0.5
+    @State private var flavor = "Mint"
+    @State private var count = 3
+    @State private var showSheet = false
+    @State private var showAlert = false
+    @State private var offset = CGSize.zero
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 20) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Settings").font(.title)
+                Toggle("Show notifications", isOn: $notify)
+                Toggle("Dark mode", isOn: $dark).toggleStyle(.switch)
+                HStack { Text("Volume"); Slider(value: $volume) }
+                Picker("Flavor:", selection: $flavor) {
+                    Text("Mint").tag("Mint"); Text("Lemon").tag("Lemon"); Text("Berry").tag("Berry")
+                }
+                Picker("", selection: $flavor) {
+                    Text("Mint").tag("Mint"); Text("Lemon").tag("Lemon"); Text("Berry").tag("Berry")
+                }.pickerStyle(.segmented)
+                Stepper("Count: \(count)", value: $count, in: 0...10)
+                TextField("Name", text: $model.name)
+                HStack {
+                    Button("Cancel") { showAlert = true }
+                    Button("Open Sheet") { showSheet = true }.buttonStyle(.borderedProminent)
+                }
+                DisclosureGroup("Advanced") { Text("Hidden options") }
+            }
+            .frame(width: 260)
+            VStack(spacing: 12) {
+                Triangle().fill(Color.orange).frame(width: 80, height: 70)
+                Canvas { ctx, size in
+                    ctx.fill(Path(ellipseIn: CGRect(x: 0, y: 0, width: size.width, height: size.height)), with: .color(.blue.opacity(0.3)))
+                    var p = Path(); p.move(to: .zero); p.addCurve(to: CGPoint(x: size.width, y: size.height), control1: CGPoint(x: size.width, y: 0), control2: CGPoint(x: 0, y: size.height))
+                    ctx.stroke(p, with: .color(.purple), lineWidth: 3)
+                }
+                .frame(width: 140, height: 90)
+                GeometryReader { g in
+                    Text("\(Int(g.size.width))×\(Int(g.size.height))").foregroundStyle(.secondary)
+                }
+                .frame(width: 140, height: 30)
+                Circle().fill(Color.green).frame(width: 40, height: 40)
+                    .offset(x: offset.width, y: offset.height)
+                    .gesture(DragGesture().onChanged { offset = $0.translation })
+                TabView {
+                    Text("General tab").tabItem { Text("General") }
+                    Text("Other tab").tabItem { Text("Other") }
+                }
+                .frame(width: 200, height: 90)
+            }
+        }
+        .padding(20)
+        .sheet(isPresented: $showSheet) { SheetView() }
+        .alert("Delete item?", isPresented: $showAlert) {
+            Button("Delete", role: .destructive) {}
+            Button("Cancel") {}
+        } message: { Text("This can't be undone.") }
+    }
+}
+
+struct SheetView: View {
+    @Environment(\.dismiss) var dismiss
+    var body: some View {
+        VStack(spacing: 12) {
+            Text("A sheet").font(.headline)
+            Text("Sheets slide over the window.")
+            Button("Done") { dismiss() }.buttonStyle(.borderedProminent)
+        }
+        .frame(width: 240)
+    }
+}
+
+app("Engine Demo", width: 640, height: 480) { ContentView() }

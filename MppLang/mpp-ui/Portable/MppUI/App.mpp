@@ -1,0 +1,267 @@
+// MppUI (portable engine) — the app loop and the MppUI components.
+//
+//   app("Notes", width: 600, height: 400) { NotesView() }
+//
+// `mpp app.mpp "Title"` sets the window title. With MPP_UI_HEADLESS=out.png
+// the app renders without a window and writes its last frame to out.png
+// (MPP_UI_SCRIPT="click 120 80; type hello; key return" drives it).
+
+import MppUIEngine
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
+/// Opens a window showing `content` and runs the app until it closes. Apps
+/// are Liquid Glass (macOS Tahoe / iOS 26) unless MPP_UI_STYLE=standard asks
+/// for plain Tahoe controls on the window background.
+public func app<Content: View>(_ title: String = "M++", width: Double = 480, height: Double = 360,
+                               @ViewBuilder content: @escaping () -> Content) -> Never {
+    let style: MppStyle = getenv("MPP_UI_STYLE").map { String(cString: $0) } == "standard" ? .standard : .liquidGlass
+    _runApp(title: title, width: width, height: height, style: style) { content() }
+}
+
+/// Called while the app is idle; return true to redraw (e.g. new data
+/// arrived on another thread).
+nonisolated(unsafe) public var _mppUIRefresh: (() -> Bool)? = nil
+
+/// Runs when the window closes, just before the app exits.
+nonisolated(unsafe) public var onAppClose: (() -> Void)? = nil
+
+public func _runApp(title: String, width: Double, height: Double, style: MppStyle, root: @escaping () -> any View) -> Never {
+    let t = getenv("MPP_WINDOW_TITLE").map { String(cString: $0) } ?? title
+    if mppui_open(t, Int32(width), Int32(height)) != 0 {
+        let msg = "MppUI: " + String(cString: mppui_error()) + "\n"
+        _ = msg.withCString { write(2, $0, strlen($0)) }
+        exit(1)
+    }
+    var shownTitle = t
+    var tree: Node? = nil
+
+    func render() {
+        Runtime.dirty = false
+        Springs.beginFrame()
+        Runtime.seenStates = []
+        Runtime.appearedNow = [:]
+        Runtime.environment = EnvironmentValues()
+        Runtime.environment.mppStyle = style
+        Runtime.windowTitle = nil
+        Runtime.overlayRequests = []
+        var ctx = BuildContext(path: "")
+        let node = ctx.build(root(), index: 0)
+        let w = Double(mppui_width()), h = Double(mppui_height())
+        let s = node.measure(Proposal(width: w, height: h))
+        node.place(aligned(Size(width: Swift.min(s.width, w), height: Swift.min(s.height, h)),
+                           in: Rect(x: 0, y: 0, width: w, height: h), .center))
+        if style == .liquidGlass {
+            // A soft, Tahoe-like backdrop for the glass to bend: sky to blush, two light glows.
+            mppui_begin_frame(0xFF_F1_F2_F8)
+            mppui_linear_gradient(0, 0, Float(w), Float(h), 0, Color.blue.opacity(0.26).argb, Color.pink.opacity(0.20).argb, 45)
+            mppui_fill_ellipse(Float(w * 0.62), Float(-h * 0.25), Float(w * 0.55), Float(w * 0.55), Color.purple.opacity(0.13).argb)
+            mppui_fill_ellipse(Float(-w * 0.15), Float(h * 0.6), Float(w * 0.5), Float(w * 0.5), Color.cyan.opacity(0.12).argb)
+        } else {
+            mppui_begin_frame(LG.windowBackground)  // Tahoe window background
+        }
+        tree = node
+        Runtime.tree = node
+        Runtime.layoutOverlays(tree: node, width: w, height: h)
+        node.draw()
+        Runtime.drawOverlays(width: w, height: h)
+        mppui_end_frame()
+
+        // Forget state no view uses any more; run appear/disappear/change actions.
+        for k in Runtime.states.keys where !Runtime.seenStates.contains(k) { Runtime.states[k] = nil }
+        for (k, v) in Runtime.appeared where Runtime.appearedNow[k] == nil {
+            if k.hasSuffix("#disappear"), let action = v { action() }
+        }
+        Runtime.appeared = Runtime.appearedNow
+        let pending = Runtime.afterRender
+        Runtime.afterRender = []
+        for a in pending { a() }
+        if !pending.isEmpty { Runtime.dirty = true }
+        if let wt = Runtime.windowTitle, getenv("MPP_WINDOW_TITLE") == nil, wt != shownTitle {
+            mppui_set_title(wt)
+            shownTitle = wt
+        }
+    }
+
+    /// Nodes under the pointer: in the topmost overlay if there is one.
+    func nodes(at x: Double, _ y: Double) -> [Node] {
+        var out: [Node] = []
+        if let top = Runtime.overlays.last {
+            if top.panel.contains(x, y) { top.node.stack(at: x, y, into: &out) }
+            return out
+        }
+        tree?.stack(at: x, y, into: &out)
+        return out
+    }
+    func find(_ path: String) -> Node? { Runtime.findAnywhere(path) }
+
+    var event = MppUIEvent()
+    var frames = 0
+    loop: while true {
+        if Runtime.dirty {
+            render()
+            frames += 1
+            if frames > 1000 && Runtime.dirty { Runtime.dirty = false }   // an onChange loop: stop spinning
+        }
+        let poll = Int32(_mppUIRefresh == nil ? 500 : 50)
+        // While a spring is moving, draw about 60 frames a second.
+        guard mppui_next_event(&event, Runtime.dirty ? 0 : (Springs.moving ? 16 : poll)) > 0 else {
+            if let refresh = _mppUIRefresh, refresh() { Runtime.invalidate() }
+            if Springs.moving { Runtime.invalidate(); frames = 0 }
+            continue
+        }
+        frames = 0
+        let x = Double(event.x), y = Double(event.y)
+        switch Int(event.type) {
+        case Int(MPPUI_EVENT_CLOSE.rawValue):
+            if Runtime.dirty { render() }
+            break loop
+        case Int(MPPUI_EVENT_RESIZE.rawValue), Int(MPPUI_EVENT_EXPOSE.rawValue):
+            Runtime.invalidate()
+        case Int(MPPUI_EVENT_MOUSE_DOWN.rawValue):
+            if let top = Runtime.overlays.last, !top.panel.contains(x, y) {
+                // A click outside a menu or popover closes it.
+                if top.request.kind == .menu || top.request.kind == .popover { top.request.dismiss() }
+                Runtime.invalidate()
+                continue
+            }
+            let target = nodes(at: x, y).last { $0.acceptsClicks }
+            Runtime.pressedPath = target?.path
+            Runtime.focusPath = target is TextFieldNode ? target?.path : nil
+            target?.mouseDown(x, y)
+            Runtime.invalidate()
+        case Int(MPPUI_EVENT_MOUSE_MOVE.rawValue):
+            if let p = Runtime.pressedPath, let n = find(p) { n.mouseDragged(x, y) } else { Runtime.pointerMoved(nodes(at: x, y)) }
+        case Int(MPPUI_EVENT_MOUSE_UP.rawValue):
+            if let p = Runtime.pressedPath, let n = find(p) { n.mouseUp(x, y, inside: n.frame.contains(x, y)) }
+            Runtime.pressedPath = nil
+            Runtime.invalidate()
+        case Int(MPPUI_EVENT_SCROLL.rawValue):
+            for n in nodes(at: x, y).reversed() where n.scroll(Double(event.dx), Double(event.dy)) {
+                Runtime.invalidate()
+                break
+            }
+        case Int(MPPUI_EVENT_KEY.rawValue):
+            if event.key == Int32(MPPUI_KEY_TAB.rawValue) {
+                // Tab moves focus to the next text field.
+                var fields: [Node] = []
+                func collect(_ n: Node) { if n is TextFieldNode { fields.append(n) }; n.children().forEach(collect) }
+                if let top = Runtime.overlays.last { collect(top.node) } else if let tree { collect(tree) }
+                if !fields.isEmpty {
+                    let i = fields.firstIndex { $0.path == Runtime.focusPath } ?? -1
+                    Runtime.focusPath = fields[(i + 1) % fields.count].path
+                    Runtime.invalidate()
+                }
+            } else if let p = Runtime.focusPath, let n = find(p) {
+                n.key(event.key, modifiers: event.modifiers)
+            } else if event.key == Int32(MPPUI_KEY_ESCAPE.rawValue), let top = Runtime.overlays.last {
+                top.request.dismiss()
+                Runtime.invalidate()
+            }
+        case Int(MPPUI_EVENT_TEXT.rawValue):
+            if let p = Runtime.focusPath, let n = find(p) {
+                let text = withUnsafeBytes(of: event.text) { raw -> String in
+                    let b = raw.bindMemory(to: UInt8.self)
+                    return String(decoding: b.prefix { $0 != 0 }, as: UTF8.self)
+                }
+                n.text(text)
+            }
+        default: break
+        }
+    }
+    mppui_close()
+    onAppClose?()
+    exit(0)
+}
+
+// MARK: - Components (the same API as MppUI on macOS)
+
+/// A padded, rounded container.
+public struct Card: View {
+    let spacing: Double
+    let content: ViewList
+    public init(spacing: Double = 10, @ViewBuilder content: () -> ViewList) { self.spacing = spacing; self.content = content() }
+    public var body: some View {
+        VStack(alignment: .leading, spacing: spacing) { content }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .mppSurface(cornerRadius: 20)
+    }
+}
+
+/// A button that follows the app style.
+public struct MppButton: View {
+    public enum Kind: Sendable { case primary, secondary, plain }
+    @Environment(\.mppStyle) private var style
+    let title: String
+    let systemImage: String?
+    let kind: Kind
+    let action: () -> Void
+    public init(_ title: String, systemImage: String? = nil, kind: Kind = .primary, action: @escaping () -> Void) {
+        self.title = title; self.systemImage = systemImage; self.kind = kind; self.action = action
+    }
+    public var body: some View {
+        let s: ButtonStyleKind = kind == .plain ? .plain
+            : style == .liquidGlass ? (kind == .primary ? .glassProminent : .glass)
+            : (kind == .primary ? .borderedProminent : .bordered)
+        if let systemImage {
+            Button(title, systemImage: systemImage, action: action).buttonStyle(s)
+        } else {
+            Button(title, action: action).buttonStyle(s)
+        }
+    }
+}
+
+/// A text field on a style-following surface.
+public struct MppTextField: View {
+    let title: String
+    let text: Binding<String>
+    public init(_ title: String, text: Binding<String>) { self.title = title; self.text = text }
+    public var body: some View {
+        TextField(title, text: text)
+            .textFieldStyle(.plain)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .mppSurface(cornerRadius: 14)
+    }
+}
+
+/// A horizontal bar for controls (toolbar-like), on a style-following surface.
+public struct Bar: View {
+    let content: ViewList
+    public init(@ViewBuilder content: () -> ViewList) { self.content = content() }
+    public var body: some View {
+        HStack(spacing: 12) { content }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .mppSurface(cornerRadius: 26)
+    }
+}
+
+/// A small capsule label.
+public struct Pill: View {
+    let text: String
+    let tint: Color
+    public init(_ text: String, tint: Color = .accentColor) { self.text = text; self.tint = tint }
+    public var body: some View {
+        Text(text)
+            .font(Font.caption.weight(.semibold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .foregroundStyle(tint)
+            .background(tint.opacity(0.15), in: Capsule())
+    }
+}
+
+/// Groups glass shapes (on this engine every glass shape already blends with the backdrop).
+public struct GlassGroup: View {
+    let content: ViewList
+    public init(spacing: Double? = nil, @ViewBuilder content: () -> ViewList) { self.content = content() }
+    public var body: some View { content }
+}
+public typealias GlassEffectContainer = GlassGroup

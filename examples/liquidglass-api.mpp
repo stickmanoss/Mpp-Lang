@@ -1,0 +1,47 @@
+// Liquid Glass with SwiftUI's API, drawn by Metallic shaders ported from
+// liquidGL — the same on every Mac (any GPU, or none) and on Linux:
+//   MPP_UI_HEADLESS=glass.png mpp examples/liquidglass-api.mpp
+import MppUIKit
+
+struct GlassShowcase: View {
+    @State private var count = 0
+
+    var body: some View {
+        ZStack {
+            // Something with detail behind the glass, so the refraction shows.
+            VStack(spacing: 0) {
+                ForEach(0 ..< 14) { i in
+                    Rectangle().fill(i % 2 == 0 ? Color.blue : Color.orange).frame(height: 40)
+                }
+            }
+            VStack(spacing: 22) {
+                Text("Liquid Glass").font(.largeTitle.bold()).foregroundStyle(.white)
+
+                GlassEffectContainer(spacing: 12) {
+                    HStack(spacing: 12) {
+                        Button("Count \(count)") { count += 1 }.buttonStyle(.glass)
+                        Button("Prominent") { count = 0 }.buttonStyle(.glassProminent)
+                    }
+                }
+
+                Text("Regular: frosted, tinted, interactive")
+                    .padding(16)
+                    .glassEffect(.regular.tint(.teal).interactive(), in: .capsule)
+
+                Text("Alien preset with colour fringing")
+                    .padding(18)
+                    .glassEffect(.alien.chromaticAberration(0.4), in: .rect(cornerRadius: 24))
+
+                HStack(spacing: 24) {
+                    Circle().fill(.clear).frame(width: 96, height: 96)
+                        .glassEffect(.clear.magnify(1.6).bevel(depth: 0.15, width: 0.3), in: .circle)
+                    RoundedRectangle(cornerRadius: 20).fill(.clear).frame(width: 140, height: 96)
+                        .glassEffect(.edge, in: .rect(cornerRadius: 20))
+                }
+            }
+            .padding(30)
+        }
+    }
+}
+
+app("Liquid Glass", width: 560, height: 560) { GlassShowcase() }

@@ -1,0 +1,287 @@
+// MppKit — Format: {fmt}-style formatting.
+//
+//   format("{} + {} = {}", 1, 2, 3)            // "1 + 2 = 3"
+//   format("{:>8.3f}|{:<6}|{:^7}", pi, "ab", 42)
+//   format("{0} {1} {0}", "a", "b")            // positional arguments
+//   format("{:#x} {:08b} {:,}", 255, 5, 1234567)  // "0xff 00000101 1,234,567"
+//   format("{:.1%}", 0.256)                    // "25.6%"
+//   println("{} items", n)                     // fmt::print with a newline
+//
+// Spec: {[index]:[[fill]align][sign][#][0][width][,][.precision][type]}
+//   align  < > ^      sign  + - space      type  d x X o b e E f F g % s c
+// A malformed format string or missing argument traps with a clear message.
+
+public struct FormatSpec: Sendable {
+    public var fill: Character = " "
+    public var align: Character? = nil      // "<", ">", "^"
+    public var sign: Character = "-"        // "+", "-", " "
+    public var alternate = false            // "#": 0x / 0b / 0o prefixes
+    public var zeroPad = false
+    public var width = 0
+    public var grouping = false             // ",": thousands separators
+    public var precision: Int? = nil
+    public var type: Character? = nil
+
+    public init() {}
+
+    public init(parsing spec: Substring) {
+        var s = spec[...]
+        func peek(_ off: Int = 0) -> Character? {
+            let i = s.index(s.startIndex, offsetBy: off, limitedBy: s.endIndex)
+            return i.flatMap { $0 < s.endIndex ? s[$0] : nil }
+        }
+        if let second = peek(1), "<>^".contains(second), let first = peek() {
+            fill = first; align = second; s = s.dropFirst(2)
+        } else if let first = peek(), "<>^".contains(first) {
+            align = first; s = s.dropFirst()
+        }
+        if let c = peek(), "+- ".contains(c) { sign = c; s = s.dropFirst() }
+        if peek() == "#" { alternate = true; s = s.dropFirst() }
+        if peek() == "0" { zeroPad = true; s = s.dropFirst() }
+        var w = 0
+        while let c = peek(), let d = c.wholeNumberValue, c.isASCII { w = w * 10 + d; s = s.dropFirst() }
+        width = w
+        if peek() == "," { grouping = true; s = s.dropFirst() }
+        if peek() == "." {
+            s = s.dropFirst()
+            var p = 0
+            while let c = peek(), let d = c.wholeNumberValue, c.isASCII { p = p * 10 + d; s = s.dropFirst() }
+            precision = p
+        }
+        if let c = peek() { type = c; s = s.dropFirst() }
+        if !s.isEmpty { preconditionFailure("format: invalid spec '\(spec)'") }
+    }
+}
+
+/// Types that format themselves under a spec. Integers, floating point
+/// numbers, strings, characters and Bool conform; anything else falls back
+/// to `String(describing:)`.
+public protocol Formattable {
+    func formatted(_ spec: FormatSpec) -> String
+}
+
+// MARK: - Number rendering
+
+@usableFromInline
+func _group(_ digits: String) -> String {
+    var out = ""
+    for (i, c) in digits.enumerated() {
+        if i > 0 && (digits.count - i) % 3 == 0 { out.append(",") }
+        out.append(c)
+    }
+    return out
+}
+
+func _pad(_ body: String, sign: String, prefix: String, _ spec: FormatSpec, numeric: Bool) -> String {
+    let len = sign.count + prefix.count + body.count
+    if spec.width <= len { return sign + prefix + body }
+    let padCount = spec.width - len
+    if spec.zeroPad && spec.align == nil && numeric {
+        return sign + prefix + String(repeating: "0", count: padCount) + body
+    }
+    let full = sign + prefix + body
+    let fill = String(spec.fill)
+    switch spec.align ?? (numeric ? ">" : "<") {
+    case "<": return full + String(repeating: fill, count: padCount)
+    case "^": return String(repeating: fill, count: padCount / 2) + full + String(repeating: fill, count: padCount - padCount / 2)
+    default: return String(repeating: fill, count: padCount) + full
+    }
+}
+
+func _signString(negative: Bool, _ spec: FormatSpec) -> String {
+    negative ? "-" : (spec.sign == "+" ? "+" : spec.sign == " " ? " " : "")
+}
+
+extension BinaryInteger {
+    public func formatted(_ spec: FormatSpec) -> String {
+        let negative = self < 0
+        let mag = self.magnitude
+        var prefix = ""
+        var digits: String
+        switch spec.type {
+        case "x": digits = String(mag, radix: 16); if spec.alternate { prefix = "0x" }
+        case "X": digits = String(mag, radix: 16, uppercase: true); if spec.alternate { prefix = "0X" }
+        case "o": digits = String(mag, radix: 8); if spec.alternate { prefix = "0o" }
+        case "b": digits = String(mag, radix: 2); if spec.alternate { prefix = "0b" }
+        case "c": return _pad(String(Character(Unicode.Scalar(UInt32(truncatingIfNeeded: self)) ?? "?")), sign: "", prefix: "", spec, numeric: false)
+        case "e", "E", "f", "F", "g", "%": return Double(self).formatted(spec)
+        case nil, "d": digits = String(mag)
+        case let t?: preconditionFailure("format: type '\(t)' is not valid for integers")
+        }
+        if spec.grouping { digits = _group(digits) }
+        return _pad(digits, sign: _signString(negative: negative, spec), prefix: prefix, spec, numeric: true)
+    }
+}
+
+extension Int: Formattable {}
+extension Int8: Formattable {}
+extension Int16: Formattable {}
+extension Int32: Formattable {}
+extension Int64: Formattable {}
+extension UInt: Formattable {}
+extension UInt8: Formattable {}
+extension UInt16: Formattable {}
+extension UInt32: Formattable {}
+extension UInt64: Formattable {}
+
+/// Fixed-point digits of |x| with `precision` decimals (round half to even
+/// on the scaled value, like printf for representable inputs).
+func _fixed(_ x: Double, _ precision: Int) -> String {
+    let p = min(precision, 17)
+    let scale = (0 ..< p).reduce(1.0) { a, _ in a * 10 }
+    let scaled = (x * scale).rounded(.toNearestOrEven)
+    if scaled >= 9.0e18 || !scaled.isFinite {  // too large for integer path
+        var s = "\(x.rounded(.toNearestOrEven))"
+        if s.hasSuffix(".0") { s.removeLast(2) }
+        return p == 0 ? s : s + "." + String(repeating: "0", count: p)
+    }
+    var digits = String(UInt64(scaled))
+    if p == 0 { return digits }
+    if digits.count <= p { digits = String(repeating: "0", count: p - digits.count + 1) + digits }
+    let cut = digits.index(digits.endIndex, offsetBy: -p)
+    return digits[..<cut] + "." + digits[cut...] + String(repeating: "0", count: max(0, precision - 17))
+}
+
+func _scientific(_ x: Double, _ precision: Int, upper: Bool) -> String {
+    if x == 0 { return _fixed(0, precision) + (upper ? "E+00" : "e+00") }
+    var exp = _decimalExponent(x)
+    var mant = x / pow10Double(exp)
+    if mant >= 10 { mant /= 10; exp += 1 }
+    if mant < 1 { mant *= 10; exp -= 1 }
+    var m = _fixed(mant, precision)
+    if m.hasPrefix("10") { m = _fixed(mant / 10, precision); exp += 1 }   // rounding carried over
+    let e = abs(exp) < 10 ? "0\(abs(exp))" : "\(abs(exp))"
+    return m + (upper ? "E" : "e") + (exp < 0 ? "-" : "+") + e
+}
+
+func pow10Double(_ e: Int) -> Double {
+    var r = 1.0
+    if e >= 0 { for _ in 0 ..< e { r *= 10 } } else { for _ in 0 ..< -e { r /= 10 } }
+    return r
+}
+
+/// floor(log10(x)) for finite x > 0, without libm.
+func _decimalExponent(_ x: Double) -> Int {
+    var e = 0
+    var v = x
+    while v >= 1e16 { v /= 1e16; e += 16 }
+    while v >= 10 { v /= 10; e += 1 }
+    while v < 1e-16 { v *= 1e16; e -= 16 }
+    while v < 1 { v *= 10; e -= 1 }
+    return e
+}
+
+extension BinaryFloatingPoint {
+    public func formatted(_ spec: FormatSpec) -> String {
+        let x = Double(self)
+        if x.isNaN { return _pad("nan", sign: "", prefix: "", spec, numeric: true) }
+        let negative = x.sign == .minus && x != 0 || (x == 0 && x.sign == .minus)
+        let sign = _signString(negative: negative, spec)
+        let a = abs(x)
+        if a.isInfinite { return _pad("inf", sign: sign, prefix: "", spec, numeric: true) }
+        var body: String
+        switch spec.type {
+        case "f", "F": body = _fixed(a, spec.precision ?? 6)
+        case "e", "E": body = _scientific(a, spec.precision ?? 6, upper: spec.type == "E")
+        case "%": body = _fixed(a * 100, spec.precision ?? 6) + "%"
+        case "g", "G":
+            let p = max(spec.precision ?? 6, 1)
+            let exp = a == 0 ? 0 : _decimalExponent(a)
+            if exp < -4 || exp >= p { body = _scientific(a, p - 1, upper: spec.type == "G") }
+            else {
+                body = _fixed(a, max(p - 1 - exp, 0))
+                if body.contains(".") { while body.hasSuffix("0") { body.removeLast() }; if body.hasSuffix(".") { body.removeLast() } }
+            }
+        case nil:
+            if let p = spec.precision { body = _fixed(a, p) }
+            else { body = "\(a)" }
+        case let t?: preconditionFailure("format: type '\(t)' is not valid for floating point")
+        }
+        if spec.grouping, let dot = body.firstIndex(where: { !$0.isNumber }) ?? Optional(body.endIndex) {
+            body = _group(String(body[..<dot])) + body[dot...]
+        }
+        return _pad(body, sign: sign, prefix: "", spec, numeric: true)
+    }
+}
+
+extension Double: Formattable {}
+extension Float: Formattable {}
+
+extension String: Formattable {
+    public func formatted(_ spec: FormatSpec) -> String {
+        var s = self
+        if let p = spec.precision, s.count > p { s = String(s.prefix(p)) }
+        return _pad(s, sign: "", prefix: "", spec, numeric: false)
+    }
+}
+
+extension Substring: Formattable {
+    public func formatted(_ spec: FormatSpec) -> String { String(self).formatted(spec) }
+}
+
+extension Character: Formattable {
+    public func formatted(_ spec: FormatSpec) -> String { String(self).formatted(spec) }
+}
+
+extension Bool: Formattable {
+    public func formatted(_ spec: FormatSpec) -> String { (self ? "true" : "false").formatted(spec) }
+}
+
+@usableFromInline
+func _formatAny(_ value: Any, _ spec: FormatSpec) -> String {
+    if let f = value as? any Formattable { return f.formatted(spec) }
+    return String(describing: value).formatted(spec)
+}
+
+// MARK: - format()
+
+/// Formats `args` into `fmt` ({fmt} syntax: "{}", "{0}", "{:>10.2f}", "{{" for a brace).
+public func format<each A>(_ fmt: String, _ args: repeat each A) -> String {
+    var values: [Any] = []
+    repeat values.append(each args)
+    return _format(fmt, values)
+}
+
+public func _format(_ fmt: String, _ values: [Any]) -> String {
+    var out = ""
+    out.reserveCapacity(fmt.utf8.count + values.count * 8)
+    var next = 0
+    var i = fmt.startIndex
+    while i < fmt.endIndex {
+        let c = fmt[i]
+        if c == "{" {
+            let j = fmt.index(after: i)
+            if j < fmt.endIndex && fmt[j] == "{" { out.append("{"); i = fmt.index(after: j); continue }
+            guard let close = fmt[j...].firstIndex(of: "}") else { preconditionFailure("format: unmatched '{' in \"\(fmt)\"") }
+            let field = fmt[j ..< close]
+            let colon = field.firstIndex(of: ":")
+            let indexPart = colon.map { field[..<$0] } ?? field
+            let spec = colon.map { FormatSpec(parsing: field[field.index(after: $0)...]) } ?? FormatSpec()
+            let index: Int
+            if indexPart.isEmpty { index = next; next += 1 }
+            else if let n = Int(indexPart) { index = n }
+            else { preconditionFailure("format: bad argument index '\(indexPart)' in \"\(fmt)\"") }
+            guard index < values.count else {
+                preconditionFailure("format: argument \(index) is missing (\(values.count) given) in \"\(fmt)\"")
+            }
+            out += _formatAny(values[index], spec)
+            i = fmt.index(after: close)
+        } else if c == "}" {
+            let j = fmt.index(after: i)
+            guard j < fmt.endIndex && fmt[j] == "}" else { preconditionFailure("format: single '}' in \"\(fmt)\"") }
+            out.append("}")
+            i = fmt.index(after: j)
+        } else {
+            out.append(c)
+            i = fmt.index(after: i)
+        }
+    }
+    return out
+}
+
+/// Formats and prints with a newline (fmt::println).
+public func println<each A>(_ fmt: String, _ args: repeat each A) {
+    var values: [Any] = []
+    repeat values.append(each args)
+    print(_format(fmt, values))
+}

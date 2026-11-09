@@ -1,0 +1,14 @@
+# Entry for github-linguist/linguist lib/linguist/languages.yml (alphabetical, after "M4Sugar").
+# language_id is assigned by running `script/update-ids` in the Linguist repo.
+M++:
+  type: programming
+  color: "#7B4DFF"
+  aliases:
+  - mpp
+  extensions:
+  - ".mpp"
+  tm_scope: source.mpp
+  ace_mode: swift
+  codemirror_mode: swift
+  codemirror_mime_type: text/x-swift
+  language_id: 0

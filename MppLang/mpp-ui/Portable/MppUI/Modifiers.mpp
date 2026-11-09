@@ -1,0 +1,281 @@
+// MppUI (portable engine) — view modifiers.
+
+import MppUIEngine
+
+/// A modifier: optionally changes the environment for the content, then
+/// optionally wraps the content's node.
+struct _Mod<Content: View>: View, PrimitiveView {
+    typealias Body = Never
+    let content: Content
+    var env: ((inout EnvironmentValues) -> Void)? = nil
+    var wrap: ((Node, inout BuildContext) -> Node)? = nil
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let saved = Runtime.environment
+        env?(&Runtime.environment)
+        var node = ctx.build(content, index: 0)
+        if let wrap { node = wrap(node, &ctx) }
+        Runtime.environment = saved
+        return node
+    }
+}
+
+extension View {
+    func _env(_ f: @escaping (inout EnvironmentValues) -> Void) -> some View { _Mod(content: self, env: f) }
+    func _wrap(_ f: @escaping (Node, inout BuildContext) -> Node) -> some View { _Mod(content: self, wrap: f) }
+    /// Ignored on this platform (kept so SwiftUI code compiles unchanged).
+    func _noop() -> some View { _Mod(content: self) }
+}
+
+// MARK: - ViewModifier
+
+public protocol ViewModifier {
+    associatedtype Body: View
+    typealias Content = _ViewModifierContent
+    @ViewBuilder func body(content: Content) -> Body
+}
+
+/// The view a ViewModifier receives as `content`.
+public struct _ViewModifierContent: View, PrimitiveView {
+    public typealias Body = Never
+    let view: any View
+    func makeNode(_ ctx: inout BuildContext) -> Node { ctx.build(view, index: 0) }
+}
+
+struct _Modified<C: View, M: ViewModifier>: View {
+    let content: C
+    let modifier: M
+    var body: some View { modifier.body(content: _ViewModifierContent(view: content)) }
+}
+
+extension View {
+    public func modifier<M: ViewModifier>(_ m: M) -> some View { _Modified(content: self, modifier: m) }
+}
+
+// MARK: - Layout
+
+extension View {
+    public func padding(_ length: Double? = nil) -> some View {
+        let l = length ?? 16
+        return _wrap { n, _ in PaddingNode(n, EdgeInsets(top: l, leading: l, bottom: l, trailing: l)) }
+    }
+    public func padding(_ edges: Edge.Set, _ length: Double? = nil) -> some View {
+        let l = length ?? 16
+        return _wrap { n, _ in
+            PaddingNode(n, EdgeInsets(top: edges.contains(.top) ? l : 0, leading: edges.contains(.leading) ? l : 0,
+                                      bottom: edges.contains(.bottom) ? l : 0, trailing: edges.contains(.trailing) ? l : 0))
+        }
+    }
+    public func padding(_ insets: EdgeInsets) -> some View { _wrap { n, _ in PaddingNode(n, insets) } }
+
+    public func frame(width: Double? = nil, height: Double? = nil, alignment: Alignment = .center) -> some View {
+        _wrap { n, _ in
+            let f = FrameNode(n)
+            f.width = width; f.height = height; f.alignment = alignment
+            return f
+        }
+    }
+    public func frame(minWidth: Double? = nil, idealWidth: Double? = nil, maxWidth: Double? = nil,
+                      minHeight: Double? = nil, idealHeight: Double? = nil, maxHeight: Double? = nil,
+                      alignment: Alignment = .center) -> some View {
+        _wrap { n, _ in
+            let f = FrameNode(n)
+            f.minWidth = minWidth; f.maxWidth = maxWidth; f.minHeight = minHeight; f.maxHeight = maxHeight
+            f.alignment = alignment
+            return f
+        }
+    }
+    public func fixedSize(horizontal: Bool = true, vertical: Bool = true) -> some View {
+        _wrap { n, _ in FixedNode(n, horizontal: horizontal, vertical: vertical) }
+    }
+    public func offset(x: Double = 0, y: Double = 0) -> some View {
+        _wrap { n, _ in let e = EffectNode(n); e.offset = (x, y); return e }
+    }
+    public func layoutPriority(_ p: Double) -> some View { _noop() }
+    public func ignoresSafeArea(_ regions: Any? = nil, edges: Edge.Set = .all) -> some View { _noop() }
+    public func zIndex(_ z: Double) -> some View { _noop() }
+    public func aspectRatio(_ ratio: Double? = nil, contentMode: ContentMode = .fit) -> some View { _noop() }
+    public func scaledToFit() -> some View { _noop() }
+    public func scaledToFill() -> some View { _noop() }
+}
+
+public enum ContentMode: Sendable { case fit, fill }
+
+final class FixedNode: WrapperNode {
+    let h: Bool, v: Bool
+    init(_ c: Node, horizontal: Bool, vertical: Bool) { h = horizontal; v = vertical; super.init(c) }
+    override var flexibility: Double { 0 }
+    override func size(_ p: Proposal) -> Size {
+        child.measure(Proposal(width: h ? nil : p.width, height: v ? nil : p.height))
+    }
+}
+
+// MARK: - Appearance
+
+public protocol ShapeStyle {}
+extension Color: ShapeStyle {}
+extension Material: ShapeStyle {}
+extension LinearGradient: ShapeStyle {}
+
+extension View {
+    public func foregroundStyle(_ c: Color) -> some View { _env { $0.foregroundColor = c } }
+    public func foregroundColor(_ c: Color?) -> some View { _env { if let c { $0.foregroundColor = c } } }
+    public func tint(_ c: Color?) -> some View { _env { if let c { $0.tint = c } } }
+    public func font(_ f: Font?) -> some View { _env { if let f { $0.font = f } } }
+    public func fontWeight(_ w: Font.Weight?) -> some View { _env { if let w { $0.font = $0.font.weight(w) } } }
+    public func bold(_ on: Bool = true) -> some View { _env { $0.font.isBold = on } }
+    public func italic(_ on: Bool = true) -> some View { _noop() }
+    public func monospaced(_ on: Bool = true) -> some View { _env { $0.font.isMonospaced = on } }
+    public func monospacedDigit() -> some View { _noop() }
+    public func lineLimit(_ n: Int?) -> some View { _env { $0.lineLimit = n } }
+    public func multilineTextAlignment(_ a: TextAlignment) -> some View { _env { $0.textAlignment = a } }
+    public func disabled(_ off: Bool) -> some View { _env { if off { $0.isEnabled = false } } }
+    public func labelsHidden() -> some View { _env { $0.labelsHidden = true } }
+    public func buttonStyle(_ s: ButtonStyleKind) -> some View { _env { $0.buttonStyleKind = s } }
+    public func textFieldStyle(_ s: TextFieldStyleKind) -> some View { _env { $0.textFieldBordered = s != .plain } }
+    public func pickerStyle(_ s: PickerStyleKind) -> some View { _env { $0.pickerStyleKind = s } }
+    public func toggleStyle(_ s: ToggleStyleKind) -> some View { _env { $0.toggleStyleKind = s } }
+    public func controlSize(_ s: ControlSize) -> some View { _env { $0.controlSize = s } }
+    /// `.bottom`: scroll views start at the end and follow new content there.
+    public func defaultScrollAnchor(_ a: UnitPoint?) -> some View { _env { $0.scrollAnchorBottom = a == .bottom } }
+    public func listStyle(_ s: Any) -> some View { _noop() }
+    public func imageScale(_ s: Any) -> some View { _noop() }
+    public func symbolRenderingMode(_ s: Any?) -> some View { _noop() }
+    public func preferredColorScheme(_ s: Any?) -> some View { _noop() }
+    public func animation<V: Equatable>(_ a: Any?, value: V) -> some View { _noop() }
+    public func transition(_ t: Any) -> some View { _noop() }
+    public func help(_ s: String) -> some View { _noop() }
+    public func id<ID: Hashable>(_ id: ID) -> some View { _noop() }
+    public func keyboardShortcut(_ k: Any, modifiers: Any? = nil) -> some View { _noop() }
+    public func contentShape<S: Shape>(_ s: S) -> some View { _noop() }
+    public func accessibilityLabel(_ s: String) -> some View { _noop() }
+    public func environment<V>(_ keyPath: WritableKeyPath<EnvironmentValues, V>, value: V) -> some View {
+        _env { $0[keyPath: keyPath] = value }
+    }
+
+    public func opacity(_ o: Double) -> some View { _wrap { n, _ in let e = EffectNode(n); e.opacity = o; return e } }
+    public func hidden() -> some View { opacity(0) }
+    public func cornerRadius(_ r: Double) -> some View { _wrap { n, _ in let e = EffectNode(n); e.clip = .rounded(r); return e } }
+    public func clipped() -> some View { _wrap { n, _ in let e = EffectNode(n); e.clip = .rectangle; return e } }
+    public func clipShape<S: Shape>(_ s: S) -> some View { _wrap { n, _ in let e = EffectNode(n); e.clip = s.kind; return e } }
+    public func shadow(color: Color = Color(white: 0, opacity: 0.33), radius: Double, x: Double = 0, y: Double = 0) -> some View {
+        _wrap { n, _ in let e = EffectNode(n); e.shadow = (color, radius, x, y); return e }
+    }
+    public func scaleEffect(_ s: Double) -> some View { _noop() }
+    public func rotationEffect(_ a: Any) -> some View { _noop() }
+    public func blur(radius: Double) -> some View { _noop() }
+
+    // Backgrounds and overlays
+
+    public func background(_ c: Color) -> some View { layer(behind: true) { let s = ShapeNode(.rectangle); s.fill = c; return s } }
+    public func background(_ m: Material) -> some View { layer(behind: true) { let s = ShapeNode(.rectangle); s.material = m; return s } }
+    public func background(_ g: LinearGradient) -> some View { layer(behind: true) { let s = ShapeNode(.rectangle); s.gradient = (g.from, g.to, g.angle); return s } }
+    public func background<S: Shape>(_ c: Color, in shape: S) -> some View { layer(behind: true) { let s = ShapeNode(shape.kind); s.fill = c; return s } }
+    public func background<S: Shape>(_ m: Material, in shape: S) -> some View { layer(behind: true) { let s = ShapeNode(shape.kind); s.material = m; return s } }
+    public func background<S: Shape>(_ g: LinearGradient, in shape: S) -> some View { layer(behind: true) { let s = ShapeNode(shape.kind); s.gradient = (g.from, g.to, g.angle); return s } }
+    public func background<B: View>(_ view: B) -> some View { layerView(view, behind: true, alignment: .center) }
+    public func background<B: View>(alignment: Alignment = .center, @ViewBuilder content: () -> B) -> some View {
+        layerView(content(), behind: true, alignment: alignment)
+    }
+    public func overlay<B: View>(_ view: B) -> some View { layerView(view, behind: false, alignment: .center) }
+    public func overlay<B: View>(alignment: Alignment = .center, @ViewBuilder content: () -> B) -> some View {
+        layerView(content(), behind: false, alignment: alignment)
+    }
+    public func border(_ c: Color, width: Double = 1) -> some View {
+        layer(behind: false) { let s = ShapeNode(.rectangle); s.stroke = (c, width); return s }
+    }
+
+    /// Liquid Glass behind this view (SwiftUI's glassEffect).
+    public func glassEffect<S: Shape>(_ g: Glass = .regular, in shape: S) -> some View {
+        layer(behind: true) { let s = ShapeNode(shape.kind); s.glass = g; return s }
+    }
+    public func glassEffect(_ g: Glass = .regular) -> some View { glassEffect(g, in: Capsule()) }
+
+    func layer(behind: Bool, _ make: @escaping () -> ShapeNode) -> some View {
+        _wrap { n, _ in
+            let s = make()
+            s.env = Runtime.environment; s.envAssigned = true
+            return LayerNode(n, layer: s, behind: behind)
+        }
+    }
+    func layerView<B: View>(_ v: B, behind: Bool, alignment: Alignment) -> some View {
+        _wrap { n, ctx in LayerNode(n, layer: ctx.build(v, index: 1), behind: behind, alignment: alignment) }
+    }
+}
+
+// MARK: - Events and life cycle
+
+extension View {
+    public func onTapGesture(count: Int = 1, perform action: @escaping () -> Void) -> some View {
+        _wrap { n, _ in TapNode(n, action) }
+    }
+    public func onSubmit(_ action: @escaping () -> Void) -> some View { _env { $0.onSubmit = action } }
+
+    public func onAppear(perform action: (() -> Void)? = nil) -> some View {
+        _wrap { n, ctx in
+            let key = ctx.path + "#appear"
+            Runtime.appearedNow[key] = Runtime.appearedNow[key] ?? nil
+            if Runtime.appeared[key] == nil, let action { Runtime.afterRender.append(action) }
+            return n
+        }
+    }
+    public func onDisappear(perform action: (() -> Void)? = nil) -> some View {
+        _wrap { n, ctx in
+            Runtime.appearedNow[ctx.path + "#disappear"] = .some(action)
+            return n
+        }
+    }
+    public func onChange<V: Equatable>(of value: V, initial: Bool = false, _ action: @escaping (V, V) -> Void) -> some View {
+        _wrap { n, ctx in
+            let key = ctx.path + "#change"
+            if let old = Runtime.memory[key] as? V {
+                if old != value { Runtime.afterRender.append { action(old, value) } }
+            } else if initial {
+                Runtime.afterRender.append { action(value, value) }
+            }
+            Runtime.memory[key] = value
+            return n
+        }
+    }
+    public func onChange<V: Equatable>(of value: V, perform action: @escaping (V) -> Void) -> some View {
+        onChange(of: value) { _, new in action(new) }
+    }
+    public func task(_ action: @escaping () -> Void) -> some View { onAppear(perform: action) }
+
+    public func navigationTitle(_ title: String) -> some View {
+        _wrap { n, _ in
+            Runtime.navigationTitle = title
+            if Runtime.navigationStacks.isEmpty { Runtime.windowTitle = title }
+            return n
+        }
+    }
+    public func navigationBarTitleDisplayMode(_ m: Any) -> some View { _noop() }
+    public func toolbar<C: View>(@ViewBuilder content: () -> C) -> some View { _noop() }
+}
+
+final class TapNode: WrapperNode {
+    let action: () -> Void
+    init(_ c: Node, _ a: @escaping () -> Void) { action = a; super.init(c) }
+    override var acceptsClicks: Bool { env.isEnabled }
+    override func mouseUp(_ x: Double, _ y: Double, inside: Bool) {
+        if inside { action() }
+        Runtime.invalidate()
+    }
+}
+
+// MARK: - MppUI style
+
+extension View {
+    /// A rounded background that follows the app style (glass or material).
+    public func mppSurface(cornerRadius: Double = 16) -> some View {
+        _wrap { n, _ in
+            let s = ShapeNode(.rounded(cornerRadius))
+            if Runtime.environment.mppStyle == .liquidGlass { s.glass = .regular } else { s.material = .regularMaterial }
+            s.env = Runtime.environment; s.envAssigned = true
+            return LayerNode(n, layer: s, behind: true)
+        }
+    }
+    /// Liquid Glass behind this view, in a rounded rectangle.
+    public func liquidGlass(tint: Color? = nil, cornerRadius: Double = 16, interactive: Bool = false) -> some View {
+        glassEffect(Glass.regular.tint(tint).interactive(interactive), in: RoundedRectangle(cornerRadius: cornerRadius))
+    }
+}

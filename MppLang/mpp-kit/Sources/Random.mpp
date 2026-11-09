@@ -1,0 +1,149 @@
+// MppKit — Random: PCG / xoshiro generators and distributions (Boost.Random, <random>).
+//
+//   var rng = PCG32(seed: 42)                     // reproducible
+//   let x = Double.random(in: 0..<1, using: &rng) // works with all Swift random APIs
+//   let z = rng.normal(mean: 0, standardDeviation: 1)
+//   let k = rng.poisson(mean: 3)
+//   [1, 2, 3].shuffled(using: &rng)
+
+/// PCG-XSH-RR 64/32 (pcg32): small state, excellent statistical quality.
+public struct PCG32: RandomNumberGenerator, Sendable {
+    @usableFromInline var _state: UInt64
+    public var state: UInt64 { _state }
+    public let increment: UInt64
+    var spareNormal: Double? = nil
+
+    public init(seed: UInt64, stream: UInt64 = 0xDA3E_39CB_94B9_5BDB) {
+        _state = 0
+        increment = (stream << 1) | 1
+        _ = next32()
+        _state &+= seed
+        _ = next32()
+    }
+
+    /// Seeded from the system's random source.
+    public init() {
+        var sys = SystemRandomNumberGenerator()
+        self.init(seed: sys.next(), stream: sys.next())
+    }
+
+    @inlinable
+    public mutating func next32() -> UInt32 {
+        let old = _state
+        _state = old &* 6_364_136_223_846_793_005 &+ increment
+        let xorshifted = UInt32(truncatingIfNeeded: ((old &>> 18) ^ old) &>> 27)
+        let rot = UInt32(truncatingIfNeeded: old &>> 59)
+        return (xorshifted &>> rot) | (xorshifted &<< ((~rot &+ 1) & 31))
+    }
+
+    @inlinable
+    public mutating func next() -> UInt64 { UInt64(next32()) << 32 | UInt64(next32()) }
+}
+
+/// xoshiro256** — very fast 64-bit generator.
+public struct Xoshiro256: RandomNumberGenerator, Sendable {
+    @usableFromInline var s: (UInt64, UInt64, UInt64, UInt64)
+    var spareNormal: Double? = nil
+
+    public init(seed: UInt64) {
+        var z = seed   // expand the seed with splitmix64
+        func splitmix() -> UInt64 {
+            z &+= 0x9E37_79B9_7F4A_7C15
+            var x = z
+            x = (x ^ (x &>> 30)) &* 0xBF58_476D_1CE4_E5B9
+            x = (x ^ (x &>> 27)) &* 0x94D0_49BB_1331_11EB
+            return x ^ (x &>> 31)
+        }
+        s = (splitmix(), splitmix(), splitmix(), splitmix())
+    }
+
+    @inlinable
+    public mutating func next() -> UInt64 {
+        let result = (s.1 &* 5).rotatedLeft(7) &* 9
+        let t = s.1 << 17
+        s.2 ^= s.0; s.3 ^= s.1; s.1 ^= s.2; s.0 ^= s.3
+        s.2 ^= t
+        s.3 = s.3.rotatedLeft(45)
+        return result
+    }
+}
+
+extension UInt64 {
+    @inlinable @inline(__always) public func rotatedLeft(_ k: UInt64) -> UInt64 { (self &<< k) | (self &>> (64 &- k)) }
+}
+
+// MARK: - Distributions
+
+extension RandomNumberGenerator {
+    /// Uniform in [0, 1) with 53 random bits.
+    @inlinable
+    public mutating func unit() -> Double { Double(next() >> 11) * 0x1.0p-53 }
+
+    /// Normal (Gaussian) via the Marsaglia polar method.
+    public mutating func normal(mean: Double = 0, standardDeviation: Double = 1) -> Double {
+        var u = 0.0, v = 0.0, s = 0.0
+        repeat {
+            u = unit() * 2 - 1
+            v = unit() * 2 - 1
+            s = u * u + v * v
+        } while s >= 1 || s == 0
+        return mean + standardDeviation * u * (-2 * _ln(s) / s).squareRoot()
+    }
+
+    /// Exponential with the given rate (mean 1/rate).
+    public mutating func exponential(rate: Double = 1) -> Double { -_ln(1 - unit()) / rate }
+
+    /// True with probability p.
+    public mutating func bernoulli(_ p: Double) -> Bool { unit() < p }
+
+    /// Poisson-distributed count (Knuth for small means, normal approximation above 60).
+    public mutating func poisson(mean: Double) -> Int {
+        if mean > 60 { return max(0, Int((normal(mean: mean, standardDeviation: mean.squareRoot())).rounded())) }
+        let l = _exp(-mean)
+        var k = 0
+        var p = 1.0
+        repeat { k += 1; p *= unit() } while p > l
+        return k - 1
+    }
+
+    /// Index chosen with probability proportional to `weights`.
+    public mutating func weightedIndex(_ weights: [Double]) -> Int {
+        let total = weights.reduce(0, +)
+        precondition(total > 0, "weightedIndex: weights must sum to a positive number")
+        var r = unit() * total
+        for (i, w) in weights.enumerated() {
+            r -= w
+            if r < 0 { return i }
+        }
+        return weights.count - 1
+    }
+}
+
+// Natural log and exp without libm (accurate to ~1e-15 on the ranges used).
+@usableFromInline
+func _ln(_ x: Double) -> Double {
+    precondition(x > 0, "ln of non-positive number")
+    var e = 0
+    var m = x
+    while m > 2 { m /= 2; e += 1 }
+    while m < 1 { m *= 2; e -= 1 }
+    // ln(m) for m in [1, 2) via atanh series: ln(m) = 2 atanh((m-1)/(m+1))
+    let t = (m - 1) / (m + 1), t2 = t * t
+    var term = t, sum = 0.0
+    var k = 1.0
+    while abs(term) > 1e-17 { sum += term / k; term *= t2; k += 2 }
+    return 2 * sum + Double(e) * 0.693_147_180_559_945_309_4
+}
+
+@usableFromInline
+func _exp(_ x: Double) -> Double {
+    // exp(x) = 2^k * exp(r), |r| <= ln2/2
+    let ln2 = 0.693_147_180_559_945_309_4
+    let k = (x / ln2).rounded()
+    let r = x - k * ln2
+    var term = 1.0, sum = 1.0
+    for n in 1 ... 25 { term *= r / Double(n); sum += term }
+    var result = sum
+    if k > 0 { for _ in 0 ..< Int(k) { result *= 2 } } else { for _ in 0 ..< Int(-k) { result /= 2 } }
+    return result
+}

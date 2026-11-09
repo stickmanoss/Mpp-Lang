@@ -1,0 +1,290 @@
+// Accelarate — fast math on whole arrays of Float.
+//
+//   import Accelarate
+//   let x = Tensor.random(count: 10_000_000, in: -1 ... 1)
+//   let y = relu(x * 2 + 1) - sqrt(abs(x))
+//   print(sum(y), mean(y * y))
+//
+// Two engines run the same code:
+//
+//   * eager (`mpp file.mpp`): every operation runs right away and writes a
+//     full-size result array, like NumPy.
+//   * the Accelarate VM (`mpp -vm file.mpp`): operations only record an
+//     expression. When a value is needed, the VM compiles the whole
+//     expression into one program of dense virtual instructions (multiply-adds
+//     and scaled operations fused into single instructions), then streams the
+//     arrays through it in cache-sized blocks on every core. Intermediate
+//     results never leave the L1 cache, and each input is read once.
+//     Compiled programs are cached, so a loop that evaluates the same shape of
+//     expression compiles it once.
+//
+// The VM can't make the CPU faster; it saves the memory traffic and the
+// passes that eager evaluation wastes. See `benchmarks/accelarate.mpp`.
+
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
+public enum Engine: Sendable { case eager, vm }
+
+public enum Accelarate {
+    /// The engine in use: `.vm` when the program runs with `mpp -vm`.
+    nonisolated(unsafe) public static var engine: Engine = {
+        if let v = getenv("MPP_VM"), String(cString: v) == "1" { return .vm }
+        return .eager
+    }()
+    /// Print every program the VM compiles (also: MPP_VM_TRACE=1).
+    nonisolated(unsafe) public static var trace: Bool = getenv("MPP_VM_TRACE") != nil
+    /// Runs `body` with a given engine (for comparisons and tests).
+    public static func with<T>(_ e: Engine, _ body: () throws -> T) rethrows -> T {
+        let saved = engine
+        engine = e
+        defer { engine = saved }
+        return try body()
+    }
+}
+
+// MARK: - Expression graph
+
+
+enum Op: UInt8 {
+    case leaf
+    case add, sub, mul, div, max, min                  // binary
+    case neg, sqrt, exp, log, sin, cos, tanh, abs, relu, sigmoid, square, recip, floor, ceil   // unary
+    case addS, mulS, subFromS, divS, divIntoS, maxS, minS, powS   // with an immediate scalar
+    case fma                                           // a * b + c (formed by the VM)
+    case affine                                        // a * s + t (formed by the VM)
+}
+
+/// A node of a lazy expression; becomes a leaf once evaluated.
+
+final class Node {
+var op: Op
+var inputs: [Node]
+var imm: Float
+var data: [Float]          // leaves only
+let count: Int
+let depth: Int
+
+    init(data: [Float]) {
+        op = .leaf; inputs = []; imm = 0; self.data = data; count = data.count; depth = 0
+    }
+    init(_ op: Op, _ inputs: [Node], imm: Float = 0, count: Int) {
+        self.op = op; self.inputs = inputs; self.imm = imm; data = []; self.count = count
+        depth = 1 + (inputs.map(\.depth).max() ?? 0)
+    }
+
+    /// Evaluates (once) and turns this node into a leaf.
+    func materialize() {
+        guard op != .leaf else { return }
+        data = Accelarate.engine == .vm ? VM.run(self) : Eager.run(self)
+        op = .leaf; inputs = []
+    }
+}
+
+// MARK: - Tensor
+
+/// An array of Float with a shape (up to any rank, row-major).
+public struct Tensor: CustomStringConvertible {
+let node: Node
+    public let shape: [Int]
+
+    init(node: Node, shape: [Int]) {
+        self.node = node
+        self.shape = shape
+        // Deep chains (e.g. `x = x + 1` in a loop) are cut so evaluation stays shallow.
+        if Accelarate.engine == .eager || node.depth > 48 { node.materialize() }
+    }
+
+    public init(_ values: [Float]) { self.init(node: Node(data: values), shape: [values.count]) }
+    public init(_ values: [Float], shape: [Int]) {
+        precondition(shape.reduce(1, *) == values.count, "Tensor: shape \(shape) doesn't match \(values.count) values")
+        self.init(node: Node(data: values), shape: shape)
+    }
+    public init(doubles values: [Double]) { self.init(values.map(Float.init)) }
+    public init(repeating v: Float, count: Int) { self.init([Float](repeating: v, count: count)) }
+    public init(repeating v: Float, shape: [Int]) { self.init([Float](repeating: v, count: shape.reduce(1, *)), shape: shape) }
+
+    public static func zeros(_ count: Int) -> Tensor { Tensor(repeating: 0, count: count) }
+    public static func ones(_ count: Int) -> Tensor { Tensor(repeating: 1, count: count) }
+    public static func arange(_ count: Int) -> Tensor { Tensor((0 ..< count).map(Float.init)) }
+    public static func linspace(_ a: Float, _ b: Float, count: Int) -> Tensor {
+        let step = count > 1 ? (b - a) / Float(count - 1) : 0
+        return Tensor((0 ..< count).map { a + Float($0) * step })
+    }
+    /// Uniform random values (xorshift; fast, not cryptographic).
+    public static func random(count: Int, in range: ClosedRange<Float> = 0 ... 1, seed: UInt64 = 0x9E37_79B9_7F4A_7C15) -> Tensor {
+        var s = seed | 1
+        let lo = range.lowerBound, span = range.upperBound - range.lowerBound
+        let v = [Float](unsafeUninitializedCapacity: count) { b, n in
+            for i in 0 ..< count {
+                s ^= s << 13; s ^= s >> 7; s ^= s << 17
+                b[i] = lo + span * Float(s >> 40) * (1.0 / 16_777_216.0)
+            }
+            n = count
+        }
+        return Tensor(v)
+    }
+
+    public var count: Int { node.count }
+    public var rank: Int { shape.count }
+
+    /// The values (evaluates the expression if needed).
+    public var array: [Float] { node.materialize(); return node.data }
+    public subscript(i: Int) -> Float { array[i] }
+    public subscript(row: Int, col: Int) -> Float {
+        precondition(rank == 2, "Tensor: two indices need a matrix")
+        return array[row * shape[1] + col]
+    }
+
+    public func reshaped(_ shape: [Int]) -> Tensor {
+        precondition(shape.reduce(1, *) == count, "Tensor: can't reshape \(self.shape) to \(shape)")
+        return Tensor(node: node, shape: shape)
+    }
+
+    /// Forces evaluation now (useful before timing, or to share a result).
+    @discardableResult public func evaluated() -> Tensor { node.materialize(); return self }
+
+    public var description: String {
+        let a = array
+        let shown = a.prefix(8).map { "\($0)" }.joined(separator: ", ")
+        return "Tensor\(shape)[\(shown)\(a.count > 8 ? ", …" : "")]"
+    }
+}
+
+// MARK: - Building expressions
+
+/// Result shape of a broadcasting operation: equal shapes, a scalar, or a
+/// smaller operand repeated along the leading dimensions (its shape must be
+/// a suffix of the other's, e.g. adding a row vector to every row).
+
+func broadcastShape(_ a: [Int], _ b: [Int]) -> [Int] {
+    if a == b { return a }
+    let ca = a.reduce(1, *), cb = b.reduce(1, *)
+    if cb == 1 { return a }
+    if ca == 1 { return b }
+    if a.count >= b.count && Array(a.suffix(b.count)) == b { return a }
+    if b.count > a.count && Array(b.suffix(a.count)) == a { return b }
+    preconditionFailure("Tensor: shapes \(a) and \(b) don't broadcast")
+}
+
+func binary(_ op: Op, _ a: Tensor, _ b: Tensor) -> Tensor {
+    let shape = broadcastShape(a.shape, b.shape)
+    return Tensor(node: Node(op, [a.node, b.node], count: shape.reduce(1, *)), shape: shape)
+}
+func unary(_ op: Op, _ a: Tensor) -> Tensor { Tensor(node: Node(op, [a.node], count: a.count), shape: a.shape) }
+func scalarOp(_ op: Op, _ a: Tensor, _ s: Float) -> Tensor {
+    Tensor(node: Node(op, [a.node], imm: s, count: a.count), shape: a.shape)
+}
+
+public func + (a: Tensor, b: Tensor) -> Tensor { binary(.add, a, b) }
+public func - (a: Tensor, b: Tensor) -> Tensor { binary(.sub, a, b) }
+public func * (a: Tensor, b: Tensor) -> Tensor { binary(.mul, a, b) }
+public func / (a: Tensor, b: Tensor) -> Tensor { binary(.div, a, b) }
+public func + (a: Tensor, s: Float) -> Tensor { scalarOp(.addS, a, s) }
+public func + (s: Float, a: Tensor) -> Tensor { scalarOp(.addS, a, s) }
+public func - (a: Tensor, s: Float) -> Tensor { scalarOp(.addS, a, -s) }
+public func - (s: Float, a: Tensor) -> Tensor { scalarOp(.subFromS, a, s) }
+public func * (a: Tensor, s: Float) -> Tensor { scalarOp(.mulS, a, s) }
+public func * (s: Float, a: Tensor) -> Tensor { scalarOp(.mulS, a, s) }
+public func / (a: Tensor, s: Float) -> Tensor { scalarOp(.mulS, a, 1 / s) }
+public func / (s: Float, a: Tensor) -> Tensor { scalarOp(.divIntoS, a, s) }
+public prefix func - (a: Tensor) -> Tensor { unary(.neg, a) }
+public func += (a: inout Tensor, b: Tensor) { a = a + b }
+public func -= (a: inout Tensor, b: Tensor) { a = a - b }
+public func *= (a: inout Tensor, b: Tensor) { a = a * b }
+public func += (a: inout Tensor, s: Float) { a = a + s }
+public func *= (a: inout Tensor, s: Float) { a = a * s }
+
+public func sqrt(_ a: Tensor) -> Tensor { unary(.sqrt, a) }
+public func exp(_ a: Tensor) -> Tensor { unary(.exp, a) }
+public func log(_ a: Tensor) -> Tensor { unary(.log, a) }
+public func sin(_ a: Tensor) -> Tensor { unary(.sin, a) }
+public func cos(_ a: Tensor) -> Tensor { unary(.cos, a) }
+public func tanh(_ a: Tensor) -> Tensor { unary(.tanh, a) }
+public func abs(_ a: Tensor) -> Tensor { unary(.abs, a) }
+public func floor(_ a: Tensor) -> Tensor { unary(.floor, a) }
+public func ceil(_ a: Tensor) -> Tensor { unary(.ceil, a) }
+public func relu(_ a: Tensor) -> Tensor { unary(.relu, a) }
+public func sigmoid(_ a: Tensor) -> Tensor { unary(.sigmoid, a) }
+public func square(_ a: Tensor) -> Tensor { unary(.square, a) }
+public func reciprocal(_ a: Tensor) -> Tensor { unary(.recip, a) }
+public func pow(_ a: Tensor, _ p: Float) -> Tensor {
+    p == 2 ? unary(.square, a) : p == 1 ? a : p == 0.5 ? unary(.sqrt, a) : scalarOp(.powS, a, p)
+}
+public func max(_ a: Tensor, _ b: Tensor) -> Tensor { binary(.max, a, b) }
+public func min(_ a: Tensor, _ b: Tensor) -> Tensor { binary(.min, a, b) }
+public func max(_ a: Tensor, _ s: Float) -> Tensor { scalarOp(.maxS, a, s) }
+public func min(_ a: Tensor, _ s: Float) -> Tensor { scalarOp(.minS, a, s) }
+public func clamp(_ a: Tensor, _ lo: Float, _ hi: Float) -> Tensor { min(max(a, lo), hi) }
+
+// MARK: - Reductions (fused with the expression in the VM)
+
+public enum Reduction: Sendable { case sum, max, min }
+
+public func sum(_ a: Tensor) -> Float { reduce(a, .sum) }
+public func mean(_ a: Tensor) -> Float { a.count == 0 ? .nan : reduce(a, .sum) / Float(a.count) }
+public func maxElement(_ a: Tensor) -> Float { reduce(a, .max) }
+public func minElement(_ a: Tensor) -> Float { reduce(a, .min) }
+public func dot(_ a: Tensor, _ b: Tensor) -> Float {
+    precondition(a.count == b.count, "dot: counts differ")
+    return reduce(a * b, .sum)
+}
+public func norm(_ a: Tensor) -> Float { reduce(square(a), .sum).squareRoot() }
+public func variance(_ a: Tensor) -> Float {
+    let m = mean(a)
+    return reduce(square(a - m), .sum) / Float(a.count)
+}
+
+func reduce(_ a: Tensor, _ r: Reduction) -> Float {
+    if Accelarate.engine == .vm && a.node.op != .leaf { return VM.reduce(a.node, r) }
+    return Eager.reduce(a.array, r)
+}
+
+// MARK: - Matrix product
+
+/// [m, k] × [k, n] → [m, n]. Rows are split across cores; the inner loop
+/// streams a row of `b`, so it vectorizes.
+public func matmul(_ a: Tensor, _ b: Tensor) -> Tensor {
+    precondition(a.rank == 2 && b.rank == 2 && a.shape[1] == b.shape[0], "matmul: shapes \(a.shape) and \(b.shape) don't match")
+    let m = a.shape[0], k = a.shape[1], n = b.shape[1]
+    let av = a.array, bv = b.array
+    var out = [Float](repeating: 0, count: m * n)
+    av.withUnsafeBufferPointer { ap in
+        bv.withUnsafeBufferPointer { bp in
+            out.withUnsafeMutableBufferPointer { op in
+                let A = _AccelPtr(UnsafeMutablePointer(mutating: ap.baseAddress!)), B = _AccelPtr(UnsafeMutablePointer(mutating: bp.baseAddress!))
+                let O = _AccelPtr(op.baseAddress!)
+                _accelParallel(m, minimumPerThread: Swift.max(1, 32_768 / Swift.max(1, k * n))) { rows in
+                    for i in rows {
+                        let orow = O.p + i * n
+                        for kk in 0 ..< k {
+                            let s = A.p[i * k + kk]
+                            if s == 0 { continue }
+                            let brow = B.p + kk * n
+                            for j in 0 ..< n { orow[j] += s * brow[j] }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return Tensor(out, shape: [m, n])
+}
+
+infix operator •: MultiplicationPrecedence
+public func • (a: Tensor, b: Tensor) -> Tensor { matmul(a, b) }
+
+extension Tensor {
+    public var transposed: Tensor {
+        precondition(rank == 2, "transposed: needs a matrix")
+        let r = shape[0], c = shape[1], v = array
+        var out = [Float](repeating: 0, count: count)
+        for i in 0 ..< r { for j in 0 ..< c { out[j * r + i] = v[i * c + j] } }
+        return Tensor(out, shape: [c, r])
+    }
+}

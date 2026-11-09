@@ -1,0 +1,163 @@
+// mpp driver — the front end's own tests (`mpp --self-test`).
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+func exitProcess(_ code: Int32) -> Never { exit(code) }
+
+enum SelfTest {
+    static func run() -> Int32 {
+        var failures = 0
+        func check(_ src: String, _ want: String, auto: Bool = false, fast: Bool = false, line: Int = #line) {
+            var o = LoweringOptions(autoParallel: auto)
+            o.fastLoops = fast
+            let got = Frontend.lower(src, o).text
+            if got != want {
+                failures += 1
+                writeStdout("FAIL (line \(line))\n  input: \(src)\n  want:  \(want)\n  got:   \(got)\n")
+            }
+        }
+        func unchanged(_ src: String, auto: Bool = false, line: Int = #line) { check(src, src, auto: auto, line: line) }
+
+        // place / unplace
+        check("let p = place buf Point(x: 1, y: 2)", "let p = _mppPlace(into: buf, Point(x: 1, y: 2))")
+        check("place arena Node()", "_mppPlace(into: arena, Node())")
+        check("place slots[3] Node()", "_mppPlace(into: slots[3], Node())")
+        check("place self.storage! Node()", "_mppPlace(into: self.storage!, Node())")
+        check("place (base + 64) Node()", "_mppPlace(into: (base + 64), Node())")
+        check("place b Pair<Int, [String]>(a: f(1, g(2)), b: [\")\"])", "_mppPlace(into: b, Pair<Int, [String]>(a: f(1, g(2)), b: [\")\"]))")
+        check("let p = place buf Point(\n  x: 1\n)\nprint(p)", "let p = _mppPlace(into: buf, Point(\n  x: 1\n))\nprint(p)")
+        check("\"\\(place a Int(5))\"", "\"\\(_mppPlace(into: a, Int(5)))\"")
+        for s in ["let place = 1", "print(place)", "place = 3", "if place is String {}", "var place: Int",
+                  "func place(_ x: Int) {}", "place(x)", "x.place y()", "return place", "place == other"] { unchanged(s) }
+        for s in ["\"place buf T()\"", "// place buf T()", "/* place buf T() /* nested */ */", "#\"place buf T()\"#",
+                  "\"\"\"\nplace buf T()\n\"\"\""] { unchanged(s) }
+        check("unplace p", "_mppUnplace(p)")
+        check("let raw = unplace nodes[i]", "let raw = _mppUnplace(nodes[i])")
+
+        // imports
+        check("import liquidglass.mpp\nlet x = 1", "import liquidglass\nlet x = 1")
+        check("import MppUI\nimport liquidglass\n", "/* MppUI via liquidglass */\nimport liquidglass\n")
+        unchanged("// import liquidglass.mpp")
+        if Frontend.importedModules("import neural\n@testable import Geo\n// import Nope\nimport struct Foo.Bar\nimport liquidglass.mpp\n")
+            != ["neural", "Geo", "Foo", "liquidglass"] { failures += 1; writeStdout("FAIL importedModules\n") }
+
+        // automatic parallel loops
+        check("func f(_ i: Int) -> Int { i }\nfor i in 0..<n {\n    out[i] = f(i) * 2\n}",
+              "func f(_ i: Int) -> Int { i }\nout.withUnsafeMutableBufferPointer { __mppBuf_out in let __mppOut_out = _MppSendable(__mppBuf_out); _mppAutoFor(0..<n, bounds: [__mppBuf_out.count]) { [__mppOut_out] i in\n    __mppOut_out.value[i] = f(i) * 2\n} }",
+              auto: true)
+        check("func work(_ y: Int) {}\nfor i in 0..<n { let y = i * i; work(y) }", "func work(_ y: Int) {}\n_mppAutoFor(0..<n) { i in let y = i * i; work(y) }", auto: true)
+        // ...but not functions from elsewhere: they may change state the compiler can't see.
+        unchanged("for i in 0..<n { let y = i * i; work(y) }", auto: true)
+        check("var scale = 2\nfor i in 1...10 { out[i] = i * scale }",
+              "var scale = 2\nout.withUnsafeMutableBufferPointer { __mppBuf_out in let __mppOut_out = _MppSendable(__mppBuf_out); _mppAutoFor(1...10, bounds: [__mppBuf_out.count]) { [__mppOut_out, scale] i in __mppOut_out.value[i] = i * scale } }",
+              auto: true)
+        // Not parallel: accumulators, I/O, early exit, other indices, non-range sequences, serial keyword.
+        unchanged("for i in 0..<n { total += i }", auto: true)
+        unchanged("for i in 0..<n { print(i) }", auto: true)
+        unchanged("for i in 0..<n { if i > 3 { break } }", auto: true)
+        unchanged("for i in 0..<n { out[i + 1] = i }", auto: true)
+        unchanged("for i in 0..<n { out[i] = out[i - 1] }", auto: true)
+        unchanged("for x in items { out[x] = 1 }", auto: true)
+        unchanged("for i in 0..<n { list.append(i) }", auto: true)
+        unchanged("for i in 0..<n { try f(i) }", auto: true)
+        check("serial for i in 0..<n { out[i] = i }", "       for i in 0..<n { out[i] = i }", auto: true)
+
+        // proven-safe sequential loops
+        func fast(_ src: String, has: [String] = [], lacks: [String] = [], line: Int = #line) {
+            let got = Frontend.lower(src, LoweringOptions(autoParallel: false)).text
+            let newlines = { (t: String) in t.utf8.filter { $0 == 10 }.count }
+            for h in has where !got.contains(h) { failures += 1; writeStdout("FAIL (line \(line)) missing \(h)\n  got: \(got)\n") }
+            for h in lacks where got.contains(h) { failures += 1; writeStdout("FAIL (line \(line)) unexpected \(h)\n  got: \(got)\n") }
+            if newlines(got) != newlines(src) { failures += 1; writeStdout("FAIL (line \(line)) line count changed\n") }
+        }
+        let hoisted = "__mppRun(_MppUnchecked.self)"
+        fast("for i in 1..<n {\n  a[i] = a[i] &+ a[i - 1]\n}", has: [hoisted, "a.withUnsafeMutableBufferPointer", ">= 1", "a.count - (0)", "\n__mppI &+= 1 }"])
+        fast("for i in 0...n { s += a[i + 2] }", has: [hoisted, "withUnsafeBufferPointer", "a.count - (2)", "while true", "; if __mppI == __mppR.upperBound { break }; __mppI &+= 1 }"])
+        fast("for i in 0...n { if i == 2 { continue }; s += i }", has: ["__mppMore", "let __mppI = __mppN"], lacks: ["defer"])
+        fast("for i in 0..<n where i % 2 == 0 { s += a[i] }", has: [hoisted, "guard i % 2 == 0 else { __mppI &+= 1; continue }"])
+        fast("for i in 0..<n where a[i] > 0 { s += a[i] }", has: ["__mppI &+= 1"], lacks: [hoisted])
+        fast("for i in 0..<n { s += a[i]; f(a) }", has: ["__mppI &+= 1"], lacks: [hoisted])          // other use / call
+        fast("for i in 0..<n { s += a[j] }", has: ["__mppI &+= 1"], lacks: [hoisted])                // not the loop index
+        fast("for i in 0..<n { s += a[i]; g.x = 1 }", lacks: [hoisted])                              // dotted write
+        fast("for i in 0..<n { let k = { a[i] }; s += k() }", lacks: [hoisted])                    // closure
+        fast("for i in 0..<n { if a[i] > 3 { return } }", has: ["__mppN &+= 1"], lacks: [hoisted, "defer"])  // return
+        fast("for i in 0..<n { let i = 3; s += a[i] }", lacks: [hoisted])                            // shadowed index
+        fast("for i in 0..<n { for i in 0..<m { s += a[i] } }", has: ["(0..<m); let __mppFast"])     // inner `i` shadows: only the inner loop hoists
+        fast("for i in 0..<n { s += a[i] * sqrt(b[i]) + Double(c[i]) }", has: [hoisted, "let a = _MppReadSpan", "let b = _MppReadSpan"])
+        fast("for i in 0..<n {\n  for j in 0..<m {\n    s += row[j]\n  }\n}", has: ["row.withUnsafeBufferPointer"])
+        fast("for i in 0..<n { s += a[i] & 0xFF }", has: [hoisted])
+        fast("for i in 0..<n { swap(&a[i], &b[i]) }", lacks: [hoisted])
+        fast("for x in items { s += x }", lacks: ["__mppI"])
+        fast("for i in (0..<n).reversed() { s += i }", lacks: ["__mppR"])       // not a plain range
+        // .mppgnore globbing
+        func g(_ p: String, _ t: String) -> Bool { MppIgnore.glob(Array(p.utf8)[...], Array(t.utf8)[...]) }
+        let globs: [(String, String, Bool)] = [
+            ("*.draft.mpp", "a.draft.mpp", true), ("*.mpp", "dir/a.mpp", false), ("**/a.mpp", "x/y/a.mpp", true),
+            ("**/a.mpp", "a.mpp", true), ("Gen/**", "Gen/x/y.mpp", true), ("a?c", "abc", true), ("a?c", "a/c", false),
+            ("[ab]x", "bx", true), ("[!ab]x", "bx", false), ("[a-c]1", "c1", true), ("x", "xy", false),
+        ]
+        for (p, t, want) in globs where g(p, t) != want { failures += 1; writeStdout("FAIL glob \(p) ~ \(t) should be \(want)\n") }
+        // Parallel loops may only call this file's functions, pure math and initializers.
+        func isParallel(_ src: String) -> Bool { !Frontend.lower(src, LoweringOptions(autoParallel: true)).parallelLoops.filter(\.parallel).isEmpty }
+        if isParallel("var out = [Double](repeating: 0, count: 9)\nfor i in 0 ..< 9 { draw(i) }") { failures += 1; writeStdout("FAIL: loop calling an imported function was parallelized\n") }
+        if !isParallel("var out = [Double](repeating: 0, count: 9)\nfor i in 0 ..< 9 { out[i] = sqrt(Double(i)) }") { failures += 1; writeStdout("FAIL: pure loop not parallelized\n") }
+        if !isParallel("func f(_ x: Int) -> Double { 1 }\nvar out = [Double](repeating: 0, count: 9)\nfor i in 0 ..< 9 { out[i] = f(i) }") { failures += 1; writeStdout("FAIL: loop calling a local function not parallelized\n") }
+
+        // Metallic shader syntax; ordinary `[[T]]` types are left alone.
+        let varyings = Frontend.lower("struct V {\n    var position: float4 [[position]]\n    var uv: float2   // a comment\n}").text
+        if !varyings.contains("r.uv = a.uv * w.x") { failures += 1; writeStdout("FAIL Metallic varyings with comments:\n\(varyings)\n") }
+        unchanged("struct P { var contours: [[Int]] = [] }")
+        let shader = Frontend.lower("@kernel func k(_ t: texture2d<float> [[texture(0)]], _ g: uint2 [[thread_position_in_grid]]) {\n}").text
+        if !shader.contains("let kFunction = MetallicFunction(kernel: \"k\") { __a in let __b0: texture2d<float> = __a.texture(0); return { __r in")
+            || !shader.contains("k(__b0, __t.threadPosition)") || shader.contains("[[") || shader.contains("@kernel") || shader.split(separator: "\n").count != 2 {
+            failures += 1; writeStdout("FAIL Metallic kernel lowering:\n\(shader)\n")
+        }
+
+        // Metallic shaders compiled to C++: the subset translates; the rest stays in M++.
+        let k2 = "struct U { var gain: Float }\nfunc half(_ x: Float) -> Float { x * 0.5 }\n"
+            + "@kernel func k2(_ u: U [[buffer(0)]], _ t: texture2d<float> [[texture(0)]], _ g: uint2 [[thread_position_in_grid]]) {\n"
+            + "    let c = t.read(g)\n    var s: Float = 0\n    for i in 0 ..< 3 { s += c[i] }\n    if s > 1, u.gain > 0 { t.write(float4(c.rgb * half(u.gain), 1), g) }\n}\n"
+        if let native = Lowerer(Array(k2.utf8)).translateShadersToCpp(prefix: "t") {
+            for want in ["struct U {", "MTL_INLINE float half_(float x) {\n    return x * 0.5f;", "for(long i = (0); i < (3); ++i)",
+                         "if(s > 1 && u.gain > 0)", "vec4(c.rgb * half_(u.gain), 1)", "extern \"C\" void mppmtl_t_k2("] where !native.cpp.contains(want) {
+                failures += 1; writeStdout("FAIL Metallic C++ translation: missing \(want)\n\(native.cpp)\n")
+            }
+        } else { failures += 1; writeStdout("FAIL Metallic C++ translation: not translated\n") }
+        for code in ["let f = { (x: Float) in x }", "let n: Float? = nil", "let b = Int(g.x) & 1", "let q = 1 / 2"] {
+            let src = "@kernel func k3(_ t: texture2d<float> [[texture(0)]], _ g: uint2 [[thread_position_in_grid]]) {\n    \(code)\n}\n"
+            if Lowerer(Array(src.utf8)).translateShadersToCpp(prefix: "t") != nil { failures += 1; writeStdout("FAIL Metallic C++ translation accepted: \(code)\n") }
+        }
+
+        // MppxxCpp: `import cpp` and `#cpp { }` extraction (lines must stay where they were)
+        func cpp(_ src: String, _ wantText: String, _ wantInline: String, line: Int = #line) {
+            let ex = CppInterop.extract(src, file: "/t/m.mpp")
+            let body = ex.inline.split(separator: "\n", maxSplits: 1).dropFirst().first.map(String.init) ?? ""
+            if ex.text != wantText || body.trimmingNewlines != wantInline {
+                failures += 1
+                writeStdout("FAIL cpp (line \(line))\n  text: \(ex.text)\n  inline: \(body)\n")
+            }
+        }
+        cpp("import cpp \"a/fast.hpp\"\nprint(1)", "import fast\nprint(1)", "")
+        cpp("#cpp {\n int f() { return 1; }\n}\nprint(f())", "import m_cpp\n\n\nprint(f())", "int f() { return 1; }")
+        cpp("#cpp { int x = 1'000'000; const char* s = \"}\"; char c = '}'; /* } */ // }\n}\nlet y = 2",
+            "import m_cpp\n\nlet y = 2", "int x = 1'000'000; const char* s = \"}\"; char c = '}'; /* } */ // }")
+        cpp("#cpp { auto r = R\"x(})x\"; }\nlet z = 3", "import m_cpp\nlet z = 3", "auto r = R\"x(})x\";")
+        cpp("let s = \"#cpp { }\" // import cpp \"x.hpp\"", "let s = \"#cpp { }\" // import cpp \"x.hpp\"", "")
+        let two = CppInterop.extract("#cpp { int a; }\n#cpp { int b; }", file: "/t/m.mpp")
+        if two.text != "import m_cpp\n" || !two.inline.contains("#line 2 \"/t/m.mpp\"\n int b;") {
+            failures += 1; writeStdout("FAIL cpp: two blocks\n")
+        }
+        if Cpp.parseDepFile("o.o: a.cpp /x/b\\ c.hpp \\\n  d.h\n") != ["a.cpp", "/x/b c.hpp", "d.h"] {
+            failures += 1; writeStdout("FAIL depfile parsing\n")
+        }
+        if failures > 0 { writeStdout("front end: \(failures) failure(s)\n"); return 1 }
+        writeStdout("front end: all tests passed\n")
+        return 0
+    }
+}

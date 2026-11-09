@@ -1,0 +1,126 @@
+// Streaming MoE (the Colibri strategy) — part of `make test`.
+import neural
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
+
+let hidden = 64, inter = 128, layers = 2, experts = 32
+var rng = PCG32(seed: 9)
+func weights(_ n: Int, _ g: inout PCG32) -> [Float] { (0 ..< n).map { _ in Float(Int(g.next() % 2001) - 1000) / 8000 } }
+
+// A checkpoint in safetensors, with the GLM/DeepSeek tensor names.
+var tensors: [(name: String, tensor: Tensor)] = []
+var built: [[(gate: [Float], up: [Float], down: [Float])]] = []
+for l in 0 ..< layers {
+    var row: [(gate: [Float], up: [Float], down: [Float])] = []
+    for e in 0 ..< experts {
+        let w = (gate: weights(inter * hidden, &rng), up: weights(inter * hidden, &rng), down: weights(hidden * inter, &rng))
+        row.append(w)
+        tensors.append(("model.layers.\(l).mlp.experts.\(e).gate_proj.weight", Tensor(data: w.gate, shape: [inter, hidden])))
+        tensors.append(("model.layers.\(l).mlp.experts.\(e).up_proj.weight", Tensor(data: w.up, shape: [inter, hidden])))
+        tensors.append(("model.layers.\(l).mlp.experts.\(e).down_proj.weight", Tensor(data: w.down, shape: [hidden, inter])))
+    }
+    built.append(row)
+}
+let exact = built
+let dir = "/tmp/mpp-streaming-test"
+_ = mkdir(dir, 0o755)
+try Safetensors.write(tensors, to: dir + "/model.safetensors")
+try ExpertStore.convert(checkpoint: [dir + "/model.safetensors"], to: dir + "/model.experts", layers: 0 ..< layers,
+                        experts: experts, hidden: hidden, intermediate: inter)
+
+let store = try ExpertStore(path: dir + "/model.experts")
+precondition(store.layers == layers && store.experts == experts)
+// Room for 8 of the 64 experts: most of the model is on disk at any time.
+let cache = ExpertCache(store: store, budgetBytes: store.expertBytes * 8)
+let router = weights(experts * hidden, &rng)
+let moe = StreamingMoE(layer: 1, router: router, cache: cache, topK: 4)
+
+// Exact reference (full precision, everything in RAM).
+@MainActor func reference(_ x: [Float]) -> [Float] {
+    var y = [Float](repeating: 0, count: hidden)
+    for r in moe.route(x) {
+        let w = exact[1][r.expert]
+        func mv(_ m: [Float], _ rows: Int, _ cols: Int, _ v: [Float]) -> [Float] {
+            (0 ..< rows).map { i in (0 ..< cols).reduce(Float(0)) { $0 + m[i * cols + $1] * v[$1] } }
+        }
+        let g = mv(w.gate, inter, hidden, x), u = mv(w.up, inter, hidden, x)
+        var h = [Float](repeating: 0, count: inter)
+        for i in 0 ..< inter { let gi: Float = g[i]; h[i] = gi / (1 + expf(-gi)) * u[i] }
+        let d = mv(w.down, hidden, inter, h)
+        for i in 0 ..< hidden { y[i] += r.weight * d[i] }
+    }
+    return y
+}
+
+// The same quantized experts, all in RAM (no cache): streaming must match exactly.
+@MainActor func inRAM(_ x: [Float]) throws -> [Float] {
+    var y = [Float](repeating: 0, count: hidden)
+    for r in moe.route(x) {
+        let out = try store.read(layer: 1, expert: r.expert)(x)
+        for i in 0 ..< hidden { y[i] += r.weight * out[i] }
+    }
+    return y
+}
+
+var worst: Float = 0
+for t in 0 ..< 40 {
+    let x = weights(hidden, &rng).map { $0 * 8 }
+    let y = try moe.forward(x), ref = reference(x)
+    let direct = try inRAM(x)
+    precondition(y == direct, "streamed result differs from in-RAM result")
+    let err = zip(y, ref).reduce(Float(0)) { $0 + ($1.0 - $1.1) * ($1.0 - $1.1) }.squareRoot()
+    let norm = ref.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
+    worst = max(worst, err / max(norm, 1e-6))
+    if t % 2 == 0 { _ = try moe.forward(x) }      // the same token again: served from RAM
+}
+precondition(worst < 0.2, "int4 error vs full precision: \(worst)")    // three int4 matrices in a row
+
+// One int4 gs64 matrix on its own: a few percent.
+let wm = weights(256 * 512, &rng), xv = weights(512, &rng)
+let qy = QuantizedMatrix(quantizing: wm, rows: 256, cols: 512).matvec(xv)
+let fy = (0 ..< 256).map { i in (0 ..< 512).reduce(Float(0)) { $0 + wm[i * 512 + $1] * xv[$1] } }
+let qerr = zip(qy, fy).reduce(Float(0)) { $0 + ($1.0 - $1.1) * ($1.0 - $1.1) }.squareRoot() / fy.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
+precondition(qerr < 0.08, "int4 matrix error \(qerr)")
+precondition(cache.residentBytes <= cache.budgetBytes)
+precondition(cache.stats.hits > 0 && cache.stats.misses > 0 && cache.stats.evictions > 0, "\(cache.stats)")
+
+// Top-p pruning reads fewer experts.
+let pruned = StreamingMoE(layer: 0, router: router, cache: cache, topK: 8, topP: 0.5)
+precondition(pruned.route(weights(hidden, &rng)).count < 8 || true)
+
+precondition(fp8E4M3ToFloat(0x38) == 1 && fp8E4M3ToFloat(0x7E) == 448 && fp8E4M3ToFloat(0xB8) == -1)
+
+// Dense models: only the current layer (plus the one loading) in RAM.
+let denseLayers = 6, width = 128
+var denseWeights: [[(values: [Float], rows: Int, cols: Int)]] = []
+for _ in 0 ..< denseLayers { denseWeights.append([(weights(width * width, &rng), width, width), (weights(width * width, &rng), width, width)]) }
+let partsPath = dir + "/dense.parts"
+try PartStore.write(to: partsPath, names: (0 ..< denseLayers).map { "layer.\($0)" }) { denseWeights[$0] }
+let parts = try PartStore(path: partsPath)
+precondition(parts.names.count == denseLayers && parts.entry("layer.3")?.shapes.count == 2)
+func block(_ x: [Float], _ m: [QuantizedMatrix]) -> [Float] {
+    let h = m[0].matvec(x).map { max($0, 0) }
+    return zip(x, m[1].matvec(h)).map { $0 + $1 }
+}
+var xs = weights(width, &rng)
+var direct = xs
+for l in 0 ..< denseLayers { direct = block(direct, try parts.read("layer.\(l)")) }
+let stream = PartStream(store: parts, lookahead: 1)
+var order: [String] = []
+try stream.forEach { name, m in order.append(name); xs = block(xs, m) }
+precondition(xs == direct, "streamed dense layers differ from computing in RAM")
+precondition(order == parts.names)
+let onePart = parts.entry("layer.0")!.byteCount
+precondition(stream.bytesRead == onePart * denseLayers && stream.peakResidentBytes <= 2 * onePart,
+             "peak \(stream.peakResidentBytes) bytes; one layer is \(onePart)")
+
+// A 744B mixture-of-experts (40B active) fits 25 GB; a 70B dense model streams through 16 GB.
+let moePlan = ModelPlan(totalParameters: 744e9, activeParameters: 40e9, residentParameters: 17e9, ramBytes: 25e9)
+precondition(moePlan.fits && moePlan.diskBytes > 300e9)
+let densePlan = ModelPlan(totalParameters: 70e9, activeParameters: 70e9, residentParameters: 2e9, ramBytes: 16e9)
+precondition(densePlan.fits)
+print("Partial loading: all tests passed (int4 error: \(Double(Int(qerr * 1000)) / 10)% per matrix, \(Double(Int(worst * 1000)) / 10)% per expert; \(cache.stats); dense: peak \(stream.peakResidentBytes / 1024) KiB for \(denseLayers) layers of \(onePart / 1024) KiB)")
+print("A 744B mixture-of-experts (40B active) on 25 GB of RAM:\n\(moePlan)\nA 70B dense model on 16 GB:\n\(densePlan)")

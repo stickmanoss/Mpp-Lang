@@ -1,0 +1,182 @@
+// MppKit — CLI: CLI11-style command-line parsing.
+//
+//   let cli = CommandLineParser("resize", about: "Resize images")
+//   let width = cli.option("-w", "--width", default: 800, help: "Target width")
+//   let verbose = cli.flag("-v", "--verbose", help: "Print progress")
+//   let input = cli.positional("input", help: "Image to resize")
+//   cli.parse()                       // handles --help and errors
+//   print(width.value, verbose.value, input.value)
+//
+// Accepts "--width 640", "--width=640", "-w 640", grouped short flags
+// ("-vq") and "--" to end options. Bad values name the option and stop
+// with exit code 2.
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+public final class Option<T: LosslessStringConvertible> {
+    public internal(set) var value: T
+    public internal(set) var wasSet = false
+    init(_ v: T) { value = v }
+}
+
+public final class Flag {
+    public internal(set) var value = false
+    public internal(set) var count = 0       // how many times given (-vvv)
+}
+
+public final class Positional<T: LosslessStringConvertible> {
+    var stored: T?
+    public var value: T { stored! }
+    public var wasSet: Bool { stored != nil }
+    init(_ v: T?) { stored = v }
+}
+
+public struct CommandLineError: Error, CustomStringConvertible {
+    public let description: String
+}
+
+public final class CommandLineParser {
+    public let name: String
+    public let about: String
+
+    struct Spec {
+        let names: [String]
+        let help: String
+        let takesValue: Bool
+        let defaultText: String
+        let set: (String?) throws -> Void
+    }
+    struct PositionalSpec {
+        let name: String
+        let help: String
+        let required: Bool
+        let set: (String) throws -> Void
+    }
+    var specs: [Spec] = []
+    var positionals: [PositionalSpec] = []
+    public private(set) var remaining: [String] = []
+
+    public init(_ name: String, about: String = "") {
+        self.name = name
+        self.about = about
+    }
+
+    public func option<T: LosslessStringConvertible>(_ names: String..., default value: T, help: String = "") -> Option<T> {
+        let box = Option(value)
+        specs.append(Spec(names: names, help: help, takesValue: true, defaultText: "\(value)") { raw in
+            guard let raw, let v = T(raw) else {
+                throw CommandLineError(description: "\(names.last!): '\(raw ?? "")' is not a valid \(T.self)")
+            }
+            box.value = v
+            box.wasSet = true
+        })
+        return box
+    }
+
+    public func flag(_ names: String..., help: String = "") -> Flag {
+        let box = Flag()
+        specs.append(Spec(names: names, help: help, takesValue: false, defaultText: "") { _ in
+            box.value = true
+            box.count += 1
+        })
+        return box
+    }
+
+    public func positional(_ name: String, default value: String? = nil, help: String = "") -> Positional<String> {
+        positional(name, as: String.self, default: value, help: help)
+    }
+
+    public func positional<T: LosslessStringConvertible>(_ name: String, as type: T.Type,
+                                                         default value: T? = nil, help: String = "") -> Positional<T> {
+        let box = Positional<T>(value)
+        positionals.append(PositionalSpec(name: name, help: help, required: value == nil) { raw in
+            guard let v = T(raw) else { throw CommandLineError(description: "\(name): '\(raw)' is not a valid \(T.self)") }
+            box.stored = v
+        })
+        return box
+    }
+
+    public var helpText: String {
+        var out = "usage: \(name)"
+        if !specs.isEmpty { out += " [options]" }
+        for p in positionals { out += p.required ? " <\(p.name)>" : " [\(p.name)]" }
+        out += "\n"
+        if !about.isEmpty { out += "\n\(about)\n" }
+        let rows: [(String, String)] = positionals.map { ("<\($0.name)>", $0.help) } +
+            [("-h, --help", "Show this help")] +
+            specs.map { s in
+                (s.names.joined(separator: ", ") + (s.takesValue ? " <value>" : ""),
+                 s.help + (s.takesValue ? " (default: \(s.defaultText))" : ""))
+            }
+        let w = rows.map(\.0.count).max() ?? 0
+        out += "\noptions:\n"
+        for (l, r) in rows { out += "  " + l + String(repeating: " ", count: w - l.count + 2) + r + "\n" }
+        return out
+    }
+
+    /// Parses without exiting; throws CommandLineError.
+    public func parseOrThrow(_ args: [String]) throws {
+        var queue = args[...]
+        var positionalValues: [String] = []
+        func spec(_ n: String) throws -> Spec {
+            guard let s = specs.first(where: { $0.names.contains(n) }) else {
+                throw CommandLineError(description: "unknown option '\(n)' (see --help)")
+            }
+            return s
+        }
+        while let arg = queue.popFirst() {
+            if arg == "--" { positionalValues += queue; break }
+            if arg.hasPrefix("--") {
+                let parts = arg.split(separator: "=", maxSplits: 1).map(String.init)
+                let s = try spec(parts[0])
+                if s.takesValue {
+                    let v = parts.count == 2 ? parts[1] : queue.popFirst()
+                    guard let v else { throw CommandLineError(description: "\(parts[0]) needs a value") }
+                    try s.set(v)
+                } else {
+                    try s.set(nil)
+                }
+            } else if arg.hasPrefix("-") && arg.count > 1 && Double(arg) == nil {
+                let letters = Array(arg.dropFirst())
+                for (k, ch) in letters.enumerated() {
+                    let s = try spec("-\(ch)")
+                    if s.takesValue {
+                        let rest = String(letters[(k + 1)...])
+                        let v = rest.isEmpty ? queue.popFirst() : rest
+                        guard let v else { throw CommandLineError(description: "-\(ch) needs a value") }
+                        try s.set(v)
+                        break
+                    }
+                    try s.set(nil)
+                }
+            } else {
+                positionalValues.append(arg)
+            }
+        }
+        for (k, p) in positionals.enumerated() {
+            if k < positionalValues.count { try p.set(positionalValues[k]) }
+            else if p.required { throw CommandLineError(description: "missing <\(p.name)> (see --help)") }
+        }
+        remaining = Array(positionalValues.dropFirst(positionals.count))
+    }
+
+    /// Parses `CommandLine.arguments`; prints help (exit 0) or an error (exit 2).
+    public func parse(_ args: [String] = Array(CommandLine.arguments.dropFirst())) {
+        if args.contains("-h") || args.contains("--help") {
+            print(helpText, terminator: "")
+            exit(0)
+        }
+        do { try parseOrThrow(args) } catch {
+            fputs("\(name): \(error)\n", stderr_handle())
+            exit(2)
+        }
+    }
+}
+
+func stderr_handle() -> UnsafeMutablePointer<FILE> { fdopen(2, "w") }

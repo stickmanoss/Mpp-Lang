@@ -1,0 +1,129 @@
+// neural — Serialization: Core ML / MLX-style model files (safetensors).
+//
+//   try model.save("model.safetensors", metadata: ["task": "xor"])
+//   let restored = MyModel()
+//   try restored.load("model.safetensors")
+//
+// The format is Hugging Face's safetensors (8-byte little-endian header
+// length, a JSON header, then raw little-endian float32 data), so files
+// load in Python (safetensors / MLX / PyTorch) and vice versa.
+
+public struct SafetensorsError: Error, CustomStringConvertible, Sendable {
+    public let description: String
+}
+
+public enum Safetensors {
+    /// Writes named tensors and optional string metadata.
+    public static func write(_ tensors: [(name: String, tensor: Tensor)], to path: String,
+                             metadata: [String: String] = [:]) throws {
+        var header: JSON = [:]
+        if !metadata.isEmpty {
+            var meta: JSON = [:]
+            for (k, v) in metadata.sorted(by: { $0.key < $1.key }) { meta[k] = .string(v) }
+            header["__metadata__"] = meta
+        }
+        var offset = 0
+        for (name, t) in tensors {
+            header[name] = ["dtype": "F32", "shape": .array(t.shape.map { JSON($0) }),
+                            "data_offsets": [JSON(offset), JSON(offset + t.count * 4)]]
+            offset += t.count * 4
+        }
+        var headerBytes = Array(header.dump().utf8)
+        while headerBytes.count % 8 != 0 { headerBytes.append(0x20) }   // pad with spaces
+        var out = ByteWriter(endian: .little, reserving: 8 + headerBytes.count + offset)
+        out.write(UInt64(headerBytes.count))
+        out.write(bytes: headerBytes)
+        for (_, t) in tensors { for v in t.data { out.write(v.bitPattern) } }
+        try FS.write(path, bytes: out.bytes)
+    }
+
+    /// Reads all tensors (float32, float16 and bfloat16 are accepted) and the metadata.
+    public static func read(_ path: String) throws -> (tensors: [String: Tensor], metadata: [String: String]) {
+        let bytes = try FS.readBytes(path)
+        var r = ByteReader(bytes, endian: .little)
+        let headerLength = Int(try r.read(UInt64.self))
+        guard headerLength <= bytes.count - 8 else { throw SafetensorsError(description: "\(path): bad header length") }
+        let header = try JSON.parse(String(decoding: try r.read(bytes: headerLength), as: UTF8.self))
+        guard let object = header.object else { throw SafetensorsError(description: "\(path): header is not an object") }
+        let base = 8 + headerLength
+        var tensors: [String: Tensor] = [:]
+        var metadata: [String: String] = [:]
+        for (name, info) in object {
+            if name == "__metadata__" {
+                for (k, v) in info.object ?? JSON.Object() { metadata[k] = v.string ?? v.dump() }
+                continue
+            }
+            guard let dtype = info["dtype"].string, let shape = info["shape"].array?.compactMap(\.int),
+                  let offs = info["data_offsets"].array?.compactMap(\.int), offs.count == 2 else {
+                throw SafetensorsError(description: "\(path): bad entry for '\(name)'")
+            }
+            let count = shape.reduce(1, *)
+            let start = base + offs[0], end = base + offs[1]
+            guard end <= bytes.count else { throw SafetensorsError(description: "\(path): '\(name)' runs past the end of the file") }
+            var values = [Float](repeating: 0, count: count)
+            switch dtype {
+            case "F32":
+                guard end - start == count * 4 else { throw SafetensorsError(description: "\(path): size mismatch for '\(name)'") }
+                for i in 0 ..< count {
+                    let p = start + 4 * i
+                    let bits = UInt32(bytes[p]) | UInt32(bytes[p + 1]) << 8 | UInt32(bytes[p + 2]) << 16 | UInt32(bytes[p + 3]) << 24
+                    values[i] = Float(bitPattern: bits)
+                }
+            case "F16", "BF16":
+                guard end - start == count * 2 else { throw SafetensorsError(description: "\(path): size mismatch for '\(name)'") }
+                for i in 0 ..< count {
+                    let h = UInt16(bytes[start + 2 * i]) | UInt16(bytes[start + 2 * i + 1]) << 8
+                    values[i] = dtype == "BF16" ? Float(bitPattern: UInt32(h) << 16) : halfToFloat(h)
+                }
+            default:
+                throw SafetensorsError(description: "\(path): unsupported dtype \(dtype) for '\(name)'")
+            }
+            tensors[name] = Tensor(data: values, shape: shape)
+        }
+        return (tensors, metadata)
+    }
+}
+
+/// IEEE half -> float, done with bit manipulation.
+public func halfToFloat(_ h: UInt16) -> Float {
+    let sign = UInt32(h & 0x8000) << 16
+    var exp = UInt32(h >> 10) & 0x1F
+    var mant = UInt32(h & 0x3FF)
+    if exp == 0 {
+        if mant == 0 { return Float(bitPattern: sign) }
+        while mant & 0x400 == 0 { mant <<= 1; exp &-= 1 }      // normalize subnormal
+        exp &+= 1
+        mant &= 0x3FF
+    } else if exp == 31 {
+        return Float(bitPattern: sign | 0x7F80_0000 | mant << 13)
+    }
+    return Float(bitPattern: sign | (exp &+ 112) << 23 | mant << 13)
+}
+
+extension Module {
+    /// Saves every tensor (weights and state) as safetensors.
+    public func save(_ path: String, metadata: [String: String] = [:]) throws {
+        var meta = metadata
+        meta["format"] = "mpp-neural"
+        meta["model"] = "\(Swift.type(of: self))"
+        try Safetensors.write(namedTensors(), to: path, metadata: meta)
+    }
+
+    /// Loads tensors saved by `save` (or any safetensors file with matching names and shapes).
+    /// Returns the file's metadata.
+    @discardableResult
+    public func load(_ path: String, strict: Bool = true) throws -> [String: String] {
+        let (tensors, metadata) = try Safetensors.read(path)
+        for (name, t) in namedTensors() {
+            guard let src = tensors[name] else {
+                if strict { throw SafetensorsError(description: "\(path) has no tensor '\(name)'") }
+                continue
+            }
+            guard src.shape == t.shape else {
+                throw SafetensorsError(description: "\(path): '\(name)' has shape \(src.shape), model expects \(t.shape)")
+            }
+            t.data = src.data
+        }
+        return metadata
+    }
+}

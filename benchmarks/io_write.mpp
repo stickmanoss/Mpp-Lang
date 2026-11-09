@@ -1,0 +1,3 @@
+// Writes 0..<5M, one per line (compare: io_write.cpp).
+var out = BufferedWriter.standardOutput()
+for i in 0..<5_000_000 { out.write(i); out.write(UInt8(ascii: "\n")) }

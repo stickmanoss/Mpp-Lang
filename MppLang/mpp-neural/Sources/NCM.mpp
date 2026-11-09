@@ -1,0 +1,308 @@
+// Next-Concept Modeling (NCM): coarse-to-fine text generation with a few
+// parallel passes instead of one pass per token.
+//
+// Kumbong, Khare, Mlauzi, Woen, Ding, Buchanan, Arora, Mirhoseini, Ré,
+// "Next-Concept Modeling: Fast, Parallel Coarse-to-Fine Text Generation",
+// arXiv:2610.14162 (Stanford, 2026).
+//
+// Why it helps memory bandwidth: generating L tokens autoregressively reads
+// every weight L times (one decoding step per token). NCM writes the text as
+// a pyramid of K ≪ L levels of discrete codes; each level is ONE forward
+// pass that predicts all of its codes in parallel, so the weights are read
+// K (+1 for decoding) times. Early levels are also short sequences.
+//
+// The two parts, as in the paper:
+//   NCMTokenizer — a multiscale residual VQ-VAE. Encoder E maps tokens to
+//     z ∈ ℝ^(L×d). Level k pools the residual to ℓ_k vectors, snaps each to
+//     its nearest codebook entry, and adds the reconstruction R_k back:
+//     ẑ⁽ᵏ⁾ = ẑ⁽ᵏ⁻¹⁾ + R_k(e_k(r_k)), residual z − ẑ⁽ᵏ⁾. Trained with token
+//     cross-entropy from ẑ⁽ᵏ⁾ at a random cutoff k (nested dropout) plus the
+//     commitment and codebook losses, straight-through gradients.
+//   NCMGenerator — a transformer that, given ẑ⁽ᵏ⁻¹⁾ resized to ℓ_k
+//     positions, predicts all ℓ_k codes of level k at once. Loss: cross-
+//     entropy with per-code weights w_k ∝ ℓ_k^(−α) / Σ ℓ_j^(1−α).
+//
+// Choices of this implementation where the paper's text gives no number:
+// level lengths double (1, 2, 4, …, L); Down_k is average pooling; R_k is
+// nearest-neighbour upsampling followed by a per-level linear map; one
+// codebook size for every level; codebooks start from data on the first
+// batch. Prompt conditioning (prefix attention) is not implemented yet.
+
+import MppKit
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+public struct NCMConfig: Sendable {
+    public var vocabulary: Int
+    public var length: Int                 // L, a power of two
+    public var dims = 32
+    public var heads = 2
+    public var layers = 1
+    public var codebookSize = 64
+    public var beta: Float = 0.25          // commitment weight
+    public var alpha: Float = 0.5          // level weighting exponent
+    public init(vocabulary: Int, length: Int) {
+        precondition(length > 0 && length & (length - 1) == 0, "NCM: length must be a power of two")
+        self.vocabulary = vocabulary
+        self.length = length
+    }
+    /// ℓ_1 < ℓ_2 < … < ℓ_K = L.
+    public var levelLengths: [Int] {
+        var ls: [Int] = []
+        var l = 1
+        while l <= length { ls.append(l); l *= 2 }
+        return ls
+    }
+    public var levels: Int { levelLengths.count }
+}
+
+/// Average-pools [L, d] to [ℓ, d].
+func _ncmPool(_ x: Tensor, to l: Int) -> Tensor {
+    let L = x.shape[0], d = x.shape[1]
+    if l == L { return x }
+    return x.reshaped([l, L / l, d]).mean(axis: 1)
+}
+
+/// Repeats each of the ℓ rows L/ℓ times: [ℓ, d] → [L, d].
+func _ncmUpsample(_ x: Tensor, to L: Int) -> Tensor {
+    let l = x.shape[0]
+    if l == L { return x }
+    return x.rows((0 ..< L).map { $0 * l / L })
+}
+
+// MARK: - Tokenizer (multiscale residual VQ-VAE)
+
+public final class NCMTokenizer: Module {
+    public let config: NCMConfig
+    public var embedding: Embedding
+    public var position: Tensor
+    public var encoder: [TransformerBlock]
+    public var codebooks: [Tensor]                  // K × [codebookSize, d]
+    public var reconstruct: [Linear]                // R_k's projection
+    public var decoder: [TransformerBlock]
+    public var head: Linear
+    var codebooksInitialized = false
+
+    public init(_ c: NCMConfig) {
+        config = c
+        embedding = Embedding(c.vocabulary, c.dims)
+        position = Init.normal([c.length, c.dims], std: 0.1)
+        encoder = (0 ..< c.layers).map { _ in TransformerBlock(c.dims, heads: c.heads, causal: false) }
+        codebooks = (0 ..< c.levels).map { _ in Init.normal([c.codebookSize, c.dims], std: 0.1) }
+        reconstruct = (0 ..< c.levels).map { _ in Linear(c.dims, c.dims) }
+        decoder = (0 ..< c.layers).map { _ in TransformerBlock(c.dims, heads: c.heads, causal: false) }
+        head = Linear(c.dims, c.vocabulary)
+    }
+
+    /// z = E(x): [L, d].
+    public func encode(_ tokens: [Int]) -> Tensor {
+        precondition(tokens.count == config.length, "NCM: expected \(config.length) tokens, got \(tokens.count)")
+        var h = embedding(tokens) + position
+        for b in encoder { h = b(h) }
+        return h
+    }
+
+    /// Token logits from a (partial) reconstruction: [L, vocabulary].
+    public func decode(_ zhat: Tensor) -> Tensor {
+        var h = zhat
+        for b in decoder { h = b(h) }
+        return head(h)
+    }
+
+    /// R_k(e_k(codes)): the level's contribution, [L, d].
+    public func contribution(level k: Int, codes: [Int]) -> Tensor {
+        _ncmUpsample(reconstruct[k](codebooks[k].rows(codes)), to: config.length)
+    }
+
+    /// Nearest codebook entry for each row (no gradient).
+    func nearest(_ r: Tensor, level k: Int) -> [Int] {
+        let d = config.dims, book = codebooks[k].data, n = config.codebookSize
+        return (0 ..< r.shape[0]).map { i in
+            var best = 0, bestD = Float.infinity
+            for c in 0 ..< n {
+                var dist: Float = 0
+                for j in 0 ..< d { let t = r.data[i * d + j] - book[c * d + j]; dist += t * t }
+                if dist < bestD { bestD = dist; best = c }
+            }
+            return best
+        }
+    }
+
+    /// Quantizes z through `levels` levels. Returns the reconstruction ẑ,
+    /// the codes per level, every intermediate ẑ⁽ᵏ⁾ (k = 0…levels), and
+    /// the VQ loss (commitment + codebook, straight-through).
+    public func quantize(_ z: Tensor, levels: Int) -> (zhat: Tensor, codes: [[Int]], partials: [Tensor], vqLoss: Tensor) {
+        if !codebooksInitialized { initializeCodebooks(from: z) }
+        var zhat = Tensor.zeros(z.shape)
+        var partials = [zhat]
+        var codes: [[Int]] = []
+        var loss = Tensor(0)
+        for k in 0 ..< levels {
+            let r = _ncmPool(z - zhat, to: config.levelLengths[k])                 // Down_k(residual)
+            let idx = nearest(r, level: k)
+            let e = codebooks[k].rows(idx)
+            loss = loss + mse(r.detached(), e) + config.beta * mse(r, e.detached())
+            let q = r + (e - r).detached()                                           // straight-through
+            zhat = zhat + _ncmUpsample(reconstruct[k](q), to: config.length)
+            codes.append(idx)
+            partials.append(zhat)
+        }
+        return (zhat, codes, partials, loss)
+    }
+
+    /// Codebooks start at encoder outputs (avoids unused codes).
+    func initializeCodebooks(from z: Tensor) {
+        codebooksInitialized = true
+        var rng = PCG32(seed: 7)
+        let d = config.dims
+        for k in 0 ..< config.levels {
+            let pooled = _ncmPool(z, to: config.levelLengths[k]).data
+            let rows = pooled.count / d
+            var book = codebooks[k].data
+            for c in 0 ..< config.codebookSize {
+                let src = Int(rng.next() % UInt64(rows))
+                for j in 0 ..< d { book[c * d + j] = pooled[src * d + j] / Float(k + 1) + Float(Int(rng.next() % 2001) - 1000) * 1e-4 }
+            }
+            codebooks[k].data = book
+        }
+    }
+
+    /// Training loss with nested dropout: decode from the first `cutoff` levels.
+    public func loss(_ tokens: [Int], cutoff: Int) -> Tensor {
+        let z = encode(tokens)
+        let q = quantize(z, levels: config.levels)
+        return crossEntropy(decode(q.partials[cutoff]), tokens) + q.vqLoss
+    }
+
+    /// Token cross-entropy when decoding from all levels (no gradients).
+    public func reconstructionLoss(_ tokens: [Int]) -> Float {
+        withNoGrad { crossEntropy(decode(quantize(encode(tokens), levels: config.levels).zhat), tokens).item }
+    }
+
+    /// Codes for a text (all levels), without gradients.
+    public func codes(for tokens: [Int]) -> (codes: [[Int]], partials: [Tensor]) {
+        withNoGrad {
+            let q = quantize(encode(tokens), levels: config.levels)
+            return (q.codes, q.partials.map { $0.detached() })
+        }
+    }
+
+    /// Tokens decoded from codes of the first `codes.count` levels.
+    public func reconstruct(codes: [[Int]]) -> [Int] {
+        withNoGrad {
+            var zhat = Tensor.zeros([config.length, config.dims])
+            for (k, c) in codes.enumerated() { zhat = zhat + contribution(level: k, codes: c) }
+            return decode(zhat).argmax()
+        }
+    }
+}
+
+// MARK: - Generator (one pass per level)
+
+public final class NCMGenerator: Module {
+    public let config: NCMConfig
+    public var input: Linear
+    public var position: Tensor
+    public var levelEmbedding: Tensor
+    public var blocks: [TransformerBlock]
+    public var heads: [Linear]
+
+    public init(_ c: NCMConfig) {
+        config = c
+        input = Linear(c.dims, c.dims)
+        position = Init.normal([c.length, c.dims], std: 0.1)
+        levelEmbedding = Init.normal([c.levels, c.dims], std: 0.1)
+        blocks = (0 ..< max(c.layers, 1) * 2).map { _ in TransformerBlock(c.dims, heads: c.heads, causal: false) }
+        heads = (0 ..< c.levels).map { _ in Linear(c.dims, c.codebookSize) }
+    }
+
+    /// Logits for all ℓ_k codes of level k, given ẑ⁽ᵏ⁻¹⁾ ([L, d]).
+    public func logits(level k: Int, previous zhat: Tensor) -> Tensor {
+        let l = config.levelLengths[k]
+        var h = input(_ncmPool(zhat, to: l)) + position.narrow(0, 0, l) + levelEmbedding.narrow(0, k, 1)
+        for b in blocks { h = b(h) }
+        return heads[k](h)
+    }
+
+    /// The paper weights each code position by w_k ∝ ℓ_k^(−α) / Σ_j ℓ_j^(1−α);
+    /// the loss below averages over a level's ℓ_k positions, so a level's
+    /// weight is ℓ_k · w_k = ℓ_k^(1−α) / Σ_j ℓ_j^(1−α) (they sum to 1).
+    /// α = 1: every level counts the same; α = 0: every code position does.
+    public var levelWeights: [Float] {
+        let ls = config.levelLengths.map(Float.init)
+        let norm = ls.reduce(0) { $0 + powf($1, 1 - config.alpha) }
+        return ls.map { powf($0, 1 - config.alpha) / norm }
+    }
+
+    /// Teacher-forced loss over all levels.
+    public func loss(_ tokens: [Int], tokenizer: NCMTokenizer) -> Tensor {
+        let target = tokenizer.codes(for: tokens)
+        var total = Tensor(0)
+        let w = levelWeights
+        for k in 0 ..< config.levels {
+            total = total + w[k] * crossEntropy(logits(level: k, previous: target.partials[k]), target.codes[k])
+        }
+        return total
+    }
+
+    /// Generates a text: K generator passes + 1 decoder pass.
+    /// temperature 0 = argmax (as in the paper); > 0 samples.
+    public func generate(tokenizer: NCMTokenizer, temperature: Float = 0, seed: UInt64 = 1) -> (tokens: [Int], passes: Int) {
+        withNoGrad {
+            var rng = PCG32(seed: seed)
+            var zhat = Tensor.zeros([config.length, config.dims])
+            var passes = 0
+            for k in 0 ..< config.levels {
+                let lg = logits(level: k, previous: zhat)
+                passes += 1
+                let n = config.codebookSize
+                var codes: [Int] = []
+                for i in 0 ..< lg.shape[0] {
+                    let row = Array(lg.data[i * n ..< (i + 1) * n])
+                    if temperature <= 0 {
+                        codes.append(row.indices.max { row[$0] < row[$1] }!)
+                    } else {
+                        let m = row.max()!
+                        let p = row.map { expf(($0 - m) / temperature) }
+                        var u = Float(rng.next() % 1_000_000) / 1_000_000 * p.reduce(0, +)
+                        var pick = n - 1
+                        for (j, v) in p.enumerated() { u -= v; if u <= 0 { pick = j; break } }
+                        codes.append(pick)
+                    }
+                }
+                zhat = zhat + tokenizer.contribution(level: k, codes: codes)
+            }
+            passes += 1
+            return (tokenizer.decode(zhat).argmax(), passes)
+        }
+    }
+}
+
+// MARK: - Memory traffic
+
+/// Weight bytes read to generate `length` tokens: autoregressive decoding
+/// reads every weight once per token; NCM once per level (+1 to decode).
+public struct NCMBandwidth: Sendable, CustomStringConvertible {
+    public let parameters: Int
+    public let bytesPerParameter: Int
+    public let length: Int
+    public let levels: Int
+    public init(parameters: Int, bytesPerParameter: Int = 2, length: Int, levels: Int) {
+        self.parameters = parameters
+        self.bytesPerParameter = bytesPerParameter
+        self.length = length
+        self.levels = levels
+    }
+    public var autoregressiveBytes: Double { Double(parameters * bytesPerParameter) * Double(length) }
+    public var ncmBytes: Double { Double(parameters * bytesPerParameter) * Double(levels + 1) }
+    public var reduction: Double { autoregressiveBytes / ncmBytes }
+    public var description: String {
+        func gb(_ b: Double) -> String { b >= 1e9 ? "\(Double(Int(b / 1e7)) / 100) GB" : "\(Double(Int(b / 1e4)) / 100) MB" }
+        return "\(length) tokens: autoregressive reads \(gb(autoregressiveBytes)) of weights, NCM \(gb(ncmBytes)) (\(levels + 1) passes, \(Double(Int(reduction * 10)) / 10)× less)"
+    }
+}

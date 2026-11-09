@@ -1,0 +1,56 @@
+// Accelarate: the eager engine and the VM must agree.
+import Accelarate
+
+nonisolated(unsafe) var failures = 0
+func check(_ ok: Bool, _ what: String, line: Int = #line) {
+    if !ok { failures += 1; print("FAIL line \(line): \(what)") }
+}
+func close(_ a: [Float], _ b: [Float], _ tol: Float = 1e-4) -> Bool {
+    a.count == b.count && zip(a, b).allSatisfy { Swift.abs($0 - $1) <= tol * Swift.max(1, Swift.abs($0)) }
+}
+
+let n = 300_001     // not a multiple of the block size
+let x = Accelarate.with(.eager) { Tensor.random(count: n, in: -2 ... 2, seed: 1) }
+let y = Accelarate.with(.eager) { Tensor.random(count: n, in: 0.5 ... 3, seed: 2) }
+let row = Tensor([1, 2, 3])
+let m = Tensor((0 ..< 12).map(Float.init), shape: [4, 3])
+
+@MainActor func exprs() -> [[Float]] {
+    [
+        (x * y + 1).array,                                  // fma + affine
+        (relu(x * 2 + 1) - sqrt(abs(x)) / y).array,
+        (sigmoid(x) * tanh(y) - exp(-square(x))).array,
+        clamp(x * y, -1, 1).array,
+        (max(x, y * 0.5) + min(x, 0.25)).array,
+        (m + row).array,                                    // broadcast a row
+        (m * 2 - row * row).array,
+        (1 / y + pow(y, 3) + log(y)).array,
+        [sum(x * y), mean(x), maxElement(x * y + y), minElement(x - y), dot(x, y), norm(x), variance(y)],
+        [sum(m + row), maxElement((m - row) * 3)],
+    ]
+}
+
+let eager = Accelarate.with(.eager) { exprs() }
+let vm = Accelarate.with(.vm) { exprs() }
+for (k, (a, b)) in zip(eager, vm).enumerated() { check(close(a, b, k == 8 ? 1e-3 : 1e-5), "expression \(k): eager and VM differ") }
+
+// Shared subexpressions, deep chains and caching.
+Accelarate.with(.vm) {
+    let before = Accelarate.compiledPrograms
+    for _ in 0 ..< 5 { _ = (x * y + y).array }
+    check(Accelarate.compiledPrograms - before == 1, "a repeated expression compiles once")
+    let s = x * y
+    check(close((s + s * s).array, Accelarate.with(.eager) { (x * y + (x * y) * (x * y)).array }), "shared subexpression")
+    var acc = Tensor.zeros(1000)
+    for _ in 0 ..< 200 { acc = acc + 1 }
+    check(acc.array.allSatisfy { $0 == 200 }, "deep chain")
+}
+
+// matmul and shapes
+let a = Tensor([1, 2, 3, 4, 5, 6], shape: [2, 3]), b = Tensor([7, 8, 9, 10, 11, 12], shape: [3, 2])
+check((a • b).array == [58, 64, 139, 154] && (a • b).shape == [2, 2], "matmul")
+check(a.transposed.array == [1, 4, 2, 5, 3, 6] && a[1, 2] == 6, "transpose and indexing")
+check(Accelarate.with(.vm) { relu(a • b - 100).array } == [0, 0, 39, 54], "matmul then fused epilogue")
+
+precondition(failures == 0, "Accelarate: \(failures) failure(s)")
+print("Accelarate: ok")

@@ -1,0 +1,214 @@
+// neural — Training: losses, optimizers, schedules and function transforms.
+//
+//   let optimizer = Adam(learningRate: 1e-3)
+//   let lossAndGrad = valueAndGrad(model) { model, x, y in crossEntropy(model(x), y) }
+//   for (x, y) in batches(inputs, labels, batchSize: 32) {
+//       let loss = lossAndGrad(model, x, y)
+//       optimizer.update(model)
+//   }
+//
+// MLX-style: `valueAndGrad` runs the forward pass, backpropagates and
+// leaves gradients on the parameters; `optimizer.update` applies them.
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+// MARK: - Losses
+
+/// Mean squared error.
+public func mse(_ prediction: Tensor, _ target: Tensor) -> Tensor { (prediction - target).square().mean() }
+
+/// Mean absolute error.
+public func l1Loss(_ prediction: Tensor, _ target: Tensor) -> Tensor { (prediction - target).abs().mean() }
+
+/// Huber loss (quadratic below `delta`, linear above).
+public func huberLoss(_ prediction: Tensor, _ target: Tensor, delta: Float = 1) -> Tensor {
+    let diff = (prediction - target).abs()
+    let quadratic = diff.clamp(0, delta)
+    return (0.5 * quadratic.square() + delta * (diff - quadratic)).mean()
+}
+
+/// Cross-entropy of logits [N, C] against class indices.
+public func crossEntropy(_ logits: Tensor, _ labels: [Int], labelSmoothing: Float = 0) -> Tensor {
+    let logp = logits.logSoftmax(axis: -1)
+    let nll = -logp.pick(labels).mean()
+    guard labelSmoothing > 0 else { return nll }
+    return (1 - labelSmoothing) * nll - labelSmoothing * logp.mean()
+}
+
+/// Binary cross-entropy on logits (numerically stable).
+public func binaryCrossEntropy(logits: Tensor, _ target: Tensor) -> Tensor {
+    // max(x, 0) - x*t + log(1 + exp(-|x|))
+    (logits.relu() - logits * target + ((-logits.abs()).exp() + 1).log()).mean()
+}
+
+// MARK: - Function transforms (MLX)
+
+/// Returns a function that evaluates `loss(model, x, y)`, backpropagates,
+/// and leaves fresh gradients on the model's parameters.
+public func valueAndGrad<M: Module, X, Y>(_ model: M, _ loss: @escaping (M, X, Y) -> Tensor) -> (M, X, Y) -> Float {
+    return { m, x, y in
+        m.zeroGrad()
+        let l = loss(m, x, y)
+        l.backward()
+        return l.item
+    }
+}
+
+/// d f / d x for a scalar-valued function (MLX: grad).
+public func grad(_ f: @escaping (Tensor) -> Tensor) -> (Tensor) -> Tensor {
+    return { x in
+        let input = Tensor(data: x.data, shape: x.shape, requiresGrad: true)
+        f(input).backward()
+        return input.grad ?? Tensor.zeros(x.shape)
+    }
+}
+
+/// Rescales all gradients so their global L2 norm is at most `maxNorm`; returns the norm before clipping.
+@discardableResult
+public func clipGradNorm(_ parameters: [Tensor], maxNorm: Float) -> Float {
+    var total: Float = 0
+    for p in parameters { if let g = p.gradStorage { for v in g { total += v * v } } }
+    let norm = total.squareRoot()
+    if norm > maxNorm {
+        let s = maxNorm / (norm + 1e-6)
+        for p in parameters where p.gradStorage != nil {
+            for i in p.gradStorage!.indices { p.gradStorage![i] *= s }
+        }
+    }
+    return norm
+}
+
+// MARK: - Learning-rate schedules (MLX optimizers.schedulers)
+
+public struct Schedule: Sendable {
+    let f: @Sendable (Int) -> Float
+    public init(_ f: @escaping @Sendable (Int) -> Float) { self.f = f }
+    public func callAsFunction(_ step: Int) -> Float { f(step) }
+
+    public static func constant(_ lr: Float) -> Schedule { Schedule { _ in lr } }
+    /// lr * gamma^(step / every)
+    public static func stepDecay(_ lr: Float, every: Int, gamma: Float = 0.1) -> Schedule {
+        Schedule { s in lr * powf(gamma, Float(s / every)) }
+    }
+    public static func exponentialDecay(_ lr: Float, rate: Float) -> Schedule { Schedule { s in lr * powf(rate, Float(s)) } }
+    /// Cosine from lr down to `minimum` over `steps`.
+    public static func cosineDecay(_ lr: Float, steps: Int, minimum: Float = 0) -> Schedule {
+        Schedule { s in
+            let t = Float(Swift.min(s, steps)) / Float(steps)
+            return minimum + (lr - minimum) * 0.5 * (1 + cosf(Float.pi * t))
+        }
+    }
+    /// Linear warm-up from 0 to the schedule's start, then `then`.
+    public static func warmup(_ steps: Int, then: Schedule) -> Schedule {
+        Schedule { s in s < steps ? then(0) * Float(s + 1) / Float(steps) : then(s - steps) }
+    }
+}
+
+// MARK: - Optimizers
+
+open class Optimizer {
+    public var schedule: Schedule
+    public private(set) var step = 0
+    var state: [ObjectIdentifier: [[Float]]] = [:]
+
+    public var learningRate: Float { schedule(step) }
+
+    public init(schedule: Schedule) { self.schedule = schedule }
+
+    /// Applies the parameters' gradients, then clears them.
+    public func update(_ model: Module) { update(model.parameters()) }
+
+    public func update(_ parameters: [Tensor]) {
+        let lr = learningRate
+        step += 1
+        for p in parameters {
+            guard let g = p.gradStorage else { continue }
+            var s = state[ObjectIdentifier(p)] ?? []
+            apply(&p.data, g, &s, lr)
+            state[ObjectIdentifier(p)] = s
+            p.gradStorage = nil
+        }
+    }
+
+    open func apply(_ w: inout [Float], _ g: [Float], _ state: inout [[Float]], _ lr: Float) {
+        fatalError("Optimizer subclasses implement apply")
+    }
+}
+
+/// Stochastic gradient descent with optional momentum / Nesterov / weight decay.
+public final class SGD: Optimizer {
+    let momentum: Float, nesterov: Bool, weightDecay: Float
+    public init(learningRate: Float = 0.01, momentum: Float = 0, nesterov: Bool = false, weightDecay: Float = 0) {
+        self.momentum = momentum; self.nesterov = nesterov; self.weightDecay = weightDecay
+        super.init(schedule: .constant(learningRate))
+    }
+    public init(schedule: Schedule, momentum: Float = 0) {
+        self.momentum = momentum; nesterov = false; weightDecay = 0
+        super.init(schedule: schedule)
+    }
+    public override func apply(_ w: inout [Float], _ g: [Float], _ state: inout [[Float]], _ lr: Float) {
+        if state.isEmpty { state = [[Float](repeating: 0, count: w.count)] }
+        for i in w.indices {
+            let gi = g[i] + weightDecay * w[i]
+            if momentum > 0 {
+                state[0][i] = momentum * state[0][i] + gi
+                w[i] -= lr * (nesterov ? gi + momentum * state[0][i] : state[0][i])
+            } else {
+                w[i] -= lr * gi
+            }
+        }
+    }
+}
+
+/// Adam; with `decoupledWeightDecay` > 0 it is AdamW.
+public class Adam: Optimizer {
+    let beta1: Float, beta2: Float, eps: Float, decoupledWeightDecay: Float
+    public init(learningRate: Float = 1e-3, betas: (Float, Float) = (0.9, 0.999), eps: Float = 1e-8, weightDecay: Float = 0) {
+        beta1 = betas.0; beta2 = betas.1; self.eps = eps; decoupledWeightDecay = weightDecay
+        super.init(schedule: .constant(learningRate))
+    }
+    public init(schedule: Schedule, betas: (Float, Float) = (0.9, 0.999), eps: Float = 1e-8, weightDecay: Float = 0) {
+        beta1 = betas.0; beta2 = betas.1; self.eps = eps; decoupledWeightDecay = weightDecay
+        super.init(schedule: schedule)
+    }
+    public override func apply(_ w: inout [Float], _ g: [Float], _ state: inout [[Float]], _ lr: Float) {
+        if state.isEmpty { state = [[Float](repeating: 0, count: w.count), [Float](repeating: 0, count: w.count), [0]] }
+        state[2][0] += 1
+        let t = state[2][0]
+        let c1 = 1 - powf(beta1, t), c2 = 1 - powf(beta2, t)
+        for i in w.indices {
+            state[0][i] = beta1 * state[0][i] + (1 - beta1) * g[i]
+            state[1][i] = beta2 * state[1][i] + (1 - beta2) * g[i] * g[i]
+            let mHat = state[0][i] / c1, vHat = state[1][i] / c2
+            w[i] -= lr * (mHat / (vHat.squareRoot() + eps) + decoupledWeightDecay * w[i])
+        }
+    }
+}
+
+/// AdamW (Adam with decoupled weight decay, default 0.01).
+public final class AdamW: Adam {
+    public init(learningRate: Float = 1e-3, weightDecay: Float = 0.01) {
+        super.init(learningRate: learningRate, weightDecay: weightDecay)
+    }
+}
+
+public final class RMSprop: Optimizer {
+    let alpha: Float, eps: Float
+    public init(learningRate: Float = 1e-2, alpha: Float = 0.99, eps: Float = 1e-8) {
+        self.alpha = alpha; self.eps = eps
+        super.init(schedule: .constant(learningRate))
+    }
+    public override func apply(_ w: inout [Float], _ g: [Float], _ state: inout [[Float]], _ lr: Float) {
+        if state.isEmpty { state = [[Float](repeating: 0, count: w.count)] }
+        for i in w.indices {
+            state[0][i] = alpha * state[0][i] + (1 - alpha) * g[i] * g[i]
+            w[i] -= lr * g[i] / (state[0][i].squareRoot() + eps)
+        }
+    }
+}

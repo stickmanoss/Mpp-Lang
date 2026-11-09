@@ -1,0 +1,392 @@
+// MppKit — JSON: nlohmann/json-style JSON values.
+//
+//   var j: JSON = ["name": "M++", "tags": ["fast", "safe"], "version": 2]
+//   j["version"] = 3                   // assign through subscripts
+//   j.author = "Omar"                  // or dynamic members
+//   j["nested"]["deep"] = true         // missing objects are created, like nlohmann
+//   let n = j["version"].int           // typed access (nil if the type differs)
+//   let text = j.dump(indent: 2)
+//   let back = try JSON.parse(text)    // errors carry line and column
+//
+// Objects keep insertion order. Integers and floating point are kept apart
+// so large integers round-trip exactly.
+
+@dynamicMemberLookup
+public enum JSON: Equatable, Sendable, CustomStringConvertible,
+                  ExpressibleByNilLiteral, ExpressibleByBooleanLiteral, ExpressibleByIntegerLiteral,
+                  ExpressibleByFloatLiteral, ExpressibleByStringLiteral, ExpressibleByArrayLiteral,
+                  ExpressibleByDictionaryLiteral {
+    case null
+    case bool(Bool)
+    case int(Int64)
+    case double(Double)
+    case string(String)
+    case array([JSON])
+    case object(Object)
+
+    /// An insertion-ordered string-keyed map.
+    public struct Object: Equatable, Sendable, Sequence {
+        public private(set) var keys: [String] = []
+        var values: [String: JSON] = [:]
+        public init() {}
+        public var count: Int { keys.count }
+        public subscript(key: String) -> JSON? {
+            get { values[key] }
+            set {
+                if let v = newValue {
+                    if values.updateValue(v, forKey: key) == nil { keys.append(key) }
+                } else if values.removeValue(forKey: key) != nil {
+                    keys.removeAll { $0 == key }
+                }
+            }
+        }
+        public func makeIterator() -> AnyIterator<(key: String, value: JSON)> {
+            var i = 0
+            return AnyIterator {
+                guard i < keys.count else { return nil }
+                defer { i += 1 }
+                return (keys[i], values[keys[i]]!)
+            }
+        }
+        public static func == (a: Object, b: Object) -> Bool { a.values == b.values }
+    }
+
+    // MARK: Literals
+
+    public init(nilLiteral: ()) { self = .null }
+    public init(booleanLiteral value: Bool) { self = .bool(value) }
+    public init(integerLiteral value: Int64) { self = .int(value) }
+    public init(floatLiteral value: Double) { self = .double(value) }
+    public init(stringLiteral value: String) { self = .string(value) }
+    public init(arrayLiteral elements: JSON...) { self = .array(elements) }
+    public init(dictionaryLiteral elements: (String, JSON)...) {
+        var o = Object()
+        for (k, v) in elements { o[k] = v }
+        self = .object(o)
+    }
+
+    public init(_ v: Bool) { self = .bool(v) }
+    public init<I: BinaryInteger>(_ v: I) { self = .int(Int64(v)) }
+    public init(_ v: Double) { self = .double(v) }
+    public init(_ v: String) { self = .string(v) }
+    public init(_ v: [JSON]) { self = .array(v) }
+
+    // MARK: Typed access
+
+    public var isNull: Bool { self == .null }
+    public var bool: Bool? { if case .bool(let b) = self { return b }; return nil }
+    public var int: Int? {
+        switch self {
+        case .int(let i): return Int(exactly: i)
+        case .double(let d): return Int(exactly: d)
+        default: return nil
+        }
+    }
+    public var double: Double? {
+        switch self {
+        case .int(let i): return Double(i)
+        case .double(let d): return d
+        default: return nil
+        }
+    }
+    public var string: String? { if case .string(let s) = self { return s }; return nil }
+    public var array: [JSON]? { if case .array(let a) = self { return a }; return nil }
+    public var object: Object? { if case .object(let o) = self { return o }; return nil }
+    public var count: Int {
+        switch self {
+        case .array(let a): return a.count
+        case .object(let o): return o.count
+        case .null: return 0
+        default: return 1
+        }
+    }
+
+    // MARK: Subscripts
+
+    /// Object member; reading a missing key gives .null, writing to .null makes an object.
+    public subscript(key: String) -> JSON {
+        get { if case .object(let o) = self { return o[key] ?? .null }; return .null }
+        set {
+            if case .null = self { self = .object(Object()) }
+            guard case .object(var o) = self else { preconditionFailure("JSON: cannot set key '\(key)' on \(typeName)") }
+            self = .null   // drop our reference so `o` is uniquely referenced
+            o[key] = newValue
+            self = .object(o)
+        }
+    }
+
+    /// Array element; writing one past the end appends, writing to .null makes an array.
+    public subscript(index: Int) -> JSON {
+        get { if case .array(let a) = self, a.indices.contains(index) { return a[index] }; return .null }
+        set {
+            if case .null = self { self = .array([]) }
+            guard case .array(var a) = self else { preconditionFailure("JSON: cannot index \(typeName) with [\(index)]") }
+            self = .null
+            if index == a.count { a.append(newValue) }
+            else {
+                precondition(a.indices.contains(index), "JSON: index \(index) out of range 0..<\(a.count)")
+                a[index] = newValue
+            }
+            self = .array(a)
+        }
+    }
+
+    public subscript(dynamicMember key: String) -> JSON {
+        get { self[key] }
+        set { self[key] = newValue }
+    }
+
+    /// Appends to an array (turning .null into one).
+    public mutating func append(_ value: JSON) { self[count] = value }
+
+    public var typeName: String {
+        switch self {
+        case .null: return "null"
+        case .bool: return "boolean"
+        case .int, .double: return "number"
+        case .string: return "string"
+        case .array: return "array"
+        case .object: return "object"
+        }
+    }
+
+    // MARK: Serialization
+
+    public var description: String { dump() }
+
+    /// JSON text; `indent` > 0 pretty-prints.
+    public func dump(indent: Int = 0) -> String {
+        var out = ""
+        write(to: &out, indent: indent, depth: 0)
+        return out
+    }
+
+    func write(to out: inout String, indent: Int, depth: Int) {
+        let nl = indent > 0 ? "\n" : ""
+        func pad(_ d: Int) -> String { String(repeating: " ", count: d * indent) }
+        switch self {
+        case .null: out += "null"
+        case .bool(let b): out += b ? "true" : "false"
+        case .int(let i): out += String(i)
+        case .double(let d): out += d.isFinite ? "\(d)" : "null"
+        case .string(let s): JSON.quote(s, into: &out)
+        case .array(let a):
+            if a.isEmpty { out += "[]"; return }
+            out += "[" + nl
+            for (k, v) in a.enumerated() {
+                out += pad(depth + 1)
+                v.write(to: &out, indent: indent, depth: depth + 1)
+                out += (k + 1 < a.count ? "," : "") + nl
+            }
+            out += pad(depth) + "]"
+        case .object(let o):
+            if o.count == 0 { out += "{}"; return }
+            out += "{" + nl
+            for (k, key) in o.keys.enumerated() {
+                out += pad(depth + 1)
+                JSON.quote(key, into: &out)
+                out += indent > 0 ? ": " : ":"
+                o[key]!.write(to: &out, indent: indent, depth: depth + 1)
+                out += (k + 1 < o.count ? "," : "") + nl
+            }
+            out += pad(depth) + "}"
+        }
+    }
+
+    static func quote(_ s: String, into out: inout String) {
+        out.append("\"")
+        for u in s.unicodeScalars {
+            switch u {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            case "\u{08}": out += "\\b"
+            case "\u{0C}": out += "\\f"
+            default:
+                if u.value < 0x20 {
+                    let h = String(u.value, radix: 16)
+                    out += "\\u" + String(repeating: "0", count: 4 - h.count) + h
+                } else {
+                    out.unicodeScalars.append(u)
+                }
+            }
+        }
+        out.append("\"")
+    }
+
+    // MARK: Parsing
+
+    public struct ParseError: Error, CustomStringConvertible, Sendable {
+        public let message: String
+        public let line: Int
+        public let column: Int
+        public var description: String { "JSON parse error at \(line):\(column): \(message)" }
+    }
+
+    public static func parse(_ text: String) throws(ParseError) -> JSON {
+        var p = Parser(bytes: Array(text.utf8))
+        p.skipWhitespace()
+        let v = try p.value(depth: 0)
+        p.skipWhitespace()
+        if p.i < p.bytes.count { throw p.error("unexpected trailing characters") }
+        return v
+    }
+
+    struct Parser {
+        let bytes: [UInt8]
+        var i = 0
+
+        func error(_ msg: String) -> ParseError {
+            var line = 1, col = 1
+            for b in bytes[0 ..< min(i, bytes.count)] { if b == 10 { line += 1; col = 1 } else { col += 1 } }
+            return ParseError(message: msg, line: line, column: col)
+        }
+
+        mutating func skipWhitespace() {
+            while i < bytes.count, bytes[i] == 32 || bytes[i] == 10 || bytes[i] == 13 || bytes[i] == 9 { i += 1 }
+        }
+
+        mutating func literal(_ word: String, _ v: JSON) throws(ParseError) -> JSON {
+            let w = Array(word.utf8)
+            guard i + w.count <= bytes.count, Array(bytes[i ..< i + w.count]) == w else { throw error("invalid literal") }
+            i += w.count
+            return v
+        }
+
+        mutating func value(depth: Int) throws(ParseError) -> JSON {
+            guard depth < 512 else { throw error("nesting too deep") }
+            guard i < bytes.count else { throw error("unexpected end of input") }
+            switch bytes[i] {
+            case UInt8(ascii: "{"):
+                i += 1
+                var o = Object()
+                skipWhitespace()
+                if i < bytes.count && bytes[i] == UInt8(ascii: "}") { i += 1; return .object(o) }
+                while true {
+                    skipWhitespace()
+                    guard i < bytes.count, bytes[i] == UInt8(ascii: "\"") else { throw error("expected a string key") }
+                    let key = try string()
+                    skipWhitespace()
+                    guard i < bytes.count, bytes[i] == UInt8(ascii: ":") else { throw error("expected ':'") }
+                    i += 1
+                    skipWhitespace()
+                    o[key] = try value(depth: depth + 1)
+                    skipWhitespace()
+                    guard i < bytes.count else { throw error("unterminated object") }
+                    if bytes[i] == UInt8(ascii: ",") { i += 1; continue }
+                    if bytes[i] == UInt8(ascii: "}") { i += 1; return .object(o) }
+                    throw error("expected ',' or '}'")
+                }
+            case UInt8(ascii: "["):
+                i += 1
+                var a: [JSON] = []
+                skipWhitespace()
+                if i < bytes.count && bytes[i] == UInt8(ascii: "]") { i += 1; return .array(a) }
+                while true {
+                    skipWhitespace()
+                    a.append(try value(depth: depth + 1))
+                    skipWhitespace()
+                    guard i < bytes.count else { throw error("unterminated array") }
+                    if bytes[i] == UInt8(ascii: ",") { i += 1; continue }
+                    if bytes[i] == UInt8(ascii: "]") { i += 1; return .array(a) }
+                    throw error("expected ',' or ']'")
+                }
+            case UInt8(ascii: "\""): return .string(try string())
+            case UInt8(ascii: "t"): return try literal("true", true)
+            case UInt8(ascii: "f"): return try literal("false", false)
+            case UInt8(ascii: "n"): return try literal("null", nil)
+            default: return try number()
+            }
+        }
+
+        mutating func hex4() throws(ParseError) -> UInt32 {
+            guard i + 4 <= bytes.count else { throw error("bad \\u escape") }
+            var v: UInt32 = 0
+            for _ in 0 ..< 4 {
+                let b = bytes[i]
+                let d: UInt8
+                switch b {
+                case 48 ... 57: d = b - 48
+                case 65 ... 70: d = b - 55
+                case 97 ... 102: d = b - 87
+                default: throw error("bad hex digit in \\u escape")
+                }
+                v = v << 4 | UInt32(d)
+                i += 1
+            }
+            return v
+        }
+
+        mutating func string() throws(ParseError) -> String {
+            i += 1  // opening quote
+            var out = [UInt8]()
+            while true {
+                guard i < bytes.count else { throw error("unterminated string") }
+                let b = bytes[i]
+                if b == UInt8(ascii: "\"") { i += 1; break }
+                if b < 0x20 { throw error("control character in string") }
+                if b != UInt8(ascii: "\\") { out.append(b); i += 1; continue }
+                i += 1
+                guard i < bytes.count else { throw error("unterminated escape") }
+                let e = bytes[i]
+                i += 1
+                switch e {
+                case UInt8(ascii: "\""): out.append(0x22)
+                case UInt8(ascii: "\\"): out.append(0x5C)
+                case UInt8(ascii: "/"): out.append(0x2F)
+                case UInt8(ascii: "b"): out.append(0x08)
+                case UInt8(ascii: "f"): out.append(0x0C)
+                case UInt8(ascii: "n"): out.append(0x0A)
+                case UInt8(ascii: "r"): out.append(0x0D)
+                case UInt8(ascii: "t"): out.append(0x09)
+                case UInt8(ascii: "u"):
+                    var cp = try hex4()
+                    if cp >= 0xD800 && cp < 0xDC00 {
+                        guard i + 1 < bytes.count, bytes[i] == UInt8(ascii: "\\"), bytes[i + 1] == UInt8(ascii: "u") else {
+                            throw error("unpaired surrogate")
+                        }
+                        i += 2
+                        let lo = try hex4()
+                        guard lo >= 0xDC00 && lo < 0xE000 else { throw error("invalid low surrogate") }
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                    }
+                    guard let scalar = Unicode.Scalar(cp) else { throw error("invalid code point") }
+                    out.append(contentsOf: Array(String(Character(scalar)).utf8))
+                default: throw error("invalid escape")
+                }
+            }
+            return String(decoding: out, as: UTF8.self)
+        }
+
+        mutating func number() throws(ParseError) -> JSON {
+            let start = i
+            if i < bytes.count && bytes[i] == UInt8(ascii: "-") { i += 1 }
+            func digits() -> Int {
+                let s = i
+                while i < bytes.count && bytes[i] >= 48 && bytes[i] <= 57 { i += 1 }
+                return i - s
+            }
+            let intDigits = digits()
+            guard intDigits > 0 else { throw error("invalid value") }
+            if intDigits > 1 && bytes[i - intDigits] == 48 { throw error("leading zeros are not allowed") }
+            var isFloat = false
+            if i < bytes.count && bytes[i] == UInt8(ascii: ".") {
+                i += 1
+                guard digits() > 0 else { throw error("expected digits after '.'") }
+                isFloat = true
+            }
+            if i < bytes.count && (bytes[i] == UInt8(ascii: "e") || bytes[i] == UInt8(ascii: "E")) {
+                i += 1
+                if i < bytes.count && (bytes[i] == UInt8(ascii: "+") || bytes[i] == UInt8(ascii: "-")) { i += 1 }
+                guard digits() > 0 else { throw error("expected exponent digits") }
+                isFloat = true
+            }
+            let text = String(decoding: bytes[start ..< i], as: UTF8.self)
+            if !isFloat, let v = Int64(text) { return .int(v) }
+            guard let d = Double(text) else { throw error("invalid number") }
+            return .double(d)
+        }
+    }
+}

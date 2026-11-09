@@ -1,0 +1,147 @@
+// MppKit — Parallel: TBB-style data parallelism.
+//
+//   Parallel.for(0..<n) { i in ... }                       // tbb::parallel_for
+//   Parallel.forChunks(0..<n) { range in ... }             // tbb::blocked_range
+//   let squares = Parallel.map(0..<n) { i in i * i }       // parallel transform
+//   let total = Parallel.reduce(0..<n, 0, { $0 }, { $0 + $1 })  // tbb::parallel_reduce
+//   let s = Parallel.sum(0..<n) { Double($0) }
+//   Parallel.sort(&array)                                  // tbb::parallel_sort
+//
+// Work is split into chunks and run on all cores; small inputs run inline.
+
+import Dispatch
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+/// Wraps a value that is safe to share because the code using it partitions
+/// access (each task touches a disjoint part of a buffer).
+public struct UnsafeSendable<T>: @unchecked Sendable {
+    public let value: T
+    @inlinable public init(_ value: T) { self.value = value }
+}
+
+public enum Parallel {
+    /// Number of worker threads used (online CPU cores).
+    public static let threadCount: Int = max(1, Int(sysconf(Int32(_SC_NPROCESSORS_ONLN))))
+
+    @usableFromInline
+    static func chunking(_ count: Int, grain: Int?) -> (chunks: Int, size: Int) {
+        let g = max(1, grain ?? max(1, count / (threadCount * 8)))
+        let chunks = (count + g - 1) / g
+        return (chunks, g)
+    }
+
+    /// Calls `body` with disjoint sub-ranges covering `range`, in parallel.
+    @inlinable
+    public static func forChunks(_ range: Range<Int>, grain: Int? = nil, _ body: @Sendable (Range<Int>) -> Void) {
+        let n = range.count
+        if n == 0 { return }
+        let (chunks, size) = chunking(n, grain: grain)
+        if chunks == 1 { body(range); return }
+        let lo = range.lowerBound
+        DispatchQueue.concurrentPerform(iterations: chunks) { c in
+            let start = lo + c * size
+            body(start ..< min(start + size, range.upperBound))
+        }
+    }
+
+    /// Calls `body(i)` for every `i` in `range`, in parallel.
+    @inlinable
+    public static func `for`(_ range: Range<Int>, grain: Int? = nil, _ body: @Sendable (Int) -> Void) {
+        forChunks(range, grain: grain) { r in for i in r { body(i) } }
+    }
+
+    /// `[transform(i) for i in range]`, computed in parallel, in order.
+    @inlinable
+    public static func map<T>(_ range: Range<Int>, grain: Int? = nil, _ transform: @Sendable (Int) -> T) -> [T] {
+        let n = range.count
+        return [T](unsafeUninitializedCapacity: n) { buffer, initialized in
+            let out = UnsafeSendable(buffer.baseAddress!)
+            let lo = range.lowerBound
+            forChunks(range, grain: grain) { r in
+                for i in r { (out.value + (i - lo)).initialize(to: transform(i)) }
+            }
+            initialized = n
+        }
+    }
+
+    /// Parallel map over an array.
+    @inlinable
+    public static func map<S: Sendable, T>(_ items: [S], grain: Int? = nil, _ transform: @Sendable (S) -> T) -> [T] {
+        let box = UnsafeSendable(items)
+        return map(0 ..< items.count, grain: grain) { transform(box.value[$0]) }
+    }
+
+    /// Maps each index to a value and combines all values with `combine`
+    /// (which must be associative). `identity` is combine's neutral element.
+    @inlinable
+    public static func reduce<T: Sendable>(_ range: Range<Int>, _ identity: T, grain: Int? = nil,
+                                           _ map: @Sendable (Int) -> T,
+                                           _ combine: @Sendable (T, T) -> T) -> T {
+        let n = range.count
+        if n == 0 { return identity }
+        let (chunks, size) = chunking(n, grain: grain)
+        let partials = Parallel.map(0 ..< chunks, grain: 1) { c -> T in
+            let start = range.lowerBound + c * size
+            var acc = identity
+            for i in start ..< min(start + size, range.upperBound) { acc = combine(acc, map(i)) }
+            return acc
+        }
+        return partials.reduce(identity, combine)
+    }
+
+    /// Sum of `value(i)` over `range`, in parallel.
+    @inlinable
+    public static func sum<T: AdditiveArithmetic & Sendable>(_ range: Range<Int>, grain: Int? = nil,
+                                                              _ value: @Sendable (Int) -> T) -> T {
+        reduce(range, .zero, grain: grain, value, { $0 + $1 })
+    }
+
+    /// Sorts in place using all cores (chunk sorts, then pairwise merges).
+    public static func sort<T: Comparable & Sendable>(_ array: inout [T]) {
+        sort(&array, by: { $0 < $1 })
+    }
+
+    public static func sort<T: Sendable>(_ array: inout [T], by less: @escaping @Sendable (T, T) -> Bool) {
+        let n = array.count
+        if n < 16_384 || threadCount == 1 { array.sort(by: less); return }
+        var width = (n + threadCount - 1) / threadCount
+        array.withUnsafeMutableBufferPointer { buf in
+            let base = UnsafeSendable(buf.baseAddress!)
+            forChunks(0 ..< n, grain: width) { r in
+                var chunk = UnsafeMutableBufferPointer(start: base.value + r.lowerBound, count: r.count)
+                chunk.sort(by: less)
+            }
+        }
+        // Merge runs of `width`, doubling until one run remains.
+        var scratch = array
+        while width < n {
+            let w = width
+            let pairs = (n + 2 * w - 1) / (2 * w)
+            array.withUnsafeBufferPointer { src in
+                scratch.withUnsafeMutableBufferPointer { dst in
+                    let s = UnsafeSendable(src.baseAddress!), d = UnsafeSendable(dst.baseAddress!)
+                    Parallel.for(0 ..< pairs, grain: 1) { p in
+                        var i = p * 2 * w, k = i
+                        let mid = min(i + w, n), end = min(i + 2 * w, n)
+                        var j = mid
+                        while i < mid && j < end {
+                            if less(s.value[j], s.value[i]) { d.value[k] = s.value[j]; j += 1 }
+                            else { d.value[k] = s.value[i]; i += 1 }
+                            k += 1
+                        }
+                        while i < mid { d.value[k] = s.value[i]; i += 1; k += 1 }
+                        while j < end { d.value[k] = s.value[j]; j += 1; k += 1 }
+                    }
+                }
+            }
+            swap(&array, &scratch)
+            width *= 2
+        }
+    }
+}

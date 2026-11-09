@@ -1,0 +1,71 @@
+// Core memory features. Exits non-zero on failure.
+final class Counter { nonisolated(unsafe) static var live = 0; init() { Counter.live += 1 }; deinit { Counter.live -= 1 } }
+
+// Unique: move-only ownership, freed exactly once.
+do {
+    var u = Unique(Counter())
+    precondition(Counter.live == 1)
+    let moved = consume u          // `u` can't be used after this line (compile error if you try)
+    let c = moved.take()
+    precondition(Counter.live == 1)
+    _ = c
+    u = Unique(Counter())
+    _ = u
+}
+precondition(Counter.live == 0, "Unique leaked: \(Counter.live)")
+
+// place + unplace run init/deinit exactly once.
+let raw = UnsafeMutableRawBufferPointer.allocate(byteCount: 64, alignment: 16)
+let p = place raw Counter()
+precondition(Counter.live == 1)
+unplace p
+precondition(Counter.live == 0)
+raw.deallocate()
+
+// Pool runs deinit on release and on pool destruction.
+do {
+    let pool = Pool<Counter>(capacity: 4)
+    let a = place pool Counter()
+    _ = place pool Counter()
+    pool.release(a)
+    precondition(Counter.live == 1 && pool.count == 1)
+}
+precondition(Counter.live == 0, "Pool leaked")
+
+// Pool bitmap across several 64-bit words.
+do {
+    let pool = Pool<Int>(capacity: 130)
+    var ptrs: [UnsafeMutablePointer<Int>] = []
+    for i in 0..<130 { ptrs.append(place pool Int(i)) }
+    precondition(pool.isFull && Set(ptrs).count == 130)
+    pool.release(ptrs[129]); pool.release(ptrs[3]); pool.release(ptrs[70])
+    precondition(pool.count == 127)
+    let again = [place pool Int(0), place pool Int(0), place pool Int(0)]
+    precondition(Set(again) == Set([ptrs[3], ptrs[70], ptrs[129]]), "pool did not reuse freed slots")
+}
+
+// Bit-twiddling helpers.
+for v: UInt64 in [0, 1, 9, 10, 99, 100, 12345, 999_999_999, 1_000_000_000, UInt64.max] {
+    precondition(Bits.digitCount(v) == String(v).count, "digitCount(\(v))")
+}
+var digitBuf = [UInt8](repeating: 0, count: 24)
+digitBuf.withUnsafeMutableBufferPointer { b in
+    Bits.writeDigits(9_876_543_210, endingAt: b.baseAddress! + 10)
+    precondition(String(decoding: b[0..<10], as: UTF8.self) == "9876543210")
+}
+let chunk = Array("1234567x".utf8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+precondition(Bits.digitRun(chunk) == 7 && Bits.parse8(chunk, count: 7) == 1_234_567)
+
+// Arena alignment.
+let arena = Arena(chunkSize: 128)
+for _ in 0..<1000 {
+    let b = arena.allocate(byteCount: 3, alignment: 1)
+    let d = arena.allocate(byteCount: 8, alignment: 64)
+    precondition(Int(bitPattern: d) % 64 == 0 && Int(bitPattern: b) != 0)
+}
+arena.reset()
+precondition(arena.bytesAllocated == 0)
+
+// bitCast is checked.
+precondition(Memory.bitCast(1.0, to: UInt64.self) == 0x3FF0_0000_0000_0000)
+print("memory: ok")

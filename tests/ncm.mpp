@@ -1,0 +1,42 @@
+// NCM tests (part of `make test`): structure, passes, losses, bandwidth.
+import neural
+
+var config = NCMConfig(vocabulary: 12, length: 16)
+config.dims = 16
+config.codebookSize = 16
+precondition(config.levelLengths == [1, 2, 4, 8, 16] && config.levels == 5)
+
+Init.seed(3)
+let tokenizer = NCMTokenizer(config)
+let generator = NCMGenerator(config)
+let x = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4]
+
+// Quantization: one partial reconstruction per level, codes of each level's length.
+let q = tokenizer.quantize(tokenizer.encode(x), levels: config.levels)
+precondition(q.partials.count == config.levels + 1 && q.codes.map(\.count) == config.levelLengths)
+
+// Training lowers the reconstruction error.
+let opt = Adam(learningRate: 2e-3)
+let first = tokenizer.reconstructionLoss(x)
+for step in 0 ..< 150 {
+    tokenizer.zeroGrad()
+    let loss = tokenizer.loss(x, cutoff: 1 + step % config.levels)
+    loss.backward()
+    opt.update(tokenizer)
+}
+let last = tokenizer.reconstructionLoss(x)
+precondition(last < first, "reconstruction loss \(first) -> \(last)")
+
+// Generator: level weights sum to 1 (α = 0.5 favours longer levels), a
+// finite loss, K + 1 passes to generate.
+let w = generator.levelWeights
+precondition(abs(w.reduce(0, +) - 1) < 1e-4 && w[4] > w[0], "weights \(w)")
+precondition(generator.loss(x, tokenizer: tokenizer).item.isFinite)
+let (tokens, passes) = generator.generate(tokenizer: tokenizer)
+precondition(tokens.count == 16 && passes == config.levels + 1)
+
+// Bandwidth: weights are read once per level instead of once per token.
+let bw = NCMBandwidth(parameters: 1000, bytesPerParameter: 2, length: 1024, levels: 10)
+precondition(bw.autoregressiveBytes == 2_048_000 && bw.ncmBytes == 22_000)
+
+print("NCM: all tests passed (\(config.levels) levels, \(passes) passes for \(config.length) tokens)")

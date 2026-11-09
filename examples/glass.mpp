@@ -1,0 +1,35 @@
+// A Liquid Glass app in one file: `mpp examples/glass.mpp` (macOS).
+import liquidglass.mpp
+
+struct Counter: View {
+    @State private var count = 0
+    @State private var name = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("M++ × Liquid Glass").font(.largeTitle.bold())
+
+            Card {
+                Text("Count: \(count)").font(.title2.monospacedDigit())
+                HStack {
+                    MppButton("Add", systemImage: "plus") { count += 1 }
+                    MppButton("Reset", kind: .secondary) { count = 0 }
+                    Button("+10") { count += 10 }      // plain SwiftUI: glass automatically
+                }
+            }
+
+            MppTextField("Your name", text: $name)
+            if !name.isEmpty { Pill("Hello, \(name)!") }
+
+            Bar {
+                Image(systemName: "sparkles")
+                Text("Glass bar")
+                Spacer()
+                Text("\(count)").monospacedDigit().padding(8).liquidGlass(tint: .blue, cornerRadius: 10)
+            }
+        }
+        .padding(24)
+    }
+}
+
+app("Glass Counter", width: 520, height: 440) { Counter() }

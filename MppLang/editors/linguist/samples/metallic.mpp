@@ -1,0 +1,63 @@
+// Metallic: Metal-style shaders and engine in M++ — `mpp examples/metallic.mpp` writes metallic.png
+import Metallic
+
+struct VertexOut {
+    var position: float4 [[position]]
+    var color: float3
+    var uv: float2
+}
+
+struct Spin { var angle: Float }
+
+@vertex func triangleVertex(_ id: uint [[vertex_id]], _ u: Spin [[buffer(0)]]) -> VertexOut {
+    let corners: [float2] = [float2(0, 0.8), float2(-0.7, -0.6), float2(0.7, -0.6)]
+    let colors: [float3] = [float3(1, 0.2, 0.3), float3(0.2, 0.9, 0.4), float3(0.2, 0.4, 1)]
+    let p = corners[Int(id)]
+    let c = cos(u.angle), s = sin(u.angle)
+    return VertexOut(position: float4(p.x * c - p.y * s, p.x * s + p.y * c, 0, 1), color: colors[Int(id)], uv: p * 0.5 + 0.5)
+}
+
+@fragment func triangleFragment(_ v: VertexOut [[stage_in]], _ pos: float4 [[position]]) -> float4 {
+    let stripes = step(0.5, fract(pos.x / 16))
+    return float4(v.color * (0.8 + 0.2 * stripes), 1)
+}
+
+@kernel func vignette(_ src: texture2d<float> [[texture(0)]],
+                      _ dst: texture2d<float> [[texture(1)]],
+                      _ gid: uint2 [[thread_position_in_grid]]) {
+    let size = float2(Float(src.get_width()), Float(src.get_height()))
+    let uv = float2(gid) / size
+    let d = length(uv - 0.5)
+    dst.write(float4(src.read(gid).rgb * (1 - smoothstep(0.3, 0.75, d)), 1), gid)
+}
+
+let device = MetallicCreateSystemDefaultDevice()!
+let queue = device.makeCommandQueue()!
+let desc = MetallicTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: 320, height: 240, mipmapped: false)
+let scene = device.makeTexture(descriptor: desc)!, out = device.makeTexture(descriptor: desc)!
+
+var rp = MetallicRenderPipelineDescriptor()
+rp.vertexFunction = triangleVertexFunction
+rp.fragmentFunction = triangleFragmentFunction
+let render = try device.makeRenderPipelineState(descriptor: rp)
+let compute = try device.makeComputePipelineState(function: vignetteFunction)
+
+let cb = queue.makeCommandBuffer()!
+var pass = MetallicRenderPassDescriptor()
+pass.colorAttachments[0].texture = scene
+pass.colorAttachments[0].loadAction = .clear
+pass.colorAttachments[0].clearColor = MetallicClearColor(red: 0.95, green: 0.95, blue: 0.97, alpha: 1)
+let re = cb.makeRenderCommandEncoder(descriptor: pass)!
+re.setRenderPipelineState(render)
+re.setVertexBytes(Spin(angle: 0.3), index: 0)
+re.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+re.endEncoding()
+let ce = cb.makeComputeCommandEncoder()!
+ce.setComputePipelineState(compute)
+ce.setTexture(scene, index: 0)
+ce.setTexture(out, index: 1)
+ce.dispatchThreads(MetallicSize(width: 320, height: 240), threadsPerThreadgroup: MetallicSize(width: 16, height: 16))
+ce.endEncoding()
+cb.commit()
+cb.waitUntilCompleted()
+print(device.name, cb.status == .completed, out.savePNG("metallic.png"))

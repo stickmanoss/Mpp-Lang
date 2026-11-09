@@ -1,0 +1,7 @@
+import Foundation
+
+// A first Foundation program, using Swift syntax and Foundation.
+let language = "Mpp"
+let answer = 6 * 7
+print("Hello from \(language)!")
+print(answer)

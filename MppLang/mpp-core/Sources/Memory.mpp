@@ -1,0 +1,262 @@
+// MppCore — low-level memory tools.
+//
+// Arena      bump allocator; `place arena T(...)`; frees everything at once
+// Pool<T>    fixed-slot object pool with O(1) acquire/release
+// Unique<T>  move-only owning pointer (unique_ptr whose misuse is a compile error)
+// Memory     aligned allocation, stack buffers, byte views
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+// MARK: - Arena
+
+/// A bump allocator. Allocation is a pointer increment; `reset()` or deinit
+/// releases every allocation at once.
+///
+/// Like a C++ arena, it does not run destructors of values placed in it.
+/// Use `unplace` first for values that own resources.
+public final class Arena: PlacementTarget {
+    @usableFromInline var chunks: [(base: UnsafeMutableRawPointer, size: Int)] = []
+    @usableFromInline var cursor: UnsafeMutableRawPointer? = nil
+    @usableFromInline var limit: UnsafeMutableRawPointer? = nil
+    public let chunkSize: Int
+    @usableFromInline var allocatedCount: Int = 0
+    /// Bytes handed out since creation or the last reset.
+    public var bytesAllocated: Int { allocatedCount }
+
+    public init(chunkSize: Int = 64 * 1024) {
+        _mppRequire(chunkSize > 0, "Arena: chunkSize must be positive")
+        self.chunkSize = chunkSize
+    }
+
+    deinit { for c in chunks { c.base.deallocate() } }
+
+    /// Uninitialized, aligned bytes that live until `reset()` or deinit.
+    @inlinable
+    public func allocate(byteCount: Int, alignment: Int) -> UnsafeMutableRawPointer {
+        _mppRequire(alignment > 0 && alignment & (alignment - 1) == 0,
+                     "Arena: alignment must be a power of two")
+        if let c = cursor, let l = limit {
+            let aligned = UnsafeMutableRawPointer(bitPattern: (Int(bitPattern: c) + alignment - 1) & ~(alignment - 1))!
+            if aligned + byteCount <= l {
+                cursor = aligned + byteCount
+                allocatedCount += byteCount
+                return aligned
+            }
+        }
+        return slowAllocate(byteCount: byteCount, alignment: alignment)
+    }
+
+    @usableFromInline
+    func slowAllocate(byteCount: Int, alignment: Int) -> UnsafeMutableRawPointer {
+        let size = max(chunkSize, byteCount + alignment)
+        let base = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: max(alignment, 16))
+        chunks.append((base, size))
+        cursor = base
+        limit = base + size
+        return allocate(byteCount: byteCount, alignment: alignment)
+    }
+
+    /// Uninitialized storage for `count` values of `T`.
+    @inlinable
+    public func allocate<T>(_ type: T.Type, count: Int = 1) -> UnsafeMutableBufferPointer<T> {
+        let raw = allocate(byteCount: MemoryLayout<T>.stride * count, alignment: MemoryLayout<T>.alignment)
+        return UnsafeMutableBufferPointer(start: raw.bindMemory(to: T.self, capacity: count), count: count)
+    }
+
+    /// Copies `values` into the arena.
+    @inlinable
+    public func copy<C: Collection>(_ values: C) -> UnsafeMutableBufferPointer<C.Element> {
+        let buf = allocate(C.Element.self, count: values.count)
+        _ = buf.initialize(from: values)
+        return buf
+    }
+
+    /// Releases all allocations but keeps the largest chunk for reuse.
+    public func reset() {
+        guard let keep = chunks.max(by: { $0.size < $1.size }) else { return }
+        for c in chunks where c.base != keep.base { c.base.deallocate() }
+        chunks = [keep]
+        cursor = keep.base
+        limit = keep.base + keep.size
+        allocatedCount = 0
+    }
+
+    @inlinable
+    public func placementStorage(size: Int, alignment: Int) -> UnsafeMutableRawPointer {
+        allocate(byteCount: size, alignment: alignment)
+    }
+}
+
+/// Runs `body` with a temporary arena that is freed when it returns.
+@inlinable
+public func withArena<R>(chunkSize: Int = 64 * 1024, _ body: (Arena) throws -> R) rethrows -> R {
+    let arena = Arena(chunkSize: chunkSize)
+    return try withExtendedLifetime(arena) { try body(arena) }
+}
+
+// MARK: - Pool
+
+/// Fixed-capacity pool of slots for values of `Element`.
+///
+///     let pool = Pool<Particle>(capacity: 10_000)
+///     let p = place pool Particle(x: 0, y: 0)
+///     pool.release(p)          // runs deinit, slot is reusable
+public final class Pool<Element>: PlacementTarget {
+    // Free slots are a bitmap (1 = free). Acquire = find the first non-zero
+    // word, take its lowest set bit (trailingZeroBitCount), clear it with
+    // w & (w - 1). Release sets the bit back. Double release is a bit test.
+    @usableFromInline let slots: UnsafeMutableRawPointer
+    @usableFromInline let slotSize: Int
+    @usableFromInline let free: UnsafeMutablePointer<UInt64>
+    @usableFromInline let words: Int
+    @usableFromInline let liveCount: UnsafeMutablePointer<Int>
+    @usableFromInline let hint: UnsafeMutablePointer<Int>   // first word that may have a free bit
+    public let capacity: Int
+
+    public init(capacity: Int) {
+        _mppRequire(capacity > 0, "Pool: capacity must be positive")
+        self.capacity = capacity
+        slotSize = max(MemoryLayout<Element>.stride, 1)
+        slots = .allocate(byteCount: slotSize * capacity, alignment: max(MemoryLayout<Element>.alignment, 16))
+        words = (capacity + 63) >> 6
+        free = .allocate(capacity: words)
+        free.initialize(repeating: ~0, count: words)
+        let tail = capacity & 63
+        if tail != 0 { free[words - 1] = (1 << UInt64(tail)) - 1 }   // bits past capacity are never free
+        liveCount = .allocate(capacity: 1); liveCount.initialize(to: 0)
+        hint = .allocate(capacity: 1); hint.initialize(to: 0)
+    }
+
+    deinit {
+        for w in 0..<words {
+            var used = ~free[w]
+            if w == words - 1 && capacity & 63 != 0 { used &= (1 << UInt64(capacity & 63)) - 1 }
+            while used != 0 {   // visit each set bit: lowest first, then clear it
+                let i = (w << 6) | used.trailingZeroBitCount
+                (slots + i * slotSize).assumingMemoryBound(to: Element.self).deinitialize(count: 1)
+                used &= used &- 1
+            }
+        }
+        slots.deallocate()
+        free.deallocate()
+        liveCount.deallocate()
+        hint.deallocate()
+    }
+
+    public var count: Int { liveCount.pointee }
+    public var isFull: Bool { liveCount.pointee == capacity }
+
+    @inlinable
+    public func placementStorage(size: Int, alignment: Int) -> UnsafeMutableRawPointer {
+        _mppRequire(size <= slotSize && alignment <= max(MemoryLayout<Element>.alignment, 16),
+                    "place: value does not fit a Pool<\(Element.self)> slot")
+        var w = hint.pointee
+        while w < words && free[w] == 0 { w &+= 1 }
+        if w == words { _mppFail("Pool<\(Element.self)> is full (\(capacity) slots)") }
+        let bits = free[w]
+        free[w] = bits & (bits &- 1)
+        hint.pointee = w
+        liveCount.pointee &+= 1
+        return slots + ((w << 6) | bits.trailingZeroBitCount) * slotSize
+    }
+
+    /// Deinitializes the value and returns its slot to the pool.
+    public func release(_ p: UnsafeMutablePointer<Element>) {
+        let offset = UnsafeMutableRawPointer(p) - slots
+        _mppRequire(offset >= 0 && offset % slotSize == 0 && offset / slotSize < capacity,
+                    "Pool.release: pointer does not belong to this pool")
+        let i = offset / slotSize
+        let bit: UInt64 = 1 << UInt64(i & 63)
+        _mppRequire(free[i >> 6] & bit == 0, "Pool.release: slot \(i) released twice")
+        p.deinitialize(count: 1)
+        free[i >> 6] |= bit
+        if i >> 6 < hint.pointee { hint.pointee = i >> 6 }
+        liveCount.pointee &-= 1
+    }
+}
+
+// MARK: - Unique
+
+/// A move-only owning pointer to a heap value (C++ `std::unique_ptr`).
+///
+/// It cannot be copied, and using it after `consume` or `take()` is a
+/// compile-time error, not a null dereference at run time.
+public struct Unique<T: ~Copyable>: ~Copyable {
+    @usableFromInline let pointer: UnsafeMutablePointer<T>
+
+    @inlinable
+    public init(_ value: consuming T) {
+        pointer = .allocate(capacity: 1)
+        pointer.initialize(to: value)
+    }
+
+    /// The owned value, read and modified in place.
+    @inlinable
+    public var value: T {
+        unsafeAddress { UnsafePointer(pointer) }
+        unsafeMutableAddress { pointer }
+    }
+
+    /// Moves the value out and frees the box.
+    public consuming func take() -> T {
+        let v = pointer.move()
+        pointer.deallocate()
+        discard self
+        return v
+    }
+
+    @inlinable
+    deinit {
+        pointer.deinitialize(count: 1)
+        pointer.deallocate()
+    }
+}
+
+// MARK: - Memory helpers
+
+public enum Memory {
+    /// Uninitialized bytes with the requested power-of-two alignment
+    /// (e.g. 64 for a cache line, 4096 for a page). Free with `deallocate()`.
+    @inlinable
+    public static func allocate(bytes: Int, alignment: Int) -> UnsafeMutableRawBufferPointer {
+        .allocate(byteCount: bytes, alignment: alignment)
+    }
+
+    /// Stack storage (like C `alloca` or a VLA) that is valid only inside `body`.
+    /// Large requests fall back to the heap automatically.
+    @inlinable
+    public static func withStackBuffer<T, R>(
+        of type: T.Type, count: Int, _ body: (UnsafeMutableBufferPointer<T>) throws -> R
+    ) rethrows -> R {
+        try withUnsafeTemporaryAllocation(of: type, capacity: count, body)
+    }
+
+    /// Raw stack bytes, valid only inside `body`; can be used with `place`.
+    @inlinable
+    public static func withStackBytes<R>(
+        _ byteCount: Int, alignment: Int = 16, _ body: (UnsafeMutableRawBufferPointer) throws -> R
+    ) rethrows -> R {
+        try withUnsafeTemporaryAllocation(byteCount: byteCount, alignment: alignment, body)
+    }
+
+    /// Reinterprets the bits of a value as another type of identical size.
+    /// Size mismatch is a trap, not undefined behaviour.
+    @inlinable
+    public static func bitCast<From, To>(_ value: From, to: To.Type) -> To {
+        _mppRequire(MemoryLayout<From>.size == MemoryLayout<To>.size,
+                     "bitCast: \(From.self) is \(MemoryLayout<From>.size) bytes, \(To.self) is \(MemoryLayout<To>.size)")
+        return unsafeBitCast(value, to: To.self)
+    }
+
+    /// Size, stride and alignment of a type, for layout-sensitive code.
+    @inlinable
+    public static func layout<T>(of: T.Type) -> (size: Int, stride: Int, alignment: Int) {
+        (MemoryLayout<T>.size, MemoryLayout<T>.stride, MemoryLayout<T>.alignment)
+    }
+}

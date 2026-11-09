@@ -1,0 +1,244 @@
+// MppKit — Log: spdlog-style logging.
+//
+//   logger.info("server started on port {}", port)
+//   logger.warn("{} retries left", n)
+//   logger.level = .debug
+//   let audit = Logger("audit", sinks: [FileSink("audit.log"), ConsoleSink()])
+//   audit.pattern = "[%H:%M:%S.%e] [%n] [%l] %v"
+//
+// Messages below the logger's level are not even formatted. Sinks are
+// thread-safe. Pattern tokens: %Y %m %d %H %M %S %e (millis) %l (level)
+// %L (short level) %n (logger name) %v (message) %t (thread id) %% .
+
+import Dispatch
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+public enum LogLevel: Int, Comparable, Sendable, CaseIterable {
+    case trace, debug, info, warn, error, critical, off
+
+    public static func < (a: LogLevel, b: LogLevel) -> Bool { a.rawValue < b.rawValue }
+
+    public var name: String { ["trace", "debug", "info", "warning", "error", "critical", "off"][rawValue] }
+    var short: String { ["T", "D", "I", "W", "E", "C", "O"][rawValue] }
+    var color: String { ["\u{1B}[37m", "\u{1B}[36m", "\u{1B}[32m", "\u{1B}[33;1m", "\u{1B}[31;1m", "\u{1B}[1;41m", ""][rawValue] }
+}
+
+/// A pthread mutex (works on every platform M++ targets).
+public final class Lock: @unchecked Sendable {
+    let m: UnsafeMutablePointer<pthread_mutex_t>
+    public init() {
+        m = .allocate(capacity: 1)
+        pthread_mutex_init(m, nil)
+    }
+    deinit {
+        pthread_mutex_destroy(m)
+        m.deallocate()
+    }
+    @inlinable public func locked<R>(_ body: () throws -> R) rethrows -> R {
+        lock(); defer { unlock() }
+        return try body()
+    }
+    @usableFromInline func lock() { pthread_mutex_lock(m) }
+    @usableFromInline func unlock() { pthread_mutex_unlock(m) }
+}
+
+public struct LogRecord: Sendable {
+    public let level: LogLevel
+    public let logger: String
+    public let message: String
+    public let seconds: Int       // since the epoch
+    public let millis: Int
+}
+
+public protocol LogSink: AnyObject, Sendable {
+    func write(_ record: LogRecord, formatted: String)
+    func flush()
+}
+
+/// Colored output to stderr (colors only when it is a terminal).
+public final class ConsoleSink: LogSink, @unchecked Sendable {
+    let lock = Lock()
+    let fd: Int32
+    let colors: Bool
+    public init(stdout: Bool = false) {
+        fd = stdout ? 1 : 2
+        colors = isatty(fd) != 0
+    }
+    public func write(_ record: LogRecord, formatted: String) {
+        var line = formatted
+        if colors {
+            line = _replaceFirst(in: line, "[\(record.level.name)]", with: "[\(record.level.color)\(record.level.name)\u{1B}[0m]")
+        }
+        line += "\n"
+        lock.locked { _ = line.withCString { Glibc_or_Darwin_write(fd, $0, strlen($0)) } }
+    }
+    public func flush() {}
+}
+
+/// Appends to a file.
+public final class FileSink: LogSink, @unchecked Sendable {
+    let lock = Lock()
+    let path: String
+    var fd: Int32
+    var size: Int
+    let maxBytes: Int
+    let maxFiles: Int
+
+    /// With `maxBytes`, rotates path -> path.1 -> ... -> path.<maxFiles> (spdlog's rotating sink).
+    public init(_ path: String, maxBytes: Int = 0, maxFiles: Int = 3) {
+        self.path = path
+        self.maxBytes = maxBytes
+        self.maxFiles = maxFiles
+        fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o644)
+        var st = stat()
+        size = fd >= 0 && fstat(fd, &st) == 0 ? Int(st.st_size) : 0
+    }
+    deinit { if fd >= 0 { close(fd) } }
+
+    public func write(_ record: LogRecord, formatted: String) {
+        let line = formatted + "\n"
+        lock.locked {
+            if maxBytes > 0 && size + line.utf8.count > maxBytes { rotate() }
+            guard fd >= 0 else { return }
+            _ = line.withCString { Glibc_or_Darwin_write(fd, $0, strlen($0)) }
+            size += line.utf8.count
+        }
+    }
+
+    func rotate() {
+        if fd >= 0 { close(fd) }
+        for k in stride(from: maxFiles - 1, through: 1, by: -1) { rename("\(path).\(k)", "\(path).\(k + 1)") }
+        rename(path, "\(path).1")
+        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o644)
+        size = 0
+    }
+
+    public func flush() { lock.locked { if fd >= 0 { fsync(fd) } } }
+}
+
+/// Keeps records in memory (handy in tests).
+public final class MemorySink: LogSink, @unchecked Sendable {
+    let lock = Lock()
+    var stored: [String] = []
+    public init() {}
+    public func write(_ record: LogRecord, formatted: String) { lock.locked { stored.append(formatted) } }
+    public func flush() {}
+    public var lines: [String] { lock.locked { stored } }
+}
+
+func _replaceFirst(in s: String, _ target: String, with replacement: String) -> String {
+    let a = Array(s.utf8), t = Array(target.utf8)
+    guard !t.isEmpty, a.count >= t.count else { return s }
+    for i in 0 ... a.count - t.count where a[i] == t[0] && Array(a[i ..< i + t.count]) == t {
+        return String(decoding: a[..<i], as: UTF8.self) + replacement + String(decoding: a[(i + t.count)...], as: UTF8.self)
+    }
+    return s
+}
+
+@inline(__always) func Glibc_or_Darwin_write(_ fd: Int32, _ p: UnsafePointer<CChar>, _ n: Int) -> Int { write(fd, p, n) }
+
+public final class Logger: @unchecked Sendable {
+    public let name: String
+    let lock = Lock()
+    var _level: LogLevel
+    var _sinks: [any LogSink]
+    var _pattern: String
+
+    public init(_ name: String, level: LogLevel = .info, sinks: [any LogSink] = [ConsoleSink()],
+                pattern: String = "[%Y-%m-%d %H:%M:%S.%e] [%l] %v") {
+        self.name = name
+        _level = level
+        _sinks = sinks
+        _pattern = pattern
+    }
+
+    public var level: LogLevel {
+        get { lock.locked { _level } }
+        set { lock.locked { _level = newValue } }
+    }
+    public var pattern: String {
+        get { lock.locked { _pattern } }
+        set { lock.locked { _pattern = newValue } }
+    }
+    public var sinks: [any LogSink] {
+        get { lock.locked { _sinks } }
+        set { lock.locked { _sinks = newValue } }
+    }
+
+    @inlinable public func shouldLog(_ l: LogLevel) -> Bool { l >= level && l != .off }
+
+    public func log<each A>(_ l: LogLevel, _ fmt: String, _ args: repeat each A) {
+        guard shouldLog(l) else { return }
+        var values: [Any] = []
+        repeat values.append(each args)
+        emit(l, _format(fmt, values))
+    }
+
+    public func trace<each A>(_ fmt: String, _ args: repeat each A) { log(.trace, fmt, repeat each args) }
+    public func debug<each A>(_ fmt: String, _ args: repeat each A) { log(.debug, fmt, repeat each args) }
+    public func info<each A>(_ fmt: String, _ args: repeat each A) { log(.info, fmt, repeat each args) }
+    public func warn<each A>(_ fmt: String, _ args: repeat each A) { log(.warn, fmt, repeat each args) }
+    public func error<each A>(_ fmt: String, _ args: repeat each A) { log(.error, fmt, repeat each args) }
+    public func critical<each A>(_ fmt: String, _ args: repeat each A) { log(.critical, fmt, repeat each args) }
+
+    public func flush() { for s in sinks { s.flush() } }
+
+    func emit(_ l: LogLevel, _ message: String) {
+        var ts = timespec()
+        clock_gettime(CLOCK_REALTIME, &ts)
+        let record = LogRecord(level: l, logger: name, message: message, seconds: Int(ts.tv_sec), millis: Int(ts.tv_nsec) / 1_000_000)
+        let (pat, targets) = lock.locked { (_pattern, _sinks) }
+        let line = Logger.render(pat, record)
+        for s in targets { s.write(record, formatted: line) }
+    }
+
+    static func two(_ v: Int32) -> String { v < 10 ? "0\(v)" : "\(v)" }
+
+    static func render(_ pattern: String, _ r: LogRecord) -> String {
+        var t = time_t(r.seconds)
+        var tmv = tm()
+        localtime_r(&t, &tmv)
+        var out = ""
+        var it = pattern.makeIterator()
+        while let c = it.next() {
+            guard c == "%" else { out.append(c); continue }
+            guard let k = it.next() else { out.append("%"); break }
+            switch k {
+            case "Y": out += String(tmv.tm_year + 1900)
+            case "m": out += two(tmv.tm_mon + 1)
+            case "d": out += two(tmv.tm_mday)
+            case "H": out += two(tmv.tm_hour)
+            case "M": out += two(tmv.tm_min)
+            case "S": out += two(tmv.tm_sec)
+            case "e": out += r.millis < 10 ? "00\(r.millis)" : r.millis < 100 ? "0\(r.millis)" : "\(r.millis)"
+            case "l": out += r.level.name
+            case "L": out += r.level.short
+            case "n": out += r.logger
+            case "v": out += r.message
+            case "t": out += String(pthread_self_id())
+            case "%": out += "%"
+            default: out.append("%"); out.append(k)
+            }
+        }
+        return out
+    }
+}
+
+func pthread_self_id() -> UInt64 {
+    #if canImport(Darwin)
+    var tid: UInt64 = 0
+    pthread_threadid_np(nil, &tid)
+    return tid
+    #else
+    return UInt64(truncatingIfNeeded: pthread_self())
+    #endif
+}
+
+/// The default logger (stderr, level info).
+public let logger = Logger("default")

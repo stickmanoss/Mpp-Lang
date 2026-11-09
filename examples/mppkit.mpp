@@ -1,0 +1,34 @@
+// A tour of MppKit (C++ library equivalents): `mpp examples/mppkit.mpp`
+import MppKit
+
+// {fmt}
+println("{:<10}|{:^10}|{:>10}", "left", "center", "right")
+println("pi ≈ {:.4f}, 255 = {:#x}, big = {:,}", 3.14159265, 255, 9_876_543_210)
+
+// spdlog
+logger.info("starting with {} threads", Parallel.threadCount)
+
+// nlohmann/json
+var config: JSON = ["name": "demo", "layers": [2, 8, 1]]
+config.learningRate = 0.5
+println("config: {}", config.dump())
+
+// Eigen
+let a: Mat = [[4, 1], [2, 3]]
+println("det = {}, solve = {}", a.determinant, try a.solve([[1], [2]]).storage)
+
+// TBB
+let total = Parallel.sum(0 ..< 10_000_000) { Double($0) }
+println("parallel sum = {:,.0f}", total)
+
+// Abseil
+var counts = MppDictionary<String, Int>()
+for word in "the quick brown fox jumps over the lazy dog the end".split(separator: " ") {
+    counts[String(word), default: 0] += 1
+}
+println("'the' appears {} times", counts["the"] ?? 0)
+
+// Google Benchmark
+var rng = PCG32(seed: 1)
+let m = Mat.random(256, 256, using: &rng)
+benchmark("256x256 matmul") { blackHole(m * m) }

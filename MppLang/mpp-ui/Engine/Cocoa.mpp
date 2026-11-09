@@ -1,0 +1,304 @@
+// MppUI engine — macOS window backend (AppKit) and the system font (SF)
+// through Core Text, in M++.
+//
+// The view draws the engine's back buffer as a CGImage and turns AppKit
+// events into MppUIEvents. Retina screens get a buffer at the window's
+// backing scale. MppUI's run loop calls in on the main thread.
+
+#if canImport(AppKit)
+
+import AppKit
+import CoreText
+
+// MARK: - State
+
+final class _CocoaState {
+    var app: NSApplication? = nil
+    var window: NSWindow? = nil
+    var view: _MppEngineView? = nil
+    var delegate: _MppWindowDelegate? = nil
+    var queue: [MppUIEvent] = []
+    var queueHead = 0
+    var closed = false
+
+    func push(_ e: MppUIEvent) { queue.append(e) }
+    func pop() -> MppUIEvent? {
+        guard queueHead < queue.count else { return nil }
+        let e = queue[queueHead]
+        queueHead += 1
+        if queueHead == queue.count { queue.removeAll(keepingCapacity: true); queueHead = 0 }
+        return e
+    }
+    var isEmpty: Bool { queueHead >= queue.count }
+}
+
+nonisolated(unsafe) let _cocoa = _CocoaState()
+
+func _modifiers(_ event: NSEvent) -> Int32 {
+    let f = event.modifierFlags
+    return (f.contains(.shift) ? 1 : 0) | (f.contains(.control) ? 2 : 0) | (f.contains(.option) ? 4 : 0) | (f.contains(.command) ? 8 : 0)
+}
+
+// MARK: - The view
+
+final class _MppEngineView: NSView {
+    override var isFlipped: Bool { true }                 // y grows downward, like the engine
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let w = _g.width, h = _g.height
+        let bytes = w * h * 4
+        guard let data = CGDataProvider(dataInfo: nil, data: UnsafeRawPointer(_g.pixels), size: bytes, releaseData: { _, _, _ in }),
+              let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  // 0xAARRGGBB words in little-endian memory are B,G,R,A bytes.
+                                  bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue),
+                                  provider: data, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        else { return }
+        // The view is flipped; CGContext.draw draws bottom-up, so flip back.
+        ctx.saveGState()
+        ctx.translateBy(x: 0, y: bounds.height)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.interpolationQuality = .none
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: bounds.width, height: bounds.height))
+        ctx.restoreGState()
+    }
+
+    func mouse(_ event: NSEvent, _ type: MppUIEventType) {
+        var e = MppUIEvent(type)
+        let p = convert(event.locationInWindow, from: nil)
+        e.x = Float(p.x)
+        e.y = Float(p.y)
+        e.modifiers = _modifiers(event)
+        _cocoa.push(e)
+    }
+    override func mouseDown(with event: NSEvent) { mouse(event, MPPUI_EVENT_MOUSE_DOWN) }
+    override func mouseUp(with event: NSEvent) { mouse(event, MPPUI_EVENT_MOUSE_UP) }
+    override func mouseDragged(with event: NSEvent) { mouse(event, MPPUI_EVENT_MOUSE_MOVE) }
+    override func mouseMoved(with event: NSEvent) { mouse(event, MPPUI_EVENT_MOUSE_MOVE) }
+
+    override func scrollWheel(with event: NSEvent) {
+        var e = MppUIEvent(MPPUI_EVENT_SCROLL)
+        let p = convert(event.locationInWindow, from: nil)
+        e.x = Float(p.x)
+        e.y = Float(p.y)
+        let k: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 10
+        e.dx = Float(event.scrollingDeltaX * k)
+        e.dy = Float(event.scrollingDeltaY * k)
+        _cocoa.push(e)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let mods = _modifiers(event)
+        let chars = event.characters ?? ""
+        if mods & 8 != 0 && (chars == "q" || chars == "w") {
+            _cocoa.closed = true
+            _cocoa.push(MppUIEvent(MPPUI_EVENT_CLOSE))
+            return
+        }
+        let key: MppUIKey
+        switch event.keyCode {
+        case 51: key = MPPUI_KEY_BACKSPACE
+        case 117: key = MPPUI_KEY_DELETE
+        case 36, 76: key = MPPUI_KEY_RETURN
+        case 48: key = MPPUI_KEY_TAB
+        case 53: key = MPPUI_KEY_ESCAPE
+        case 123: key = MPPUI_KEY_LEFT
+        case 124: key = MPPUI_KEY_RIGHT
+        case 126: key = MPPUI_KEY_UP
+        case 125: key = MPPUI_KEY_DOWN
+        case 115: key = MPPUI_KEY_HOME
+        case 119: key = MPPUI_KEY_END
+        default: key = MPPUI_KEY_OTHER
+        }
+        var e = MppUIEvent()
+        e.modifiers = mods
+        if key != MPPUI_KEY_OTHER {
+            e.type = Int32(MPPUI_EVENT_KEY.rawValue)
+            e.key = Int32(key.rawValue)
+            _cocoa.push(e)
+            return
+        }
+        if let first = chars.utf8.first, first >= 32, mods & (2 | 8) == 0 {
+            e.type = Int32(MPPUI_EVENT_TEXT.rawValue)
+            e.setText(chars.utf8)
+            _cocoa.push(e)
+        }
+    }
+}
+
+final class _MppWindowDelegate: NSObject, NSWindowDelegate {
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        _cocoa.closed = true
+        _cocoa.push(MppUIEvent(MPPUI_EVENT_CLOSE))
+        return false                                       // the app loop closes the window itself
+    }
+    func windowDidResize(_ notification: Notification) {
+        _syncSize()
+        _cocoa.push(MppUIEvent(MPPUI_EVENT_RESIZE))
+    }
+}
+
+@MainActor func _syncSize() {
+    guard let view = _cocoa.view, let window = _cocoa.window else { return }
+    var scale = Float(window.backingScaleFactor)
+    if let s = _env("MPP_UI_SCALE"), let v = Float(s), v > 0 { scale = v }
+    _g.scale = scale > 0 ? scale : 1
+    _g.resize(_int((Float(view.bounds.width) * _g.scale).rounded()), _int((Float(view.bounds.height) * _g.scale).rounded()))
+}
+
+// MARK: - Backend
+
+func _backendOpen(_ title: String, _ width: Int, _ height: Int) -> Int32 {
+    MainActor.assumeIsolated {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)                  // Dock icon, menu bar, key window
+
+        // A minimal menu bar with Quit (⌘Q).
+        let menubar = NSMenu()
+        let appItem = NSMenuItem()
+        menubar.addItem(appItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appItem.submenu = appMenu
+        app.mainMenu = menubar
+
+        let rect = NSRect(x: 0, y: 0, width: width, height: height)
+        let window = NSWindow(contentRect: rect, styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                              backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.title = title
+        let view = _MppEngineView(frame: rect)
+        window.contentView = view
+        window.acceptsMouseMovedEvents = true
+        let delegate = _MppWindowDelegate()
+        window.delegate = delegate
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(view)
+        app.finishLaunching()
+        app.activate()
+        _cocoa.app = app
+        _cocoa.window = window
+        _cocoa.view = view
+        _cocoa.delegate = delegate
+        _syncSize()
+        return 0
+    }
+}
+
+func _backendSetTitle(_ title: String) {
+    MainActor.assumeIsolated { _cocoa.window?.title = title }
+}
+
+func _backendPresent() {
+    MainActor.assumeIsolated {
+        guard let view = _cocoa.view else { return }
+        view.needsDisplay = true
+        view.displayIfNeeded()
+    }
+}
+
+func _backendNextEvent(_ e: UnsafeMutablePointer<MppUIEvent>, _ timeoutMs: Int) -> Int32 {
+    // The event comes back out of the main-actor closure; the pointer stays outside it.
+    let next: MppUIEvent? = MainActor.assumeIsolated {
+        guard let app = _cocoa.app else { return nil }
+        let deadline = Date(timeIntervalSinceNow: Double(max(timeoutMs, 0)) / 1000)
+        while _cocoa.isEmpty {
+            if let ev = app.nextEvent(matching: .any, until: deadline, inMode: .default, dequeue: true) {
+                app.sendEvent(ev)
+                app.updateWindows()
+            } else {
+                break                                      // timed out
+            }
+            if Date() >= deadline { break }
+        }
+        return _cocoa.pop()
+    }
+    guard let next else { return 0 }
+    e.pointee = next
+    return 1
+}
+
+func _backendClose() {
+    MainActor.assumeIsolated {
+        if let window = _cocoa.window { window.orderOut(nil); window.close() }
+        _cocoa.window = nil
+        _cocoa.view = nil
+        _cocoa.delegate = nil
+    }
+}
+
+// MARK: - The system font (SF Pro / SF Mono) as glyph atlases
+
+nonisolated(unsafe) var _systemFonts: [Int: _Font] = [:]
+nonisolated(unsafe) var _systemFontFailed: Set<Int> = []
+
+func _makeSystemFont(_ which: Int) -> CTFont? {
+    let size: CGFloat = 32
+    if which == Int(MPPUI_FONT_MONO.rawValue) { return CTFontCreateUIFontForLanguage(.userFixedPitch, size, nil) }
+    guard let base = CTFontCreateUIFontForLanguage(.system, size, nil) else { return nil }
+    if which != Int(MPPUI_FONT_BOLD.rawValue) { return base }
+    // Semibold, the weight SwiftUI uses for headlines.
+    let traits: [CFString: Any] = [kCTFontWeightTrait: 0.3 as CGFloat]
+    let attributes: [CFString: Any] = [kCTFontTraitsAttribute: traits]
+    let descriptor = CTFontDescriptorCreateCopyWithAttributes(CTFontCopyFontDescriptor(base), attributes as CFDictionary)
+    return CTFontCreateWithFontDescriptor(descriptor, size, nil)
+}
+
+/// The system font for MppUIFont `which` (nil: use the embedded font).
+func _backendFont(_ which: Int) -> _Font? {
+    if which < 0 || which > 2 || _env("MPP_UI_EMBEDDED_FONT") != nil { return nil }
+    if let f = _systemFonts[which] { return f }
+    if _systemFontFailed.contains(which) { return nil }
+    guard let font = _makeSystemFont(which) else { _systemFontFailed.insert(which); return nil }
+    // The same characters as the embedded atlas.
+    let embedded = which == Int(MPPUI_FONT_BOLD.rawValue) ? _Font.bold : which == Int(MPPUI_FONT_MONO.rawValue) ? _Font.mono : _Font.sans
+    var glyphs: [_Font.Glyph] = []
+    var pixels: [UInt8] = []
+    let gray = CGColorSpaceCreateDeviceGray()
+    for source in embedded.glyphs {
+        let cp = source.codepoint
+        var out = _Font.Glyph(codepoint: cp, width: 0, height: 0, left: 0, top: 0, advance: 0, offset: pixels.count)
+        var ch = UniChar(truncatingIfNeeded: cp)
+        var glyph: CGGlyph = 0
+        if cp > 0xFFFF || !CTFontGetGlyphsForCharacters(font, &ch, &glyph, 1) {
+            var fallback = source                          // the embedded glyph's metrics, no pixels
+            fallback.width = 0
+            glyphs.append(fallback)
+            continue
+        }
+        var advance = CGSize.zero
+        CTFontGetAdvancesForGlyphs(font, .horizontal, &glyph, &advance, 1)
+        let box = CTFontGetBoundingRectsForGlyphs(font, .horizontal, &glyph, nil, 1)
+        out.advance = Int(advance.width.rounded())
+        if box.width > 0 && box.height > 0 {
+            let left = Int(box.minX.rounded(.down)) - 1, bottom = Int(box.minY.rounded(.down)) - 1
+            let right = Int(box.maxX.rounded(.up)) + 1, top = Int(box.maxY.rounded(.up)) + 1
+            let w = right - left, h = top - bottom
+            var buf = [UInt8](repeating: 0, count: w * h)
+            buf.withUnsafeMutableBytes { raw in
+                guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
+                                          space: gray, bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
+                ctx.setFillColor(gray: 1, alpha: 1)
+                ctx.setAllowsFontSmoothing(false)
+                var position = CGPoint(x: -CGFloat(left), y: -CGFloat(bottom))
+                CTFontDrawGlyphs(font, &glyph, &position, 1, ctx)
+            }
+            out.width = w
+            out.height = h
+            out.left = left
+            out.top = top
+            pixels += buf
+        }
+        glyphs.append(out)
+    }
+    let ascent = Int(CTFontGetAscent(font).rounded()), descent = Int(CTFontGetDescent(font).rounded())
+    let f = _Font(glyphs: glyphs, pixels: pixels, ascent: ascent, descent: descent, lineHeight: ascent + descent)
+    _systemFonts[which] = f
+    return f
+}
+
+#endif

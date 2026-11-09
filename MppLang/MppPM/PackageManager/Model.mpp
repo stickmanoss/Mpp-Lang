@@ -1,0 +1,245 @@
+// MppPM (mpp pm) — package model and Package.mpp evaluation.
+//
+// As in SwiftPM, a manifest is a program: Package.mpp is compiled against
+// PackageDescription and run, and the package it declares comes back as
+// JSON. Results are cached by manifest content.
+
+import MppKit
+
+// MARK: - Versions
+
+struct Version: Comparable, Hashable, CustomStringConvertible {
+    var major = 0, minor = 0, patch = 0
+    var prerelease = ""
+
+    init(_ major: Int, _ minor: Int, _ patch: Int, prerelease: String = "") {
+        self.major = major; self.minor = minor; self.patch = patch; self.prerelease = prerelease
+    }
+
+    /// Accepts "1.2.3", "v1.2", "1.0.0-beta+build".
+    init?(_ raw: String) {
+        var s = Substring(raw)
+        if s.first == "v" || s.first == "V" { s = s.dropFirst() }
+        if let plus = s.firstIndex(of: "+") { s = s[..<plus] }
+        if let dash = s.firstIndex(of: "-") { prerelease = String(s[s.index(after: dash)...]); s = s[..<dash] }
+        let parts = s.split(separator: ".", omittingEmptySubsequences: false)
+        guard (1 ... 3).contains(parts.count) else { return nil }
+        var nums = [0, 0, 0]
+        for (k, p) in parts.enumerated() {
+            guard !p.isEmpty, p.count <= 9, p.allSatisfy({ $0.isASCII && $0.isNumber }), let v = Int(p) else { return nil }
+            nums[k] = v
+        }
+        major = nums[0]; minor = nums[1]; patch = nums[2]
+    }
+
+    var description: String { "\(major).\(minor).\(patch)" + (prerelease.isEmpty ? "" : "-\(prerelease)") }
+
+    static func < (a: Version, b: Version) -> Bool {
+        if (a.major, a.minor, a.patch) != (b.major, b.minor, b.patch) { return (a.major, a.minor, a.patch) < (b.major, b.minor, b.patch) }
+        if a.prerelease.isEmpty != b.prerelease.isEmpty { return !a.prerelease.isEmpty }
+        return a.prerelease < b.prerelease
+    }
+}
+
+enum Requirement: Equatable, CustomStringConvertible {
+    case range(Version, Version)      // lower ..< upper
+    case exact(Version)
+    case branch(String)
+    case revision(String)
+
+    func allows(_ v: Version) -> Bool {
+        switch self {
+        case .range(let lo, let hi): return lo <= v && v < hi && (v.prerelease.isEmpty || !lo.prerelease.isEmpty)
+        case .exact(let e): return v == e
+        default: return false
+        }
+    }
+
+    var isRef: Bool {
+        switch self { case .branch, .revision: return true; default: return false }
+    }
+
+    var description: String {
+        switch self {
+        case .range(let lo, let hi): return "\(lo)..<\(hi)"
+        case .exact(let v): return "exactly \(v)"
+        case .branch(let b): return "branch \(b)"
+        case .revision(let r): return "revision \(r)"
+        }
+    }
+}
+
+// MARK: - Manifest
+
+struct DependencyDecl {
+    var isPath: Bool
+    var location: String        // url, or path as written
+    var absolutePath: String    // path dependencies
+    var requirement: Requirement
+    var identity: String
+}
+
+enum TargetDep {
+    case byName(String)
+    case target(String)
+    case product(String, package: String)
+}
+
+enum TargetKind { case regular, executable, test }
+
+struct TargetDecl {
+    var name: String
+    var kind: TargetKind
+    var deps: [TargetDep]
+    var path: String?
+    var exclude: [String]
+}
+
+struct ProductDecl {
+    var name: String
+    var executable: Bool
+    var targets: [String]
+}
+
+struct Manifest {
+    var name: String
+    var root: String
+    var products: [ProductDecl]
+    var dependencies: [DependencyDecl]
+    var targets: [TargetDecl]
+    var json: JSON
+
+    func target(_ n: String) -> TargetDecl? { targets.first { $0.name == n } }
+    func product(_ n: String) -> ProductDecl? { products.first { $0.name == n } }
+}
+
+func identity(for location: String, isPath: Bool) -> String {
+    var s = location
+    while s.hasSuffix("/") { s.removeLast() }
+    var last = s.split(whereSeparator: { $0 == "/" || $0 == ":" }).last.map(String.init) ?? s
+    if !isPath && last.hasSuffix(".git") { last.removeLast(4) }
+    if isPath && (last.isEmpty || last == ".") { last = Path.basename(Path.absolute(location)) }
+    return last.lowercased()
+}
+
+func findPackageRoot(_ start: String) throws(DriverError) -> String {
+    var d = Path.absolute(start)
+    while true {
+        if Files.isFile(Path.join(d, "Package.mpp")) { return d }
+        if d == "/" { break }
+        d = Path.dirname(d)
+    }
+    throw DriverError("could not find Package.mpp in \(Path.absolute(start)) or any parent directory (create one with `mpp pm init`)")
+}
+
+enum ManifestLoader {
+    static func requirement(_ j: JSON) throws(DriverError) -> Requirement {
+        func v(_ s: String?) throws(DriverError) -> Version {
+            guard let s, let v = Version(s) else { throw DriverError("invalid version \(s ?? "nil")") }
+            return v
+        }
+        switch j["type"].string {
+        case "range": return .range(try v(j["lower"].string), try v(j["upper"].string))
+        case "exact": return .exact(try v(j["version"].string))
+        case "branch": return .branch(j["name"].string ?? "")
+        case "revision": return .revision(j["id"].string ?? "")
+        default: throw DriverError("unknown requirement type \(j["type"].string ?? "nil")")
+        }
+    }
+
+    static func manifest(from j: JSON, root: String, shown: String) throws(DriverError) -> Manifest {
+        guard let name = j["name"].string, !name.isEmpty else { throw DriverError("\(shown): package name is empty") }
+        var products: [ProductDecl] = []
+        for p in j["products"].array ?? [] {
+            products.append(ProductDecl(name: p["name"].string ?? "", executable: p["type"].string == "executable",
+                                        targets: (p["targets"].array ?? []).compactMap(\.string)))
+        }
+        var deps: [DependencyDecl] = []
+        var ids = Set<String>()
+        for d in j["dependencies"].array ?? [] {
+            let isPath = d["kind"].string == "path"
+            var dep: DependencyDecl
+            if isPath {
+                let loc = d["path"].string ?? ""
+                let abs = Path.absolute(loc, relativeTo: root)
+                dep = DependencyDecl(isPath: true, location: loc, absolutePath: abs, requirement: .branch(""),
+                                     identity: identity(for: abs, isPath: true))
+            } else {
+                let url = d["url"].string ?? ""
+                dep = DependencyDecl(isPath: false, location: url, absolutePath: "", requirement: try requirement(d["requirement"]),
+                                     identity: identity(for: url, isPath: false))
+            }
+            guard ids.insert(dep.identity).inserted else { throw DriverError("\(shown): duplicate dependency '\(dep.identity)'") }
+            deps.append(dep)
+        }
+        var targets: [TargetDecl] = []
+        var names = Set<String>()
+        for t in j["targets"].array ?? [] {
+            let kind: TargetKind = t["type"].string == "executable" ? .executable : t["type"].string == "test" ? .test : .regular
+            var tdeps: [TargetDep] = []
+            for d in t["dependencies"].array ?? [] {
+                let n = d["name"].string ?? ""
+                switch d["type"].string {
+                case "target": tdeps.append(.target(n))
+                case "product": tdeps.append(.product(n, package: d["package"].string ?? ""))
+                default: tdeps.append(.byName(n))
+                }
+            }
+            let decl = TargetDecl(name: t["name"].string ?? "", kind: kind, deps: tdeps, path: t["path"].string,
+                                  exclude: (t["exclude"].array ?? []).compactMap(\.string))
+            guard names.insert(decl.name).inserted else { throw DriverError("\(shown): duplicate target '\(decl.name)'") }
+            targets.append(decl)
+        }
+        let m = Manifest(name: name, root: root, products: products, dependencies: deps, targets: targets, json: j)
+        for p in products { for t in p.targets where m.target(t) == nil {
+            throw DriverError("\(shown): product '\(p.name)' refers to unknown target '\(t)'")
+        } }
+        return m
+    }
+
+    /// Evaluates manifest text (cached by content).
+    static func load(text: String, root: String, shown: String) throws(DriverError) -> Manifest {
+        let (pdDir, pdStamp) = try Builder.packageDescription()
+        var st = Stamp()
+        st.add(try Toolchain.version()); st.add(pdStamp); st.add(text)
+        let key = st.hex
+        let jsonPath = Path.join(Locations.cache, "manifests", String(key.prefix(32)) + ".json")
+        if let cached = Files.readIfExists(jsonPath), let j = try? JSON.parse(cached) {
+            return try manifest(from: j, root: root, shown: shown)
+        }
+        let work = Path.join(Locations.cache, "manifests", "build-" + String(key.prefix(16)))
+        Files.makeDirectories(work)
+        let src = Path.join(work, "Package.mpp")
+        try Files.write(src, text)
+        var m = ModuleSpec(name: "PackageManifest", sources: [src])
+        m.kind = .executable
+        m.mainSource = src
+        m.importCore = false
+        m.autoParallel = false
+        m.deps = [("PackageDescription", pdStamp)]
+        m.searchDirs = [pdDir]
+        m.silent = true
+        m.displayNames = [src: shown]
+        let exe = try Builder.build(m, into: work, release: false)
+        let out = Path.join(work, "manifest.json")
+        _ = unlinkFile(out)
+        let r = try Process.run([exe.path], cwd: root, environment: ["MPP_MANIFEST_OUTPUT=" + out])
+        guard r.status == 0, let text = Files.readIfExists(out) else {
+            let detail = r.output.trimmingNewlines
+            throw DriverError("evaluating \(shown) failed" + (detail.isEmpty ? "" : ":\n" + detail))
+        }
+        let j: JSON
+        do { j = try JSON.parse(text) } catch { throw DriverError("\(shown): bad manifest output: \(error)") }
+        let result = try manifest(from: j, root: root, shown: shown)
+        try Files.write(jsonPath, text)
+        Files.removeTree(work)
+        return result
+    }
+
+    static func load(root: String) throws(DriverError) -> Manifest {
+        let file = Path.join(root, "Package.mpp")
+        return try load(text: try Files.read(file), root: root, shown: Path.display(file))
+    }
+}
+
+func unlinkFile(_ p: String) -> Bool { (try? FS.remove(p)) != nil }

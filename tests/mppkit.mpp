@@ -1,0 +1,186 @@
+// Tests for MppKit. Exits non-zero on failure.
+import MppKit
+
+nonisolated(unsafe) var failures = 0
+func check(_ ok: Bool, _ what: String, line: Int = #line) {
+    if !ok { failures += 1; print("FAIL line \(line): \(what)") }
+}
+
+// ---- Format ({fmt})
+check(format("{} + {} = {}", 1, 2, 3) == "1 + 2 = 3", "basic")
+check(format("{0} {1} {0}", "a", "b") == "a b a", "positional")
+check(format("{:>6}|{:<6}|{:^6}", "ab", "cd", "ef") == "    ab|cd    |  ef  ", "align")
+check(format("{:*^9}", "mid") == "***mid***", "fill")
+check(format("{:.2f}", 3.14159) == "3.14", "fixed: \(format("{:.2f}", 3.14159))")
+check(format("{:8.3f}", -2.5) == "  -2.500", "width+precision: [\(format("{:8.3f}", -2.5))]")
+check(format("{:08.2f}", -1.5) == "-0001.50", "zero pad: \(format("{:08.2f}", -1.5))")
+check(format("{:#x} {:X} {:08b} {:o}", 255, 255, 5, 8) == "0xff FF 00000101 10", "bases: \(format("{:#x} {:X} {:08b} {:o}", 255, 255, 5, 8))")
+check(format("{:,}", 1234567) == "1,234,567", "grouping")
+check(format("{:+}", 5) == "+5", "sign")
+check(format("{:.1%}", 0.256) == "25.6%", "percent: \(format("{:.1%}", 0.256))")
+check(format("{:.3e}", 12345.678) == "1.235e+04", "scientific: \(format("{:.3e}", 12345.678))")
+check(format("{:e}", 0.00012) == "1.200000e-04", "scientific small: \(format("{:e}", 0.00012))")
+check(format("{:g}", 0.5) == "0.5" && format("{:g}", 1e10) == "1.00000e+10", "general: \(format("{:g}", 1e10))")
+check(format("{{}} {}", true) == "{} true", "escapes")
+check(format("{:.0f}", 2.5) == "2" && format("{:.0f}", 3.5) == "4", "round half even")
+check(format("{}", 0.1) == "0.1", "shortest float")
+
+// ---- JSON (nlohmann)
+var j: JSON = ["name": "M++", "tags": ["fast", "safe"], "version": 2, "pi": 3.5, "ok": true, "none": nil]
+j["version"] = 3
+j.author = "Omar"
+j["nested"]["deep"] = [1, 2]
+j["nested"]["deep"].append(3)
+check(j["version"].int == 3 && j.author.string == "Omar", "json set/get")
+check(j["nested"]["deep"][2].int == 3 && j["missing"]["x"].isNull, "json nested")
+check(j.dump() == #"{"name":"M++","tags":["fast","safe"],"version":3,"pi":3.5,"ok":true,"none":null,"author":"Omar","nested":{"deep":[1,2,3]}}"#, "json dump: \(j.dump())")
+let parsed = try JSON.parse(j.dump(indent: 2))
+check(parsed == j, "json round trip")
+check(try JSON.parse(#"{"s":"a\"\\é😀","big":9007199254740993,"e":-1.5e3}"#)["big"] == .int(9007199254740993), "json big int")
+check((try JSON.parse(#""é😀""#)).string == "é😀", "json unicode escapes")
+do { _ = try JSON.parse("{\n  \"a\": [1, 2,]\n}"); check(false, "json should fail") }
+catch { check(error.line == 2 && error.column == 14, "json error position: \(error)") }
+check((try? JSON.parse("[01]")) == nil && (try? JSON.parse("[1] x")) == nil, "json strictness")
+
+// ---- Matrix (Eigen)
+let a: Mat = [[1, 2], [3, 4]]
+check(a * Mat.identity(2) == a, "identity")
+check((a * a) == [[7, 10], [15, 22]], "matmul")
+check(a.transposed == [[1, 3], [2, 4]], "transpose")
+check(abs(a.determinant - (-2)) < 1e-12, "determinant")
+let x = try a.solve([[5], [11]])
+check(x.isApproximatelyEqual(to: [[1], [2]]), "solve: \(x)")
+check((try a.inverse() * a).isApproximatelyEqual(to: .identity(2)), "inverse")
+check(a.hadamard(a) == [[1, 4], [9, 16]] && (2.0 * a - a) == a, "elementwise")
+check(a.columnSums == [[4, 6]] && a.rowSums == [[3], [7]] && a.sum == 10, "reductions")
+var rng = PCG32(seed: 1)
+let big = Mat.random(300, 200, using: &rng), big2 = Mat.random(200, 250, using: &rng)
+let prod = big * big2   // parallel blocked kernel
+var naive = 0.0
+for k in 0 ..< 200 { naive += big[17, k] * big2[k, 123] }
+check(abs(prod[17, 123] - naive) < 1e-9, "large matmul")
+check(big.transposed.transposed == big, "blocked transpose")
+do { _ = try Mat([[1, 2], [2, 4]]).inverse(); check(false, "singular should throw") } catch { check(error.description.contains("singular"), "singular") }
+
+// ---- MppDictionary (Swiss table)
+var m = MppDictionary<String, Int>()
+for i in 0 ..< 10_000 { m["k\(i)"] = i }
+check(m.count == 10_000 && m["k1234"] == 1234 && m["nope"] == nil, "swiss insert/find")
+for i in stride(from: 0, to: 10_000, by: 2) { m["k\(i)"] = nil }
+check(m.count == 5_000 && m["k2"] == nil && m["k3"] == 3, "swiss erase")
+for i in 0 ..< 10_000 { m["k\(i)", default: 0] += 1 }
+check(m.count == 10_000 && m["k2"] == 1 && m["k3"] == 4, "swiss default subscript")
+var copy = m
+copy["k3"] = -1
+check(m["k3"] == 4 && copy["k3"] == -1, "copy on write")
+var dict: [String: Int] = [:]
+for (k, v) in m { dict[k] = v }
+check(dict.count == 10_000, "iteration")
+var churn = MppDictionary<Int, Int>()
+for round in 0 ..< 50 { for i in 0 ..< 200 { churn[i] = round }; for i in 0 ..< 200 where i % 3 != 0 { churn[i] = nil } }
+check(churn.count == 67 && churn[3] == 49, "tombstone churn")
+var hs: MppSet<Int> = [1, 2, 3, 2]
+check(hs.count == 3 && hs.insert(4) && !hs.insert(4), "flat hash set")
+var ints = MppDictionary<Int, Int>(minimumCapacity: 100_000)
+for i in 0 ..< 100_000 { ints[i &* 7919] = i }
+let probe = (0 ..< 1_000).map { $0 % 2 == 0 ? $0 &* 7919 : -$0 }
+let got = ints.values(forKeys: probe)
+check(zip(probe, got).allSatisfy { ints[$0] == $1 } && got[2] == 2 && got[3] == nil, "batched lookup")
+check(ints.contains(keys: [0, -1]) == [true, false], "batched contains")
+let legacy: FlatHashMap<String, Int> = ["a": 1]
+check(legacy["a"] == 1 && MppDictionary(["x": 1, "y": 2]).dictionary == ["x": 1, "y": 2], "aliases and conversion")
+let grouped = MppDictionary(grouping: ["apple", "avocado", "banana"], by: { $0.first! })
+check(grouped["a"]?.count == 2 && grouped["b"] == ["banana"], "grouping")
+
+// ---- Containers (Boost)
+var ring = RingBuffer<Int>(capacity: 3)
+for i in 1 ... 5 { ring.push(i) }
+check(Array(ring) == [3, 4, 5] && ring.popFirst() == 3 && Array(ring) == [4, 5], "ring buffer")
+var bits = BitSet(count: 200, setting: [0, 63, 64, 199])
+check(bits.cardinality == 4 && Array(bits) == [0, 63, 64, 199] && bits.first == 0, "bitset")
+bits.remove(0)
+check(bits.first == 63 && (~bits).cardinality == 197 && (bits & BitSet(count: 200, setting: [64])).cardinality == 1, "bitset ops")
+var small: SmallArray<String> = ["a", "b"]
+for i in 0 ..< 6 { small.append("\(i)") }
+check(small.isInline && small.count == 8, "small array inline")
+small.append("x")
+check(!small.isInline && small[8] == "x" && small[0] == "a", "small array spill")
+
+// ---- Parallel (TBB)
+let squares = Parallel.map(0 ..< 100_000) { $0 * $0 }
+check(squares[99_999] == 99_999 * 99_999 && squares.count == 100_000, "parallel map")
+check(Parallel.reduce(0 ..< 1_000_001, 0, { $0 }, { $0 + $1 }) == 500_000_500_000, "parallel reduce")
+check(Parallel.sum(0 ..< 1_000_001) { Double($0) } == 500_000_500_000, "parallel sum")
+var shuffled = (0 ..< 200_000).shuffled(using: &rng)
+Parallel.sort(&shuffled)
+check(shuffled == Array(0 ..< 200_000), "parallel sort")
+
+// ---- Random (PCG)
+var p1 = PCG32(seed: 42), p2 = PCG32(seed: 42)
+check((0 ..< 5).map { _ in p1.next32() } == (0 ..< 5).map { _ in p2.next32() }, "pcg reproducible")
+var xo = Xoshiro256(seed: 7)
+let normals = (0 ..< 20_000).map { _ in xo.normal(mean: 10, standardDeviation: 2) }
+let mean = normals.sum() / 20_000
+let sd = (normals.map { ($0 - mean) * ($0 - mean) }.sum() / 20_000).squareRoot()
+check(abs(mean - 10) < 0.1 && abs(sd - 2) < 0.1, "normal distribution: \(mean) \(sd)")
+let poissonMean = Double((0 ..< 20_000).map { _ in xo.poisson(mean: 3) }.sum()) / 20_000
+check(abs(poissonMean - 3) < 0.1, "poisson: \(poissonMean)")
+
+// ---- CLI (CLI11)
+let cli = CommandLineParser("tool", about: "demo")
+let width = cli.option("-w", "--width", default: 800, help: "width")
+let name = cli.option("--name", default: "x")
+let verbose = cli.flag("-v", "--verbose")
+let quiet = cli.flag("-q")
+let input = cli.positional("input")
+try cli.parseOrThrow(["--width=640", "-vq", "in.png", "--name", "bob", "extra"])
+check(width.value == 640 && verbose.value && quiet.value && input.value == "in.png" && name.value == "bob" && cli.remaining == ["extra"], "cli parse")
+do { try CommandLineParser("t").parseOrThrow(["--nope"]); check(false, "cli unknown") } catch { check("\(error)".contains("unknown option"), "cli error") }
+check(cli.helpText.contains("--width <value>"), "cli help")
+
+// ---- Ranges (range-v3)
+check([1, 2, 3, 4, 5].chunks(of: 2).map(Array.init) == [[1, 2], [3, 4], [5]], "chunks")
+check([1, 2, 3, 4].windows(of: 3).map(Array.init) == [[1, 2, 3], [2, 3, 4]], "windows")
+check([3, 1, 3, 2, 1].uniqued() == [3, 1, 2] && ["a", "b"].interspersed(with: ",") == ["a", ",", "b"], "uniqued/intersperse")
+check([1, 2, 3, 4].scan(0, +) == [1, 3, 6, 10] && [1, 2, 3, 4].product() == 24, "scan/product")
+check(cartesianProduct([1, 2], ["a", "b"]).count == 4 && [1, 2, 3].adjacentPairs().count == 2, "products")
+check(["bb", "a", "ccc"].sorted(by: { $0.count }) == ["a", "bb", "ccc"], "sorted by key")
+
+// ---- Log (spdlog)
+let mem = MemorySink()
+let logger = Logger("test", level: .info, sinks: [mem], pattern: "[%n] [%l] %v")
+logger.debug("hidden {}", 1)
+logger.info("answer is {}", 42)
+logger.error("{:.1f}% failed", 12.34)
+check(mem.lines == ["[test] [info] answer is 42", "[test] [error] 12.3% failed"], "logger: \(mem.lines)")
+
+// ---- TokenFile
+do {
+    let tp = "/tmp/mppkit-tokens.mtok"
+    let w = try TokenWriter(creating: tp, width: .u16, capacity: 3_000_000)
+    w.append(contentsOf: [1, 2, 65535])
+    w.fill(count: 2_500_000, as: UInt16.self) { r, b in for i in 0 ..< b.count { b[i] = UInt16(truncatingIfNeeded: r.lowerBound + i) } }
+    let f = try w.finish()
+    check(f.count == 2_500_003 && f[0] == 1 && f[2] == 65535 && f[3] == 3 && f[2_500_002] == (2_500_002 & 0xFFFF), "tokens written")
+    check(f.window(at: 1, length: 3) == [2, 65535, 3], "window")
+    try f.verify()
+    // Flip one data byte: the checksum must catch it.
+    let raw = try File(tp, .readWrite)
+    try raw.seek(to: 4096 + 2 * 1_500_000)
+    try raw.write([0xAB])
+    do { try TokenFile(tp).verify(); check(false, "corruption not detected") } catch { check("\(error)".contains("block 1"), "corrupt block: \(error)") }
+    // Damage the header: opening must fail.
+    try raw.seek(to: 20)
+    try raw.write([0xFF])
+    do { _ = try TokenFile(tp); check(false, "bad header accepted") } catch { check("\(error)".contains("header checksum"), "header crc") }
+    try FS.remove(tp)
+    // An abandoned writer leaves nothing behind; a short file is rejected.
+    do { let a = try TokenWriter(creating: tp, width: .u8, capacity: 10); a.append(1) }
+    check(!FS.exists(tp), "abandoned writer")
+    try FS.write(tp, "MPPTOK too short")
+    do { _ = try TokenFile(tp); check(false, "garbage accepted") } catch { check(true, "") }
+    try FS.remove(tp)
+}
+
+precondition(failures == 0, "MppKit: \(failures) failure(s)")
+print("MppKit: ok")

@@ -1,0 +1,36 @@
+// M++ sorting vs Swift's sort(): `mpp benchmarks/sorting.mpp`
+import MppKit
+
+var rng = PCG32(seed: 1)
+let n = 5_000_000
+let ints = (0 ..< n).map { _ in Int(bitPattern: UInt(rng.next())) }
+let doubles = (0 ..< n).map { _ in Double(rng.next() % 1_000_000_007) / 3 - 1e8 }
+let strings = (0 ..< 500_000).map { _ in String(rng.next(), radix: 36) }
+
+func time(_ label: String, _ body: () -> Void) -> Double {
+    let clock = ContinuousClock(), t0 = clock.now
+    body()
+    let d = clock.now - t0
+    return Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18
+}
+func fmt(_ t: Double) -> String { "\(Double(Int(t * 1000)) / 1000)s" }
+func fmt1(_ x: Double) -> String { "\(Double(Int(x * 10)) / 10)" }
+func row(_ what: String, _ swift: Double, _ mine: [(String, Double)]) {
+    var s = what + String(repeating: " ", count: max(1, 14 - what.count)) + "sort() " + fmt(swift)
+    for (name, t) in mine { s += "   \(name) " + fmt(t) + " (" + fmt1(swift / t) + "x)" }
+    print(s)
+}
+var a = ints, b = ints, c = ints
+let ts = time("sort") { a.sort() }
+let tp = time("pdq") { b.mppSort() }
+let tr = time("radix") { c.radixSort() }
+precondition(a == b && b == c)
+row("5M Int", ts, [("mppSort", tp), ("radixSort", tr)])
+var d1 = doubles, d2 = doubles, d3 = doubles
+let ds = time("") { d1.sort() }, dp = time("") { d2.mppSort() }, dr = time("") { d3.radixSort() }
+precondition(d1 == d2 && d2 == d3)
+row("5M Double", ds, [("mppSort", dp), ("radixSort", dr)])
+var s1 = strings, s2 = strings
+let ss = time("") { s1.sort() }, sp = time("") { s2.mppSort() }
+precondition(s1 == s2)
+row("500K String", ss, [("mppSort", sp)])

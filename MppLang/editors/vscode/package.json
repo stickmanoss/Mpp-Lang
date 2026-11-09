@@ -1,0 +1,35 @@
+{
+  "name": "mpp-language",
+  "displayName": "M++",
+  "description": "M++ language support: Swift-style syntax coloring for .mpp files (including SwiftUI and the M++ libraries).",
+  "version": "0.3.0",
+  "publisher": "mpp",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "mpp",
+        "aliases": [
+          "M++",
+          "mpp"
+        ],
+        "extensions": [
+          ".mpp"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "mpp",
+        "scopeName": "source.mpp",
+        "path": "./syntaxes/mpp.tmLanguage.json"
+      }
+    ]
+  }
+}

@@ -1,0 +1,92 @@
+// MppCore — placement construction (`place` / `unplace`).
+//
+//   let p = place buffer Point(x: 1, y: 2)   // like C++  new (buffer) Point(1, 2)
+//   unplace p                                 // like C++  p->~Point()
+//
+// The front end lowers `place D T(args)` to `_mppPlace(into: D, T(args))`.
+// Unlike C++, the destination is checked before the value is built:
+// misaligned or undersized storage traps with a clear message instead of
+// being undefined behaviour. The checks stay on in every build mode and are
+// never removed: unlike `precondition`, their messages survive -O too.
+
+/// Traps with `message` when `condition` is false, in every build mode.
+@inlinable @inline(__always)
+public func _mppRequire(_ condition: Bool, _ message: @autoclosure () -> String,
+                        file: StaticString = #fileID, line: UInt = #line) {
+    if _slowPath(!condition) { _mppFail(message(), file: file, line: line) }
+}
+
+@usableFromInline @inline(never)
+func _mppFail(_ message: String, file: StaticString = #fileID, line: UInt = #line) -> Never {
+    fatalError(message, file: file, line: line)
+}
+
+/// Anything that can hand out storage for `place`.
+///
+/// Conform your own allocators to make `place myAllocator T(...)` work.
+public protocol PlacementTarget {
+    /// Returns writable, uninitialized storage of at least `size` bytes,
+    /// aligned to `alignment` (a power of two). Must trap if it cannot.
+    func placementStorage(size: Int, alignment: Int) -> UnsafeMutableRawPointer
+}
+
+@inlinable @inline(__always)
+internal func _mppCheckAligned(_ p: UnsafeMutableRawPointer, _ alignment: Int) {
+    _mppRequire(Int(bitPattern: p) & (alignment &- 1) == 0,
+                 "place: destination \(p) is not \(alignment)-byte aligned")
+}
+
+extension UnsafeMutableRawPointer: PlacementTarget {
+    @inlinable
+    public func placementStorage(size: Int, alignment: Int) -> UnsafeMutableRawPointer {
+        _mppCheckAligned(self, alignment)
+        return self
+    }
+}
+
+extension UnsafeMutablePointer: PlacementTarget {
+    @inlinable
+    public func placementStorage(size: Int, alignment: Int) -> UnsafeMutableRawPointer {
+        let raw = UnsafeMutableRawPointer(self)
+        _mppCheckAligned(raw, alignment)
+        return raw
+    }
+}
+
+extension UnsafeMutableRawBufferPointer: PlacementTarget {
+    @inlinable
+    public func placementStorage(size: Int, alignment: Int) -> UnsafeMutableRawPointer {
+        guard let base = baseAddress else { _mppFail("place: destination buffer is empty") }
+        _mppRequire(count >= size, "place: destination buffer has \(count) bytes, value needs \(size)")
+        _mppCheckAligned(base, alignment)
+        return base
+    }
+}
+
+extension UnsafeMutableBufferPointer: PlacementTarget {
+    @inlinable
+    public func placementStorage(size: Int, alignment: Int) -> UnsafeMutableRawPointer {
+        UnsafeMutableRawBufferPointer(self).placementStorage(size: size, alignment: alignment)
+    }
+}
+
+/// Lowered form of `place dest T(args)`.
+/// Storage is obtained and checked first; the value is built straight into it.
+@inlinable @discardableResult
+public func _mppPlace<Destination: PlacementTarget, T: ~Copyable>(
+    into destination: Destination,
+    _ make: @autoclosure () throws -> T
+) rethrows -> UnsafeMutablePointer<T> {
+    let raw = destination.placementStorage(size: MemoryLayout<T>.size,
+                                           alignment: MemoryLayout<T>.alignment)
+    let typed = raw.bindMemory(to: T.self, capacity: 1)
+    typed.initialize(to: try make())
+    return typed
+}
+
+/// Lowered form of `unplace p`: runs the value's destructor in place and
+/// returns the storage, ready to be reused by another `place`.
+@inlinable @discardableResult
+public func _mppUnplace<T: ~Copyable>(_ pointer: UnsafeMutablePointer<T>) -> UnsafeMutableRawPointer {
+    pointer.deinitialize(count: 1)
+}

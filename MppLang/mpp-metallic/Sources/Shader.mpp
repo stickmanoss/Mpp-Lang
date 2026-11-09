@@ -1,0 +1,386 @@
+// Metallic — textures, samplers and shader functions.
+//
+// Shaders are M++ functions written the Metal way; the front end turns the
+// attributes into bindings:
+//
+//   @kernel func invert(_ src: texture2d<float> [[texture(0)]],
+//                       _ dst: texture2d<float> [[texture(1)]],
+//                       _ gid: uint2 [[thread_position_in_grid]]) {
+//       dst.write(float4(1 - src.read(gid).rgb, 1), gid)
+//   }
+//
+//   struct VertexOut { var position: float4 [[position]]; var uv: float2 }
+//
+//   @vertex func quad(_ id: uint [[vertex_id]], _ u: QuadUniforms [[buffer(0)]]) -> VertexOut { ... }
+//   @fragment func shade(_ in: VertexOut [[stage_in]],
+//                        _ tex: texture2d<float> [[texture(0)]],
+//                        _ s: sampler [[sampler(0)]]) -> float4 { tex.sample(s, in.uv) }
+//
+// Each shader `name` also gets a `nameFunction` value to build pipelines with.
+// The front end compiles a kernel into a loop over a band of rows and a
+// fragment shader into a loop over one row of a triangle, so the shader's
+// body is specialized and inlined into the loop that runs it.
+
+internal import MetallicCore
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+// MARK: - Samplers
+
+public enum filter: Sendable { case nearest, linear }
+public enum address: Sendable { case clamp_to_edge, repeat_, mirrored_repeat, clamp_to_zero }
+
+/// `sampler(filter: .linear, address: .clamp_to_edge)`.
+public struct sampler: Sendable {
+    public var filter: filter
+    public var address: address
+    public init(filter: filter = .linear, address: address = .clamp_to_edge) {
+        self.filter = filter
+        self.address = address
+    }
+    public static let linear = sampler()
+    public static let nearest = sampler(filter: .nearest)
+}
+
+// MARK: - Textures
+
+public enum MetallicPixelFormat: Sendable { case rgba32Float, rgba8Unorm, bgra8Unorm, r32Float }
+
+/// Texel storage, shared by every `texture2d` value that refers to it.
+public final class _TextureStorage: @unchecked Sendable {
+    public let width: Int, height: Int
+    public let pixelFormat: MetallicPixelFormat
+    public let texels: UnsafeMutablePointer<float4>
+    init(width: Int, height: Int, pixelFormat: MetallicPixelFormat) {
+        precondition(width > 0 && height > 0, "Metallic: texture size must be positive")
+        self.width = width
+        self.height = height
+        self.pixelFormat = pixelFormat
+        texels = .allocate(capacity: width * height)
+        mtl_fill(_floats(texels), width * height, 0, 0, 0, 0)
+    }
+    deinit { texels.deallocate() }
+}
+
+@inline(__always) func _floats(_ p: UnsafeMutablePointer<float4>) -> UnsafeMutablePointer<Float> {
+    UnsafeMutableRawPointer(p).assumingMemoryBound(to: Float.self)
+}
+
+/// A 2D texture of float4 texels. `T` is the component type (Metal's
+/// `texture2d<float>`); the CPU engine stores float either way.
+public struct texture2d<T>: @unchecked Sendable {
+    public let storage: _TextureStorage
+    public init(_ storage: _TextureStorage) { self.storage = storage }
+
+    @inlinable public func get_width() -> uint { uint(storage.width) }
+    @inlinable public func get_height() -> uint { uint(storage.height) }
+    public var width: Int { storage.width }
+    public var height: Int { storage.height }
+
+    /// The texel at integer coordinates (clamped to the edge, like Metal's
+    /// out-of-bounds reads never crash).
+    @inlinable @inline(__always) public func read(_ c: uint2) -> float4 {
+        let x = min(Int(c.x), storage.width - 1), y = min(Int(c.y), storage.height - 1)
+        return storage.texels[y &* storage.width &+ x]
+    }
+    @inlinable @inline(__always) public func read(_ x: Int, _ y: Int) -> float4 {
+        let cx = min(max(x, 0), storage.width - 1), cy = min(max(y, 0), storage.height - 1)
+        return storage.texels[cy &* storage.width &+ cx]
+    }
+    /// Writes outside the texture are dropped (as on a GPU).
+    @inlinable @inline(__always) public func write(_ v: float4, _ c: uint2) {
+        let x = Int(c.x), y = Int(c.y)
+        if x < storage.width && y < storage.height { storage.texels[y &* storage.width &+ x] = v }
+    }
+
+    /// Samples at normalized coordinates (0...1, origin top-left).
+    @inlinable @inline(__always) public func sample(_ s: sampler, _ uv: float2) -> float4 {
+        let w = storage.width, h = storage.height
+        let t = storage.texels
+        let fx = uv.x * Float(w) - 0.5, fy = uv.y * Float(h) - 0.5
+        guard fx.isFinite && fy.isFinite else { return float4(0) }
+        let cx = max(min(fx, 1e8), -1e8), cy = max(min(fy, 1e8), -1e8)
+        if s.address == .clamp_to_edge {
+            // The common case: no wrapping, no misses.
+            if s.filter == .nearest {
+                let x = min(max(Int((cx + 0.5).rounded(.down)), 0), w - 1), y = min(max(Int((cy + 0.5).rounded(.down)), 0), h - 1)
+                return t[y &* w &+ x]
+            }
+            let x0f = cx.rounded(.down), y0f = cy.rounded(.down)
+            let tx = cx - x0f, ty = cy - y0f
+            let x0 = Int(x0f), y0 = Int(y0f)
+            let xa = min(max(x0, 0), w - 1), xb = min(max(x0 &+ 1, 0), w - 1)
+            let r0 = t + min(max(y0, 0), h - 1) &* w, r1 = t + min(max(y0 &+ 1, 0), h - 1) &* w
+            let a = r0[xa], b = r0[xb], c = r1[xa], d = r1[xb]
+            let top = a + (b - a) * tx, bottom = c + (d - c) * tx
+            return top + (bottom - top) * ty
+        }
+        @inline(__always) func wrap(_ i: Int, _ n: Int) -> Int {
+            switch s.address {
+            case .clamp_to_edge: return min(max(i, 0), n - 1)
+            case .clamp_to_zero: return i < 0 || i >= n ? -1 : i
+            case .repeat_: let m = i % n; return m < 0 ? m + n : m
+            case .mirrored_repeat:
+                let p = 2 * n, m0 = i % p, m = m0 < 0 ? m0 + p : m0
+                return m < n ? m : p - 1 - m
+            }
+        }
+        @inline(__always) func texel(_ x: Int, _ y: Int) -> float4 {
+            let wx = wrap(x, w), wy = wrap(y, h)
+            return wx < 0 || wy < 0 ? float4(0) : t[wy &* w &+ wx]
+        }
+        if s.filter == .nearest { return texel(Int((cx + 0.5).rounded(.down)), Int((cy + 0.5).rounded(.down))) }
+        let x0f = cx.rounded(.down), y0f = cy.rounded(.down)
+        let tx = cx - x0f, ty = cy - y0f
+        let x0 = Int(x0f), y0 = Int(y0f)
+        let top = texel(x0, y0) * (1 - tx) + texel(x0 + 1, y0) * tx
+        let bottom = texel(x0, y0 + 1) * (1 - tx) + texel(x0 + 1, y0 + 1) * tx
+        return top * (1 - ty) + bottom * ty
+    }
+
+    /// Replaces a region with 0xAARRGGBB words (e.g. a window's pixels).
+    public func replace(region x: Int, _ y: Int, _ w: Int, _ h: Int, fromARGB src: UnsafePointer<UInt32>, bytesPerRow: Int) {
+        guard x >= 0, y >= 0 else { return }
+        let cw = min(w, storage.width - x), ch = min(h, storage.height - y)
+        guard cw > 0, ch > 0 else { return }
+        mtl_from_argb(_floats(storage.texels + y * storage.width + x), storage.width, src, bytesPerRow / 4, cw, ch)
+    }
+
+    /// Fills the texture from a w × h region of 0xAARRGGBB words at half
+    /// resolution (each texel averages a 2×2 block): the texture must be
+    /// at least ⌈w/2⌉ × ⌈h/2⌉.
+    public func replaceHalf(fromARGB src: UnsafePointer<UInt32>, bytesPerRow: Int, width w: Int, height h: Int) {
+        precondition((w + 1) / 2 <= storage.width && (h + 1) / 2 <= storage.height, "Metallic: replaceHalf: texture too small")
+        guard w > 0, h > 0 else { return }
+        mtl_from_argb_half(_floats(storage.texels), storage.width, src, bytesPerRow / 4, w, h)
+    }
+
+    /// Copies a region out as 0xAARRGGBB words, blending over what is there
+    /// when `blend` is true (source-over with the texel's alpha).
+    public func getARGB(into dst: UnsafeMutablePointer<UInt32>, bytesPerRow: Int, region x: Int, _ y: Int, _ w: Int, _ h: Int, blend: Bool) {
+        guard x >= 0, y >= 0 else { return }
+        let cw = min(w, storage.width - x), ch = min(h, storage.height - y)
+        guard cw > 0, ch > 0 else { return }
+        mtl_to_argb(dst, bytesPerRow / 4, _floats(storage.texels + y * storage.width + x), storage.width, cw, ch, blend ? 1 : 0)
+    }
+
+    /// Fills the whole texture with one value.
+    public func fill(_ v: float4) { mtl_fill(_floats(storage.texels), storage.width * storage.height, v.x, v.y, v.z, v.w) }
+
+    /// Writes the texture as a PNG.
+    public func savePNG(_ path: String) -> Bool {
+        let n = storage.width * storage.height
+        let words = UnsafeMutablePointer<UInt32>.allocate(capacity: n)
+        defer { words.deallocate() }
+        getARGB(into: words, bytesPerRow: storage.width * 4, region: 0, 0, storage.width, storage.height, blend: false)
+        return mtl_write_png(path, words, storage.width, storage.height) == 0
+    }
+}
+
+// MARK: - Shader functions and their arguments
+
+/// What a shader's `[[buffer(n)]]`, `[[texture(n)]]` and `[[sampler(n)]]` read.
+public struct MetallicArguments: @unchecked Sendable {
+    public var buffers: [Any?] = Array(repeating: nil, count: 31)
+    public var textures: [_TextureStorage?] = Array(repeating: nil, count: 31)
+    public var samplers: [sampler] = Array(repeating: .linear, count: 16)
+    /// The bytes of each setBytes value, for shaders compiled to C++.
+    public var raw: [_RawBytes?] = Array(repeating: nil, count: 31)
+    public init() {}
+
+    public mutating func setBytes<T>(_ value: T, index: Int) {
+        buffers[index] = value
+        raw[index] = _RawBytes(value)
+    }
+    public mutating func setBuffer<T>(_ values: [T], index: Int) {
+        buffers[index] = values
+        raw[index] = nil
+    }
+
+    @inline(__always) public func buffer<T>(_ index: Int) -> T {
+        guard let v = buffers[index] else { fatalError("Metallic: nothing bound at buffer(\(index))") }
+        if let t = v as? T { return t }                  // setBytes(value) or setBuffer(array) for an array parameter
+        if let a = v as? [T], let first = a.first { return first }
+        fatalError("Metallic: buffer(\(index)) holds \(type(of: v)), the shader expects \(T.self)")
+    }
+    @inline(__always) public func texture<T>(_ index: Int) -> texture2d<T> {
+        guard let t = textures[index] else { fatalError("Metallic: nothing bound at texture(\(index))") }
+        return texture2d<T>(t)
+    }
+    @inline(__always) public func sampler(_ index: Int) -> sampler { samplers[index] }
+}
+
+/// A copy of a value's bytes (what a compiled shader's [[buffer(n)]] points at).
+public final class _RawBytes: @unchecked Sendable {
+    public let pointer: UnsafeMutableRawPointer
+    public let count: Int
+    init<T>(_ value: T) {
+        count = MemoryLayout<T>.size
+        pointer = .allocate(byteCount: max(count, 1), alignment: max(MemoryLayout<T>.alignment, 16))
+        pointer.initializeMemory(as: T.self, repeating: value, count: 1)
+    }
+    deinit { pointer.deallocate() }
+}
+
+/// Built-in values a shader can ask for.
+public struct MetallicThread: Sendable {
+    public var threadPosition = uint2(0, 0)        // [[thread_position_in_grid]]
+    public var threadsPerGrid = uint2(0, 0)        // [[threads_per_grid]]
+    public var vertexID: uint = 0                   // [[vertex_id]]
+    public var instanceID: uint = 0                 // [[instance_id]]
+    public var position = float4(0)                 // [[position]] in a fragment shader
+    @inlinable public init() {}
+}
+
+/// A vertex shader's output: the clip-space position and the values to
+/// interpolate. The front end writes this conformance for a struct with a
+/// `[[position]]` member.
+public protocol Varyings {
+    var clipPosition: float4 { get }
+    static func interpolate(_ a: Self, _ b: Self, _ c: Self, _ w: float3) -> Self
+}
+
+/// What a fragment shader without `[[stage_in]]` is rasterized with.
+public struct MetallicNoVaryings: Varyings {
+    @inlinable public init() {}
+    @inlinable public var clipPosition: float4 { float4(0) }
+    @inlinable public static func interpolate(_ a: Self, _ b: Self, _ c: Self, _ w: float3) -> Self { a }
+}
+
+/// A band of rows of a compute dispatch; the front end turns a kernel into a
+/// loop over it.
+public struct MetallicRows: Sendable {
+    public let y0: Int, y1: Int, width: Int, height: Int
+    @inlinable public init(y0: Int, y1: Int, width: Int, height: Int) { self.y0 = y0; self.y1 = y1; self.width = width; self.height = height }
+    @inlinable public var grid: uint2 { uint2(UInt32(truncatingIfNeeded: width), UInt32(truncatingIfNeeded: height)) }
+}
+
+/// One row of a triangle: the pixels [x0, x1) of row y. The front end turns a
+/// fragment shader into a call to `shade`, which runs it for every covered
+/// pixel with perspective-correct varyings.
+public struct MetallicSpan<V: Varyings> {
+    public let y: Int, x0: Int, x1: Int
+    @usableFromInline let a: float3, b: float3, c: float3        // screen x, y and depth
+    @usableFromInline let inv: Float                             // 1 / signed area
+    @usableFromInline let invW: float3                           // 1 / clip w
+    @usableFromInline let va: V, vb: V, vc: V
+    @usableFromInline let row: UnsafeMutablePointer<float4>      // the target's row y
+    @usableFromInline let blending: Bool
+
+    @inlinable init(y: Int, x0: Int, x1: Int, a: float3, b: float3, c: float3, inv: Float, invW: float3,
+                    va: V, vb: V, vc: V, row: UnsafeMutablePointer<float4>, blending: Bool) {
+        self.y = y; self.x0 = x0; self.x1 = x1; self.a = a; self.b = b; self.c = c; self.inv = inv; self.invW = invW
+        self.va = va; self.vb = vb; self.vc = vc; self.row = row; self.blending = blending
+    }
+
+    @inlinable @inline(__always) public func shade(_ f: (MetallicThread, V) -> float4) {
+        var th = MetallicThread()
+        let fy = Float(y) + 0.5
+        var px = x0
+        while px < x1 {
+            let fx = Float(px) + 0.5
+            let w0 = ((b.x - fx) * (c.y - fy) - (b.y - fy) * (c.x - fx)) * inv
+            let w1 = ((c.x - fx) * (a.y - fy) - (c.y - fy) * (a.x - fx)) * inv
+            let w2 = 1 - w0 - w1
+            if w0 >= 0 && w1 >= 0 && w2 >= 0 {
+                let pw = float3(w0, w1, w2) * invW
+                let s = pw.sum()
+                th.position = float4(fx, fy, w0 * a.z + w1 * b.z + w2 * c.z, s)
+                let color = f(th, V.interpolate(va, vb, vc, pw / s))
+                let d = row + px
+                if blending {
+                    let sa = min(max(color.w, 0), 1)
+                    let dst = d.pointee
+                    d.pointee = float4(color.x * sa + dst.x * (1 - sa), color.y * sa + dst.y * (1 - sa),
+                                       color.z * sa + dst.z * (1 - sa), sa + dst.w * (1 - sa))
+                } else {
+                    d.pointee = color
+                }
+            }
+            px &+= 1
+        }
+    }
+
+    @inlinable public var withoutVaryings: MetallicSpan<MetallicNoVaryings> {
+        MetallicSpan<MetallicNoVaryings>(y: y, x0: x0, x1: x1, a: a, b: b, c: c, inv: inv, invW: invW,
+                                         va: MetallicNoVaryings(), vb: MetallicNoVaryings(), vc: MetallicNoVaryings(),
+                                         row: row, blending: blending)
+    }
+}
+
+extension MetallicSpan where V == MetallicNoVaryings {
+    @inlinable @inline(__always) public func shade(_ f: (MetallicThread) -> float4) { shade { t, _ in f(t) } }
+}
+
+public enum MetallicFunctionKind: Sendable { case kernel, vertex, fragment }
+
+/// A compiled shader (`nameFunction`, made by the front end). Its body binds
+/// the arguments once per dispatch and returns the loop that runs it.
+public final class MetallicFunction: @unchecked Sendable {
+    public typealias Kernel = (MetallicArguments) -> (MetallicRows) -> Void
+    public typealias Draw = (MetallicFunction, _DrawJob) throws -> Void
+    /// A shader compiled to C++: (bindings, rows or span).
+    public typealias Native = (UnsafeRawPointer, UnsafeRawPointer) -> Void
+    public let name: String
+    public let kind: MetallicFunctionKind
+    @usableFromInline let body: Any
+    @usableFromInline let stageIn: Any.Type?
+    /// Vertex functions: draws with a fragment function, specialized for the varyings type.
+    @usableFromInline let draw: Draw?
+    /// Compiled to C++: the entry point and the bindings it reads.
+    @usableFromInline let native: Native?
+    @usableFromInline let nativeBuffers: [(index: Int, size: Int)]
+    @usableFromInline let nativeTextures: [Int]
+    /// Whether the shader runs as C++ (true) or M++.
+    public var isNative: Bool { native != nil }
+
+    @usableFromInline init(name: String, kind: MetallicFunctionKind, body: Any, stageIn: Any.Type?, draw: Draw?,
+                           native: Native? = nil, buffers: [(index: Int, size: Int)] = [], textures: [Int] = []) {
+        self.name = name; self.kind = kind; self.body = body; self.stageIn = stageIn; self.draw = draw
+        self.native = native; nativeBuffers = buffers; nativeTextures = textures
+    }
+
+    /// `@kernel` compiled to C++
+    public convenience init(kernel name: String, native: @escaping Native, buffers: [(Int, Int)], textures: [Int]) {
+        self.init(name: name, kind: .kernel, body: (), stageIn: nil, draw: nil, native: native,
+                  buffers: buffers.map { ($0.0, $0.1) }, textures: textures)
+    }
+    /// `@fragment` compiled to C++
+    public convenience init<V: Varyings>(fragment name: String, stageIn: V.Type, native: @escaping Native, buffers: [(Int, Int)], textures: [Int]) {
+        self.init(name: name, kind: .fragment, body: (), stageIn: V.self, draw: nil, native: native,
+                  buffers: buffers.map { ($0.0, $0.1) }, textures: textures)
+    }
+    public convenience init(fragment name: String, native: @escaping Native, buffers: [(Int, Int)], textures: [Int]) {
+        self.init(name: name, kind: .fragment, body: (), stageIn: nil, draw: nil, native: native,
+                  buffers: buffers.map { ($0.0, $0.1) }, textures: textures)
+    }
+
+    /// `@kernel`
+    @inlinable public convenience init(kernel name: String, _ body: @escaping Kernel) {
+        self.init(name: name, kind: .kernel, body: body, stageIn: nil, draw: nil)
+    }
+    /// `@vertex`
+    @inlinable public convenience init<V: Varyings>(vertex name: String, _ body: @escaping (MetallicArguments) -> (MetallicThread) -> V) {
+        self.init(name: name, kind: .vertex, body: body, stageIn: V.self, draw: { fragment, job in try _draw(job, fragment, body) })
+    }
+    /// `@fragment` with `[[stage_in]]`
+    @inlinable public convenience init<V: Varyings>(fragment name: String, stageIn: V.Type, _ body: @escaping (MetallicArguments) -> (MetallicSpan<V>) -> Void) {
+        self.init(name: name, kind: .fragment, body: body, stageIn: V.self, draw: nil)
+    }
+    /// `@fragment` without `[[stage_in]]`
+    @inlinable public convenience init(fragment name: String, _ body: @escaping (MetallicArguments) -> (MetallicSpan<MetallicNoVaryings>) -> Void) {
+        self.init(name: name, kind: .fragment, body: body, stageIn: nil, draw: nil)
+    }
+
+    var kernelBody: Kernel? { body as? Kernel }
+}
+
+public struct MetallicError: Error, CustomStringConvertible {
+    public let description: String
+    public init(_ d: String) { description = d }
+}

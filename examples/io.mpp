@@ -1,0 +1,56 @@
+// M++ I/O: typed errors, RAII files, atomic writes, fast buffered output,
+// explicit-endian binary encoding, memory mapping.
+
+let path = "/tmp/mpp-io-demo.txt"
+
+// Whole-file helpers. FS.write is atomic by default.
+try FS.write(path, "alpha 1\nbeta 2\ngamma 3\n")
+print(try FS.read(path), terminator: "")
+
+// Streaming lines from a move-only File (closed automatically).
+var total = 0
+try FS.forEachLine(path) { line in
+    let parts = line.split(separator: " ")
+    total += Int(parts[1])!
+}
+print("sum of column 2:", total)
+
+// Typed errors: the catch knows it's an IOError.
+do {
+    _ = try File("/definitely/not/here.txt")
+} catch {
+    print("caught:", error, "(errno \(error.errno ?? 0))")
+}
+
+// Fast buffered output.
+var out = BufferedWriter.standardOutput()
+for i in 1...3 { out.line("line", i, "of", 3) }
+out.flush()
+
+// Binary encoding with explicit byte order.
+var w = ByteWriter(endian: .big)
+w.write(UInt32(0xCAFE_BABE))
+w.write(Int16(-2), .little)
+w.write(3.5)
+w.write("héllo")
+try FS.write("/tmp/mpp-io-demo.bin", bytes: w.bytes)
+
+var r = ByteReader(try FS.readBytes("/tmp/mpp-io-demo.bin"), endian: .big)
+let magic = try r.read(UInt32.self)
+let small = try r.read(Int16.self, .little)
+let half = try r.read(Double.self)
+let word = try r.read(String.self)
+print("decoded:", String(magic, radix: 16), small, half, word)
+do { _ = try r.read(UInt64.self) } catch { print("past the end:", error) }
+
+// Memory-mapped read.
+let mapped = try MappedFile(path)
+let newlines = mapped.withBytes { $0.reduce(0) { $1 == 10 ? $0 + 1 : $0 } }
+print("mapped \(mapped.count) bytes, \(newlines) lines")
+
+// Token input from a file (stdin works the same way).
+let f = try File(path)
+var input = TokenReader(descriptor: f.descriptor)
+while let word = try input.next(), let n = try input.next(Int.self) {
+    print("token:", word, n * 100)
+}

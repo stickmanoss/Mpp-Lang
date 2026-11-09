@@ -1,0 +1,741 @@
+// Partial loading: using only the part of a model a step needs, instead of
+// holding the whole model in RAM. A model bigger than memory then runs from
+// disk, keeping in RAM just what is in use (the strategy Colibri uses to run
+// a 744B-parameter mixture-of-experts in ~25 GB;
+// github.com/JustVugg/colibri — this is an independent M++ implementation).
+//
+// Two access patterns, one machinery (int4 weights on disk, read with pread
+// into RAM under a byte budget):
+//
+//   • Sparse: a mixture-of-experts layer runs only the few experts its router
+//     picks, so only those are read. ExpertStore + ExpertCache + StreamingMoE:
+//     an LRU cache keeps recently used experts (consecutive tokens mostly
+//     reuse them), misses are read in parallel, top-p pruning skips experts
+//     that barely contribute.
+//
+//       let cache = ExpertCache(store: try ExpertStore(path: "model.experts"), budgetBytes: 12 << 30)
+//       let moe = StreamingMoE(layer: 3, router: routerWeights, cache: cache, topK: 8, topP: 0.85)
+//       let y = try moe.forward(x)
+//
+//   • Sequential: a dense model's layers run one after another, so only the
+//     current layer has to be in RAM. PartStore + PartStream: layer i runs
+//     while layer i+1 is read in the background, and finished layers are let
+//     go.
+//
+//       let stream = PartStream(store: try PartStore(path: "model.parts"), names: layerNames)
+//       try stream.forEach { name, weights in x = block(x, weights) }
+//
+// Both keep the part of the model that every step uses (embeddings,
+// attention, routers, norms) resident, as the caller decides.
+// `ExpertStore.convert` and `PartStore.write` build the files from safetensors
+// checkpoints (F32, F16, BF16, FP8 E4M3 with block scales), one tensor at a
+// time; `ModelPlan` says whether a model fits a machine and what to expect.
+
+import MppKit
+import Dispatch
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+public struct StreamingError: Error, CustomStringConvertible, Sendable {
+    public let description: String
+    public init(_ d: String) { description = d }
+}
+
+// MARK: - int4, group-scaled (gs64)
+
+/// A rows × cols matrix in int4 with one Float32 scale per 64 weights of a
+/// row (symmetric: q = round(w / s), q ∈ −8…7, s chosen per group for the least error).
+public struct QuantizedMatrix: Sendable {
+    public static let group = 64
+    public let rows: Int, cols: Int
+    /// Per row: scales (cols/64 Float32) then packed nibbles (cols/2 bytes).
+    public let bytes: [UInt8]
+
+    public static func byteCount(rows: Int, cols: Int) -> Int { rows * (cols / group * 4 + cols / 2) }
+
+    public init(rows: Int, cols: Int, bytes: [UInt8]) {
+        precondition(cols % QuantizedMatrix.group == 0, "QuantizedMatrix: columns must be a multiple of 64")
+        precondition(bytes.count == QuantizedMatrix.byteCount(rows: rows, cols: cols), "QuantizedMatrix: wrong byte count")
+        self.rows = rows
+        self.cols = cols
+        self.bytes = bytes
+    }
+
+    /// Quantizes row-major Float weights.
+    public init(quantizing w: [Float], rows: Int, cols: Int) {
+        precondition(w.count == rows * cols && cols % QuantizedMatrix.group == 0)
+        let g = QuantizedMatrix.group, groups = cols / g, rowBytes = groups * 4 + cols / 2
+        var out = [UInt8](repeating: 0, count: rows * rowBytes)
+        out.withUnsafeMutableBytes { raw in
+            for r in 0 ..< rows {
+                let row = raw.baseAddress! + r * rowBytes
+                let nibbles = row + groups * 4
+                for gi in 0 ..< groups {
+                    var m: Float = 0
+                    for j in 0 ..< g { m = max(m, abs(w[r * cols + gi * g + j])) }
+                    // The scale with the least squared error among a few candidates
+                    // (max/7 never clips; slightly smaller scales use the levels better).
+                    var s: Float = m > 0 ? m / 7 : 1, best = Float.infinity
+                    if m > 0 {
+                        for d: Float in [7, 7.5, 8, 8.5, 9, 10] {
+                            let c = m / d
+                            var err: Float = 0
+                            for j in 0 ..< g {
+                                let v = w[r * cols + gi * g + j]
+                                let q = max(-8, min(7, (v / c).rounded()))
+                                err += (v - q * c) * (v - q * c)
+                            }
+                            if err < best { best = err; s = c }
+                        }
+                    }
+                    row.storeBytes(of: s, toByteOffset: gi * 4, as: Float.self)
+                    for j in stride(from: 0, to: g, by: 2) {
+                        let c = gi * g + j
+                        func q(_ v: Float) -> UInt8 { UInt8(bitPattern: Int8(max(-8, min(7, (v / s).rounded())))) & 0x0F }
+                        let lo = q(w[r * cols + c]), hi = q(w[r * cols + c + 1])
+                        nibbles.storeBytes(of: lo | hi << 4, toByteOffset: c / 2, as: UInt8.self)
+                    }
+                }
+            }
+        }
+        self.init(rows: rows, cols: cols, bytes: out)
+    }
+
+    /// y = W · x, dequantizing on the fly (rows split across cores when large).
+    public func matvec(_ x: [Float]) -> [Float] {
+        precondition(x.count == cols, "QuantizedMatrix.matvec: x has \(x.count) values, expected \(cols)")
+        var y = [Float](repeating: 0, count: rows)
+        let g = QuantizedMatrix.group, groups = cols / g, rowBytes = groups * 4 + cols / 2
+        bytes.withUnsafeBytes { raw in
+            x.withUnsafeBufferPointer { xs in
+                y.withUnsafeMutableBufferPointer { ys in
+                    let base = _UncheckedBox(raw.baseAddress!), xb = _UncheckedBox(xs.baseAddress!), yb = _UncheckedBox(ys.baseAddress!)
+                    let work: @Sendable (Int, Int) -> Void = { r0, r1 in
+                        for r in r0 ..< r1 {
+                            let row = base.value + r * rowBytes
+                            let nib = (row + groups * 4).assumingMemoryBound(to: UInt8.self)
+                            var acc: Float = 0
+                            for gi in 0 ..< groups {
+                                let s = row.loadUnaligned(fromByteOffset: gi * 4, as: Float.self)
+                                var part: Float = 0
+                                var j = 0
+                                while j < g {
+                                    let b = nib[(gi * g + j) / 2]
+                                    let lo = Float(Int8(bitPattern: b << 4) >> 4), hi = Float(Int8(bitPattern: b) >> 4)
+                                    part += lo * xb.value[gi * g + j] + hi * xb.value[gi * g + j + 1]
+                                    j &+= 2
+                                }
+                                acc += part * s
+                            }
+                            yb.value[r] = acc
+                        }
+                    }
+                    if rows * cols < 1 << 18 { work(0, rows) }
+                    else {
+                        let chunks = min(rows, 16)
+                        DispatchQueue.concurrentPerform(iterations: chunks) { c in work(rows * c / chunks, rows * (c + 1) / chunks) }
+                    }
+                }
+            }
+        }
+        return y
+    }
+}
+
+struct _UncheckedBox<T>: @unchecked Sendable {
+    let value: T
+    init(_ v: T) { value = v }
+}
+
+// MARK: - Experts and the expert file
+
+/// One routed expert: a SwiGLU feed-forward (down · (silu(gate · x) ⊙ up · x)).
+public struct Expert: Sendable {
+    public let gate: QuantizedMatrix, up: QuantizedMatrix, down: QuantizedMatrix
+    public var byteCount: Int { gate.bytes.count + up.bytes.count + down.bytes.count }
+
+    public func callAsFunction(_ x: [Float]) -> [Float] {
+        let g = gate.matvec(x), u = up.matvec(x)
+        var h = [Float](repeating: 0, count: g.count)
+        for i in 0 ..< g.count { h[i] = g[i] / (1 + expf(-g[i])) * u[i] }
+        return down.matvec(h)
+    }
+}
+
+/// The on-disk expert file:
+///   "MPPEXP1\0", UInt64 JSON length, JSON {layers, experts, hidden, intermediate, format},
+///   UInt64 index[layers × experts × 2] (offset, length), then 4 KiB-aligned expert blobs
+///   (gate, up, down, each a QuantizedMatrix's bytes).
+public final class ExpertStore: @unchecked Sendable {
+    public let path: String
+    public let layers: Int, experts: Int, hidden: Int, intermediate: Int
+    let fd: Int32
+    let index: [UInt64]
+
+    public init(path: String) throws {
+        self.path = path
+        fd = open(path, O_RDONLY)
+        guard fd >= 0 else { throw StreamingError("cannot open \(path): \(String(cString: strerror(errno)))") }
+        var magic = [UInt8](repeating: 0, count: 8)
+        guard pread(fd, &magic, 8, 0) == 8, magic == Array("MPPEXP1\0".utf8) else { close(fd); throw StreamingError("\(path) is not an M++ expert file") }
+        var len: UInt64 = 0
+        _ = pread(fd, &len, 8, 8)
+        var jsonBytes = [UInt8](repeating: 0, count: Int(len))
+        _ = pread(fd, &jsonBytes, Int(len), 16)
+        let meta = try JSON.parse(String(decoding: jsonBytes, as: UTF8.self))
+        guard let l = meta["layers"].int, let e = meta["experts"].int, let h = meta["hidden"].int, let i = meta["intermediate"].int else {
+            close(fd); throw StreamingError("\(path): bad header")
+        }
+        layers = l; experts = e; hidden = h; intermediate = i
+        var idx = [UInt64](repeating: 0, count: l * e * 2)
+        let file = fd
+        _ = idx.withUnsafeMutableBytes { pread(file, $0.baseAddress, $0.count, off_t(16 + Int(len))) }
+        index = idx
+    }
+    deinit { close(fd) }
+
+    public var expertBytes: Int { 2 * QuantizedMatrix.byteCount(rows: intermediate, cols: hidden) + QuantizedMatrix.byteCount(rows: hidden, cols: intermediate) }
+    public var totalBytes: Int { expertBytes * layers * experts }
+
+    /// Reads one expert from disk (pread: no shared file offset, so reads can run in parallel).
+    public func read(layer: Int, expert: Int) throws -> Expert {
+        precondition(layer >= 0 && layer < layers && expert >= 0 && expert < experts, "ExpertStore: no expert \(layer).\(expert)")
+        let k = (layer * experts + expert) * 2
+        let offset = Int(index[k]), length = Int(index[k + 1])
+        var buf = [UInt8](repeating: 0, count: length)
+        var done = 0
+        while done < length {
+            let n = buf.withUnsafeMutableBytes { pread(fd, $0.baseAddress! + done, length - done, off_t(offset + done)) }
+            if n <= 0 { throw StreamingError("\(path): short read at expert \(layer).\(expert)") }
+            done += n
+        }
+        let gu = QuantizedMatrix.byteCount(rows: intermediate, cols: hidden)
+        return Expert(gate: QuantizedMatrix(rows: intermediate, cols: hidden, bytes: Array(buf[0 ..< gu])),
+                      up: QuantizedMatrix(rows: intermediate, cols: hidden, bytes: Array(buf[gu ..< 2 * gu])),
+                      down: QuantizedMatrix(rows: hidden, cols: intermediate, bytes: Array(buf[2 * gu ..< length])))
+    }
+
+    /// Writes an expert file. `weights(layer, expert)` returns the expert's
+    /// gate [intermediate × hidden], up [intermediate × hidden] and down
+    /// [hidden × intermediate] as row-major Floats; it is called once per
+    /// expert, so a converter can stream a checkpoint one expert at a time.
+    public static func write(to path: String, layers: Int, experts: Int, hidden: Int, intermediate: Int,
+                             weights: (Int, Int) throws -> (gate: [Float], up: [Float], down: [Float])) throws {
+        let fd = open(path + ".tmp", O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard fd >= 0 else { throw StreamingError("cannot create \(path)") }
+        defer { close(fd) }
+        func put(_ bytes: UnsafeRawBufferPointer, at offset: Int) throws {
+            var done = 0
+            while done < bytes.count {
+                let n = pwrite(fd, bytes.baseAddress! + done, bytes.count - done, off_t(offset + done))
+                if n <= 0 { throw StreamingError("\(path): write failed") }
+                done += n
+            }
+        }
+        let json = Array("{\"layers\":\(layers),\"experts\":\(experts),\"hidden\":\(hidden),\"intermediate\":\(intermediate),\"format\":\"int4-gs64\"}".utf8)
+        var head = Array("MPPEXP1\0".utf8)
+        withUnsafeBytes(of: UInt64(json.count)) { head += $0 }
+        head += json
+        let indexAt = head.count
+        var index = [UInt64](repeating: 0, count: layers * experts * 2)
+        var offset = (indexAt + index.count * 8 + 4095) / 4096 * 4096
+        for l in 0 ..< layers {
+            for e in 0 ..< experts {
+                let w = try weights(l, e)
+                let blob = QuantizedMatrix(quantizing: w.gate, rows: intermediate, cols: hidden).bytes
+                    + QuantizedMatrix(quantizing: w.up, rows: intermediate, cols: hidden).bytes
+                    + QuantizedMatrix(quantizing: w.down, rows: hidden, cols: intermediate).bytes
+                try blob.withUnsafeBytes { try put($0, at: offset) }
+                index[(l * experts + e) * 2] = UInt64(offset)
+                index[(l * experts + e) * 2 + 1] = UInt64(blob.count)
+                offset = (offset + blob.count + 4095) / 4096 * 4096
+            }
+        }
+        try head.withUnsafeBytes { try put($0, at: 0) }
+        try index.withUnsafeBytes { try put($0, at: indexAt) }
+        if rename(path + ".tmp", path) != 0 { throw StreamingError("cannot replace \(path)") }
+    }
+}
+
+// MARK: - Cache
+
+/// Experts in RAM, least recently used evicted first, within a byte budget.
+public final class ExpertCache: @unchecked Sendable {
+    public struct Stats: Sendable, CustomStringConvertible {
+        public var hits = 0, misses = 0, bytesRead = 0, evictions = 0
+        public var hitRate: Double { hits + misses == 0 ? 0 : Double(hits) / Double(hits + misses) }
+        public var description: String {
+            "hits \(hits), misses \(misses) (\(Int(hitRate * 100))% hit), read \(Double(bytesRead / 1_000_000) / 1000) GB, evictions \(evictions)"
+        }
+    }
+    public let store: ExpertStore
+    public let budgetBytes: Int
+    public private(set) var stats = Stats()
+    var entries: [Int: (expert: Expert, lastUse: Int)] = [:]
+    var bytes = 0, clock = 0
+    let lock = Lock()
+
+    public init(store: ExpertStore, budgetBytes: Int) {
+        self.store = store
+        self.budgetBytes = budgetBytes
+    }
+
+    public var residentBytes: Int { lock.locked { bytes } }
+
+    /// The experts `ids` of `layer`; missing ones are read from disk in parallel.
+    public func experts(layer: Int, _ ids: [Int]) throws -> [Expert] {
+        var result = [Expert?](repeating: nil, count: ids.count)
+        var missing: [Int] = []
+        lock.locked {
+            clock += 1
+            for (i, id) in ids.enumerated() {
+                if let hit = entries[layer * store.experts + id] {
+                    result[i] = hit.expert
+                    entries[layer * store.experts + id] = (hit.expert, clock)
+                    stats.hits += 1
+                } else { missing.append(i) }
+            }
+        }
+        if !missing.isEmpty {
+            let loaded = _Results<Expert>(missing.count)
+            let store = self.store, wanted = missing.map { ids[$0] }
+            DispatchQueue.concurrentPerform(iterations: wanted.count) { k in
+                loaded.set(k, Result { try store.read(layer: layer, expert: wanted[k]) })
+            }
+            try lock.locked {
+                for (k, i) in missing.enumerated() {
+                    let e = try loaded.get(k).get()
+                    result[i] = e
+                    stats.misses += 1
+                    stats.bytesRead += e.byteCount
+                    insert(layer * store.experts + ids[i], e)
+                }
+            }
+        }
+        return result.map { $0! }
+    }
+
+    func insert(_ key: Int, _ e: Expert) {
+        if entries[key] != nil { return }
+        while bytes + e.byteCount > budgetBytes, let victim = entries.min(by: { $0.value.lastUse < $1.value.lastUse }) {
+            bytes -= victim.value.expert.byteCount
+            entries[victim.key] = nil
+            stats.evictions += 1
+        }
+        if e.byteCount <= budgetBytes {
+            entries[key] = (e, clock)
+            bytes += e.byteCount
+        }
+    }
+}
+
+final class _Results<T>: @unchecked Sendable {
+    var items: [Result<T, Error>?]
+    let lock = Lock()
+    init(_ n: Int) { items = Array(repeating: nil, count: n) }
+    func set(_ i: Int, _ r: Result<T, Error>) { lock.locked { items[i] = r } }
+    func get(_ i: Int) -> Result<T, Error> { lock.locked { items[i]! } }
+}
+
+// MARK: - The streaming MoE layer
+
+public final class StreamingMoE: @unchecked Sendable {
+    public let layer: Int
+    public let router: [Float]            // experts × hidden, row-major (resident)
+    public let cache: ExpertCache
+    public let topK: Int
+    public let topP: Float                // keep the fewest experts whose weights reach topP (1 = all top-k)
+    public let shared: Expert?            // a shared expert that always runs (resident)
+
+    public init(layer: Int, router: [Float], cache: ExpertCache, topK: Int, topP: Float = 1, shared: Expert? = nil) {
+        precondition(router.count == cache.store.experts * cache.store.hidden, "StreamingMoE: router must be experts × hidden")
+        self.layer = layer
+        self.router = router
+        self.cache = cache
+        self.topK = topK
+        self.topP = topP
+        self.shared = shared
+    }
+
+    /// The experts and weights the router picks for `x`.
+    public func route(_ x: [Float]) -> [(expert: Int, weight: Float)] {
+        let n = cache.store.experts, h = cache.store.hidden
+        var logits = [Float](repeating: 0, count: n)
+        for e in 0 ..< n { var s: Float = 0; for j in 0 ..< h { s += router[e * h + j] * x[j] }; logits[e] = s }
+        let top = logits.indices.sorted { logits[$0] > logits[$1] }.prefix(topK)
+        let m = logits[top.first!]
+        var picked = top.map { (expert: $0, weight: expf(logits[$0] - m)) }
+        let total = picked.reduce(0) { $0 + $1.weight }
+        picked = picked.map { ($0.expert, $0.weight / total) }
+        if topP < 1 {
+            var mass: Float = 0, keep = 0
+            for p in picked { keep += 1; mass += p.weight; if mass >= topP { break } }
+            picked = Array(picked.prefix(keep))
+            let kept = picked.reduce(0) { $0 + $1.weight }
+            picked = picked.map { ($0.expert, $0.weight / kept) }
+        }
+        return picked
+    }
+
+    /// One token: Σ weight · expert(x) (+ the shared expert).
+    public func forward(_ x: [Float]) throws -> [Float] {
+        let routes = route(x)
+        let experts = try cache.experts(layer: layer, routes.map(\.expert))
+        var y = shared.map { $0(x) } ?? [Float](repeating: 0, count: x.count)
+        for (r, e) in zip(routes, experts) {
+            let out = e(x)
+            for i in 0 ..< y.count { y[i] += r.weight * out[i] }
+        }
+        return y
+    }
+}
+
+// MARK: - Converting checkpoints
+
+/// FP8 E4M3 (the format of GLM-5.x and DeepSeek-V3 checkpoints) to Float.
+public func fp8E4M3ToFloat(_ b: UInt8) -> Float {
+    let sign: Float = b & 0x80 != 0 ? -1 : 1
+    let exp = Int((b >> 3) & 0x0F), mant = Float(b & 0x07)
+    if exp == 0x0F && b & 0x07 == 0x07 { return .nan }
+    if exp == 0 { return sign * mant / 8 * powf(2, -6) }
+    return sign * (1 + mant / 8) * powf(2, Float(exp - 7))
+}
+
+/// Reads single tensors out of safetensors files by offset (no whole-file
+/// load: checkpoints can be hundreds of GB).
+public final class SafetensorsIndex: @unchecked Sendable {
+    public struct Entry: Sendable { public let file: String; public let dtype: String; public let shape: [Int]; public let start: Int; public let end: Int }
+    public private(set) var entries: [String: Entry] = [:]
+
+    public init(files: [String]) throws {
+        for f in files {
+            let fd = open(f, O_RDONLY)
+            guard fd >= 0 else { throw StreamingError("cannot open \(f)") }
+            defer { close(fd) }
+            var len: UInt64 = 0
+            _ = pread(fd, &len, 8, 0)
+            var bytes = [UInt8](repeating: 0, count: Int(len))
+            _ = pread(fd, &bytes, Int(len), 8)
+            let header = try JSON.parse(String(decoding: bytes, as: UTF8.self))
+            for (name, info) in header.object ?? JSON.Object() where name != "__metadata__" {
+                guard let dtype = info["dtype"].string, let shape = info["shape"].array?.compactMap(\.int),
+                      let offs = info["data_offsets"].array?.compactMap(\.int), offs.count == 2 else { continue }
+                entries[name] = Entry(file: f, dtype: dtype, shape: shape, start: 8 + Int(len) + offs[0], end: 8 + Int(len) + offs[1])
+            }
+        }
+    }
+
+    /// The tensor as Floats. FP8 weights with a `<name>_scale_inv` companion
+    /// (128 × 128 block scales) are scaled back.
+    public func floats(_ name: String) throws -> [Float] {
+        guard let e = entries[name] else { throw StreamingError("tensor \(name) not found") }
+        let fd = open(e.file, O_RDONLY)
+        guard fd >= 0 else { throw StreamingError("cannot open \(e.file)") }
+        defer { close(fd) }
+        var raw = [UInt8](repeating: 0, count: e.end - e.start)
+        var done = 0
+        let total = raw.count
+        while done < total {
+            let n = raw.withUnsafeMutableBytes { pread(fd, $0.baseAddress! + done, total - done, off_t(e.start + done)) }
+            if n <= 0 { throw StreamingError("short read in \(e.file)") }
+            done += n
+        }
+        let count = e.shape.reduce(1, *)
+        switch e.dtype {
+        case "F32": return raw.withUnsafeBytes { Array($0.bindMemory(to: Float.self).prefix(count)) }
+        case "F16", "BF16":
+            return (0 ..< count).map { i in
+                let h = UInt16(raw[2 * i]) | UInt16(raw[2 * i + 1]) << 8
+                return e.dtype == "BF16" ? Float(bitPattern: UInt32(h) << 16) : halfToFloat(h)
+            }
+        case "F8_E4M3":
+            var v = raw.prefix(count).map(fp8E4M3ToFloat)
+            if let s = entries[name + "_scale_inv"], e.shape.count == 2 {
+                let scales = try floats(name + "_scale_inv")
+                let rows = e.shape[0], cols = e.shape[1], bc = (cols + 127) / 128
+                _ = s
+                for r in 0 ..< rows { for c in 0 ..< cols { v[r * cols + c] *= scales[(r / 128) * bc + c / 128] } }
+            }
+            return v
+        default: throw StreamingError("\(name): unsupported dtype \(e.dtype)")
+        }
+    }
+}
+
+extension ExpertStore {
+    /// Builds an expert file from a safetensors checkpoint, one expert at a
+    /// time (RAM use stays at one expert). `name(layer, expert, part)` gives
+    /// the tensor name for part "gate", "up" or "down"; the default is the
+    /// GLM/DeepSeek naming `model.layers.L.mlp.experts.E.{gate,up,down}_proj.weight`.
+    public static func convert(checkpoint files: [String], to path: String, layers: Range<Int>, experts: Int,
+                               hidden: Int, intermediate: Int,
+                               name: (Int, Int, String) -> String = { l, e, p in "model.layers.\(l).mlp.experts.\(e).\(p)_proj.weight" },
+                               progress: ((Int, Int) -> Void)? = nil) throws {
+        let index = try SafetensorsIndex(files: files)
+        var done = 0
+        try write(to: path, layers: layers.count, experts: experts, hidden: hidden, intermediate: intermediate) { l, e in
+            let layer = layers.lowerBound + l
+            let w = (gate: try index.floats(name(layer, e, "gate")), up: try index.floats(name(layer, e, "up")),
+                     down: try index.floats(name(layer, e, "down")))
+            done += 1
+            progress?(done, layers.count * experts)
+            return w
+        }
+    }
+}
+
+// MARK: - Planning
+
+/// Will a model fit, and what will it cost per token?
+public struct ModelPlan: Sendable, CustomStringConvertible {
+    public var totalParameters: Double        // e.g. 744e9
+    public var activeParameters: Double       // used per token: 40e9 for that MoE, all of them for a dense model
+    public var residentParameters: Double     // kept in RAM (embeddings, attention, routers, norms…)
+    public var bitsPerWeight: Double = 4.5    // int4 gs64
+    public var ramBytes: Double
+    public var diskBytesPerSecond: Double = 3e9
+    /// Fraction of the streamed bytes a token finds already in RAM. Default:
+    /// 0.7 for a sparse model (consecutive tokens mostly reuse experts); for a
+    /// dense model, the share of its streamed weights the cache can hold for good.
+    public var cacheHitRate: Double? = nil
+
+    public init(totalParameters: Double, activeParameters: Double, residentParameters: Double, ramBytes: Double) {
+        self.totalParameters = totalParameters
+        self.activeParameters = activeParameters
+        self.residentParameters = residentParameters
+        self.ramBytes = ramBytes
+    }
+
+    public var isDense: Bool { activeParameters >= totalParameters }
+    public var residentBytes: Double { residentParameters * bitsPerWeight / 8 }
+    public var diskBytes: Double { (totalParameters - residentParameters) * bitsPerWeight / 8 }
+    /// RAM left for streamed weights (15% kept for activations and the OS).
+    public var cacheBytes: Double { max(0, ramBytes * 0.85 - residentBytes) }
+    public var streamedBytesPerToken: Double { max(0, activeParameters - residentParameters) * bitsPerWeight / 8 }
+    public var hitRate: Double { cacheHitRate ?? (isDense ? (diskBytes > 0 ? min(1, cacheBytes / diskBytes) : 1) : 0.7) }
+    public var diskBytesPerToken: Double { streamedBytesPerToken * (1 - hitRate) }
+    public var tokensPerSecond: Double { diskBytesPerToken > 0 ? diskBytesPerSecond / diskBytesPerToken : .infinity }
+    /// Sparse: room for a useful cache (a quarter of a token's experts).
+    /// Dense: the resident part fits, with room to stream.
+    public var fits: Bool { isDense ? cacheBytes > 0 : cacheBytes >= streamedBytesPerToken * 0.25 }
+
+    // Earlier names.
+    public var expertCacheBytes: Double { cacheBytes }
+    public var routedBytesPerToken: Double { streamedBytesPerToken }
+
+    public var description: String {
+        func gb(_ b: Double) -> String { "\(Double(Int(b / 1e8)) / 10) GB" }
+        return """
+        resident in RAM: \(gb(residentBytes)); cache for streamed weights: \(gb(cacheBytes)); on disk: \(gb(diskBytes))
+        per token: \(gb(streamedBytesPerToken)) streamed, \(gb(diskBytesPerToken)) from disk at \(Int(hitRate * 100))% cache hits
+        ≈ \(Double(Int(tokensPerSecond * 100)) / 100) tokens/s at \(gb(diskBytesPerSecond))/s (disk-bound); \(fits ? "fits" : "RAM too small for the resident part and a useful cache")
+        """
+    }
+}
+
+// MARK: - Named parts (any model, read whole parts at a time)
+
+/// An on-disk file of named parts, each a list of int4 matrices (a dense
+/// layer's weights, an expert, an embedding block — whatever the caller
+/// loads together):
+///   "MPPPRT1\0", UInt64 JSON length, JSON {parts: [{name, offset, matrices: [[rows, cols]]}]},
+///   then 4 KiB-aligned blobs (the matrices' bytes, back to back).
+public final class PartStore: @unchecked Sendable {
+    public struct Entry: Sendable {
+        public let name: String
+        public let offset: Int
+        public let shapes: [(rows: Int, cols: Int)]
+        public var byteCount: Int { shapes.reduce(0) { $0 + QuantizedMatrix.byteCount(rows: $1.rows, cols: $1.cols) } }
+    }
+
+    public let path: String
+    public let entries: [Entry]
+    let byName: [String: Int]
+    let fd: Int32
+
+    public init(path: String) throws {
+        self.path = path
+        fd = open(path, O_RDONLY)
+        guard fd >= 0 else { throw StreamingError("cannot open \(path): \(String(cString: strerror(errno)))") }
+        var magic = [UInt8](repeating: 0, count: 8)
+        guard pread(fd, &magic, 8, 0) == 8, magic == Array("MPPPRT1\0".utf8) else { close(fd); throw StreamingError("\(path) is not an M++ part file") }
+        var len: UInt64 = 0
+        _ = pread(fd, &len, 8, 8)
+        var jsonBytes = [UInt8](repeating: 0, count: Int(len))
+        _ = pread(fd, &jsonBytes, Int(len), 16)
+        let meta = try JSON.parse(String(decoding: jsonBytes, as: UTF8.self))
+        var list: [Entry] = []
+        for p in meta["parts"].array ?? [] {
+            guard let name = p["name"].string, let offset = p["offset"].int else { close(fd); throw StreamingError("\(path): bad header") }
+            let shapes = (p["matrices"].array ?? []).compactMap { m -> (rows: Int, cols: Int)? in
+                guard let r = m[0].int, let c = m[1].int else { return nil }
+                return (r, c)
+            }
+            list.append(Entry(name: name, offset: offset, shapes: shapes))
+        }
+        entries = list
+        byName = Dictionary(list.enumerated().map { ($1.name, $0) }, uniquingKeysWith: { a, _ in a })
+    }
+    deinit { close(fd) }
+
+    public var names: [String] { entries.map(\.name) }
+    public var totalBytes: Int { entries.reduce(0) { $0 + $1.byteCount } }
+    public func entry(_ name: String) -> Entry? { byName[name].map { entries[$0] } }
+
+    /// Reads one part's matrices from disk (pread: safe to call from several threads).
+    public func read(_ name: String) throws -> [QuantizedMatrix] {
+        guard let e = entry(name) else { throw StreamingError("\(path): no part named \(name)") }
+        let length = e.byteCount
+        var buf = [UInt8](repeating: 0, count: length)
+        var done = 0
+        while done < length {
+            let n = buf.withUnsafeMutableBytes { pread(fd, $0.baseAddress! + done, length - done, off_t(e.offset + done)) }
+            if n <= 0 { throw StreamingError("\(path): short read in part \(name)") }
+            done += n
+        }
+        var out: [QuantizedMatrix] = []
+        var at = 0
+        for (r, c) in e.shapes {
+            let n = QuantizedMatrix.byteCount(rows: r, cols: c)
+            out.append(QuantizedMatrix(rows: r, cols: c, bytes: Array(buf[at ..< at + n])))
+            at += n
+        }
+        return out
+    }
+
+    /// Writes a part file. `weights(i)` returns part i's matrices as
+    /// (row-major Floats, rows, cols); it is called once per part, so a
+    /// converter can stream a checkpoint a part at a time.
+    public static func write(to path: String, names: [String],
+                             weights: (Int) throws -> [(values: [Float], rows: Int, cols: Int)]) throws {
+        let fd = open(path + ".tmp", O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard fd >= 0 else { throw StreamingError("cannot create \(path)") }
+        defer { close(fd) }
+        func put(_ bytes: UnsafeRawBufferPointer, at offset: Int) throws {
+            var done = 0
+            while done < bytes.count {
+                let n = pwrite(fd, bytes.baseAddress! + done, bytes.count - done, off_t(offset + done))
+                if n <= 0 { throw StreamingError("\(path): write failed") }
+                done += n
+            }
+        }
+        // Blobs first (after room for the header), then the header that indexes them.
+        let reserve = 64 * 1024 + names.reduce(0) { $0 + $1.utf8.count + 96 }     // room for the header
+        var offset = (reserve + 4095) / 4096 * 4096
+        var json = "{\"format\":\"int4-gs64\",\"parts\":["
+        for (i, name) in names.enumerated() {
+            let ms = try weights(i)
+            var blob: [UInt8] = []
+            var shapes: [(Int, Int)] = []
+            for m in ms {
+                precondition(m.values.count == m.rows * m.cols && m.cols % QuantizedMatrix.group == 0,
+                             "PartStore: part \(name) has a \(m.rows)×\(m.cols) matrix (columns must be a multiple of \(QuantizedMatrix.group))")
+                blob += QuantizedMatrix(quantizing: m.values, rows: m.rows, cols: m.cols).bytes
+                shapes.append((m.rows, m.cols))
+            }
+            try blob.withUnsafeBytes { try put($0, at: offset) }
+            var escaped = ""
+            for ch in name.unicodeScalars {
+                switch ch {
+                case "\\": escaped += "\\\\"
+                case "\"": escaped += "\\\""
+                default: if ch.value < 32 { escaped += "?" } else { escaped.unicodeScalars.append(ch) }
+                }
+            }
+            json += (i > 0 ? "," : "") + "{\"name\":\"\(escaped)\",\"offset\":\(offset),\"matrices\":["
+                + shapes.map { "[\($0.0),\($0.1)]" }.joined(separator: ",") + "]}"
+            offset = (offset + blob.count + 4095) / 4096 * 4096
+        }
+        json += "]}"
+        let jsonBytes = Array(json.utf8)
+        guard 16 + jsonBytes.count <= reserve else { throw StreamingError("\(path): header too large") }
+        var head = Array("MPPPRT1\0".utf8)
+        withUnsafeBytes(of: UInt64(jsonBytes.count)) { head += $0 }
+        head += jsonBytes
+        try head.withUnsafeBytes { try put($0, at: 0) }
+        if rename(path + ".tmp", path) != 0 { throw StreamingError("cannot replace \(path)") }
+    }
+}
+
+/// Runs a model's parts in order with only the current one in RAM: while the
+/// caller computes with part i, part i+1 (and further, up to `lookahead`) is
+/// read in the background. A dense model bigger than RAM runs this way at
+/// roughly disk speed, with peak memory of about lookahead + 1 parts.
+public final class PartStream: @unchecked Sendable {
+    public let store: PartStore
+    public let names: [String]
+    public let lookahead: Int
+    public private(set) var bytesRead = 0
+    /// The most part bytes that were in RAM at once.
+    public private(set) var peakResidentBytes = 0
+
+    public init(store: PartStore, names: [String]? = nil, lookahead: Int = 1) {
+        self.store = store
+        self.names = names ?? store.names
+        self.lookahead = max(0, lookahead)
+    }
+
+    /// Calls `body(name, matrices)` for each part in order.
+    public func forEach(_ body: (String, [QuantizedMatrix]) throws -> Void) throws {
+        if names.isEmpty { return }
+        let state = _StreamState(names.count)
+        let store = self.store, names = self.names
+        var issued = 0
+        func issue(upTo last: Int) {
+            while issued <= min(last, names.count - 1) {
+                let i = issued
+                DispatchQueue.global().async { state.finish(i, Result { try store.read(names[i]) }) }
+                issued += 1
+            }
+        }
+        issue(upTo: lookahead)
+        for i in 0 ..< names.count {
+            let part = try state.wait(i).get()
+            issue(upTo: i + lookahead)                 // the next parts load while this one runs
+            try body(names[i], part)
+            state.release(i)
+        }
+        bytesRead += state.bytesRead
+        peakResidentBytes = max(peakResidentBytes, state.peak)
+    }
+}
+
+/// Parts in flight: loaded results, the bytes they hold, the peak.
+final class _StreamState: @unchecked Sendable {
+    let lock = Lock()
+    let arrived = DispatchSemaphore(value: 0)
+    var results: [Result<[QuantizedMatrix], Error>?]
+    var sizes: [Int]
+    var resident = 0, peak = 0, bytesRead = 0
+    init(_ n: Int) { results = Array(repeating: nil, count: n); sizes = Array(repeating: 0, count: n) }
+
+    func finish(_ i: Int, _ r: Result<[QuantizedMatrix], Error>) {
+        lock.locked {
+            results[i] = r
+            if case .success(let ms) = r {
+                sizes[i] = ms.reduce(0) { $0 + $1.bytes.count }
+                resident += sizes[i]
+                bytesRead += sizes[i]
+                peak = max(peak, resident)
+            }
+        }
+        arrived.signal()
+    }
+    func wait(_ i: Int) -> Result<[QuantizedMatrix], Error> {
+        while true {
+            if let r = lock.locked({ results[i] }) { return r }
+            arrived.wait()
+        }
+    }
+    func release(_ i: Int) {
+        lock.locked {
+            results[i] = .success([])
+            resident -= sizes[i]
+        }
+    }
+}

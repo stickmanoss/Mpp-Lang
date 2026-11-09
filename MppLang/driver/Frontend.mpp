@@ -1,0 +1,860 @@
+// mpp driver — front end: lowers M++ syntax to Swift.
+//
+//   place <dest> <Type>(<args>)    ->  _mppPlace(into: <dest>, <Type>(<args>))
+//   unplace <pointer>              ->  _mppUnplace(<pointer>)
+//   import liquidglass.mpp         ->  import liquidglass
+//   for i in a..<b { ... }         ->  parallel, when provably safe (see below)
+//   serial for i in ... { ... }    ->  always sequential
+//   parallel for i in ... { ... }  ->  always parallel (the compiler still checks races)
+//
+// Automatic parallel loops. A `for` over an integer range runs its
+// iterations on all cores when:
+//   1. the body passes a conservative scan: no break / continue / return /
+//      throw / try / await / inout (&), no direct I/O (print, logger, ...),
+//      and it assigns only to its own locals or to `array[i]` at exactly
+//      the loop index;
+//   2. the Swift 6 compiler then proves the parallel version race-free.
+//      If it cannot, the build reports errors inside the loop; the driver
+//      marks that loop serial and compiles again.
+// At run time `_mppAutoFor` times the first iterations and stays
+// sequential when the whole loop would be too short to benefit.
+//
+// Proven-safe sequential loops. Every other `for` over a range is lowered
+// so that the optimizer can do what -Ounchecked does, with all checks kept:
+//   * the loop counter steps with `&+` (it cannot overflow: it stays below
+//     the range's upper bound), which frees LLVM to keep values in
+//     registers and unroll;
+//   * arrays indexed only as `a[i]`, `a[i + k]` or `a[i - k]` get one
+//     bounds check before the loop instead of one per access. If that check
+//     passes, the body runs on the array's storage with the per-access checks
+//     proven redundant; if not, the same body runs with every access checked,
+//     so an out-of-range index still stops at exactly the same iteration.
+//     This only applies when the body cannot reach the array any other way
+//     (no closures, no calls other than pure math, no other mention of it).
+// Any lowered loop the compiler rejects is compiled again unlowered.
+//
+// Lowering never adds or removes newlines, so diagnostics keep their line
+// numbers, and each loop keeps its own line range.
+
+/// A loop that was lowered to parallel code.
+struct ParallelLoop: Hashable {
+    let firstLine: Int
+    let lastLine: Int
+    /// false: a proven-safe sequential loop (not parallel).
+    var parallel = true
+}
+
+struct LoweringResult {
+    var text: String
+    var parallelLoops: [ParallelLoop]
+}
+
+struct LoweringOptions {
+    var autoParallel = true
+    /// Loops (by first line) that must stay sequential.
+    var serialLoops: Set<Int> = []
+    /// Loops (by first line) that must not be lowered at all.
+    var plainLoops: Set<Int> = []
+    /// Proven-safe sequential lowering (see above).
+    var fastLoops = true
+    /// Metallic shaders compiled to C++ (ShaderCpp.mpp), by name.
+    var nativeShaders: [String: Lowerer.NativeShader] = [:]
+}
+
+enum Frontend {
+    // MARK: Code mask
+
+    /// 1 for bytes that are Swift code (not comments or string literals;
+    /// string interpolations count as code).
+    static func codeMask(_ s: [UInt8]) -> [Bool] {
+        let n = s.count
+        var mask = [Bool](repeating: false, count: n)
+        struct Frame { var code: Bool; var depth = 0; var hashes = 0; var multi = false }
+        var stack = [Frame(code: true)]
+        var i = 0
+        func at(_ i: Int, _ lit: [UInt8]) -> Bool {
+            i + lit.count <= n && s[i ..< i + lit.count].elementsEqual(lit)
+        }
+        let quote = UInt8(ascii: "\""), hash = UInt8(ascii: "#"), slash = UInt8(ascii: "/"), star = UInt8(ascii: "*")
+        let backslash = UInt8(ascii: "\\"), lp = UInt8(ascii: "("), rp = UInt8(ascii: ")")
+        while i < n {
+            let top = stack[stack.count - 1]
+            if top.code {
+                if s[i] == slash && i + 1 < n && s[i + 1] == slash {
+                    while i < n && s[i] != 10 { i += 1 }
+                    continue
+                }
+                if s[i] == slash && i + 1 < n && s[i + 1] == star {
+                    var depth = 1
+                    i += 2
+                    while i < n && depth > 0 {
+                        if s[i] == slash && i + 1 < n && s[i + 1] == star { depth += 1; i += 2 }
+                        else if s[i] == star && i + 1 < n && s[i + 1] == slash { depth -= 1; i += 2 }
+                        else { i += 1 }
+                    }
+                    continue
+                }
+                var j = i
+                while j < n && s[j] == hash { j += 1 }
+                if j < n && s[j] == quote {
+                    let multi = at(j, [quote, quote, quote])
+                    stack.append(Frame(code: false, hashes: j - i, multi: multi))
+                    i = j + (multi ? 3 : 1)
+                    continue
+                }
+                mask[i] = true
+                if s[i] == lp { stack[stack.count - 1].depth += 1 }
+                else if s[i] == rp {
+                    if top.depth == 0 && stack.count > 1 {
+                        mask[i] = false
+                        stack.removeLast()
+                        i += 1
+                        continue
+                    }
+                    stack[stack.count - 1].depth -= 1
+                }
+                i += 1
+            } else {
+                let closer = (top.multi ? [quote, quote, quote] : [quote]) + [UInt8](repeating: hash, count: top.hashes)
+                let esc = [backslash] + [UInt8](repeating: hash, count: top.hashes)
+                if at(i, esc) {
+                    let k = i + esc.count
+                    if k < n && s[k] == lp { stack.append(Frame(code: true)); i = k + 1; continue }
+                    i = k + 1
+                    continue
+                }
+                if at(i, closer) { stack.removeLast(); i += closer.count; continue }
+                i += 1
+            }
+        }
+        return mask
+    }
+
+    // MARK: Lowering
+
+    static func lower(_ source: String, _ options: LoweringOptions = LoweringOptions()) -> LoweringResult {
+        var source = source
+        var m = Lowerer(Array(source.utf8))
+        if let expanded = m.expandModels() { source = expanded }
+        var sh = Lowerer(Array(source.utf8))
+        if let expanded = sh.expandShaders(native: options.nativeShaders) { source = expanded }
+        var l = Lowerer(Array(source.utf8))
+        let text = l.lower(options)
+        return LoweringResult(text: normalizeImports(text), parallelLoops: l.parallel)
+    }
+
+    /// `import x.mpp` -> `import x`; a file importing liquidglass drops `import MppUI`.
+    static func normalizeImports(_ text: String) -> String {
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var glass = false
+        let mask = codeMask(Array(text.utf8))
+        var offset = 0
+        var importLines: [(Int, String)] = []
+        for (k, line) in lines.enumerated() {
+            let trimmed = line.drop { $0 == " " || $0 == "\t" }
+            let lead = line.utf8.count - trimmed.utf8.count
+            if offset + lead < mask.count && mask[offset + lead], let name = importedName(String(trimmed)) {
+                importLines.append((k, name))
+                if name == "liquidglass" { glass = true }
+            }
+            offset += line.utf8.count + 1
+        }
+        for (k, name) in importLines {
+            if lines[k].contains(name + ".mpp") { lines[k] = lines[k].replacingFirst(name + ".mpp", with: name) }
+            if glass && name == "MppUI" { lines[k] = "/* MppUI via liquidglass */" }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// The module named by an import declaration line, if it is one.
+    static func importedName(_ line: String) -> String? {
+        var words = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        while let w = words.first, w.hasPrefix("@") { words.removeFirst() }
+        guard words.first == "import", words.count >= 2 else { return nil }
+        var target = words[1]
+        if ["struct", "class", "enum", "protocol", "typealias", "func", "var", "let"].contains(target), words.count >= 3 {
+            target = words[2]
+        }
+        let name = target.prefix { $0.isLetter || $0.isNumber || $0 == "_" }
+        return name.isEmpty ? nil : String(name)
+    }
+
+    /// Modules imported by a source file (code only).
+    static func importedModules(_ source: String) -> [String] {
+        let mask = codeMask(Array(source.utf8))
+        var out: [String] = []
+        var offset = 0
+        for line in source.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.drop { $0 == " " || $0 == "\t" }
+            let lead = line.utf8.count - trimmed.utf8.count
+            if offset + lead < mask.count && mask[offset + lead], let name = importedName(String(trimmed)) { out.append(name) }
+            offset += line.utf8.count + 1
+        }
+        return out
+    }
+}
+
+extension String {
+    func replacingFirst(_ target: String, with replacement: String) -> String {
+        let a = Array(utf8), t = Array(target.utf8)
+        guard !t.isEmpty, a.count >= t.count else { return self }
+        for i in 0 ... a.count - t.count where a[i] == t[0] && a[i ..< i + t.count].elementsEqual(t) {
+            return String(decoding: a[..<i], as: UTF8.self) + replacement + String(decoding: a[(i + t.count)...], as: UTF8.self)
+        }
+        return self
+    }
+}
+
+// MARK: - The lowerer
+
+struct Lowerer {
+    let s: [UInt8]
+    let mask: [Bool]
+    let n: Int
+    var parallel: [ParallelLoop] = []
+    /// Names declared with `var` anywhere in the file (candidates for capture lists).
+    let varNames: Set<String>
+    /// Functions declared in the file (the Swift 6 compiler checks their
+    /// bodies for races, so parallel loops may call them).
+    let funcNames: Set<String>
+    /// Offsets of the newlines (for lineOf).
+    let newlines: [Int]
+
+    init(_ s: [UInt8], varNames outer: Set<String>? = nil, funcNames outerFuncs: Set<String>? = nil) {
+        self.s = s
+        mask = Frontend.codeMask(s)
+        n = s.count
+        var nl: [Int] = []
+        for (i, c) in s.enumerated() where c == 10 { nl.append(i) }
+        newlines = nl
+        if let outer, let outerFuncs { varNames = outer; funcNames = outerFuncs; return }
+        var names = Set<String>(), funcs = Set<String>()
+        var i = 0
+        while i < s.count {
+            for (word, len) in [("var", 3), ("func", 4)] where mask[i] && Lowerer.isWord(s, i, word) && (i == 0 || !Lowerer.identChar(s[i - 1])) {
+                var j = i + len
+                while j < s.count && (s[j] == 32 || s[j] == 9) { j += 1 }
+                let e = Lowerer.identEnd(s, j)
+                if e > j { if len == 3 { names.insert(String(decoding: s[j ..< e], as: UTF8.self)) } else { funcs.insert(String(decoding: s[j ..< e], as: UTF8.self)) } }
+            }
+            i += 1
+        }
+        varNames = names
+        funcNames = funcs
+    }
+
+    static func identStart(_ c: UInt8) -> Bool { (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 }
+    static func identChar(_ c: UInt8) -> Bool { identStart(c) || (c >= 48 && c <= 57) }
+    static func identEnd(_ s: [UInt8], _ i: Int) -> Int {
+        guard i < s.count, identStart(s[i]) else { return i }
+        var j = i + 1
+        while j < s.count && identChar(s[j]) { j += 1 }
+        return j
+    }
+    static func isWord(_ s: [UInt8], _ i: Int, _ w: String) -> Bool {
+        let b = Array(w.utf8)
+        guard i + b.count <= s.count, s[i ..< i + b.count].elementsEqual(b) else { return false }
+        return i + b.count == s.count || !identChar(s[i + b.count])
+    }
+
+    func code(_ i: Int) -> Bool { i >= 0 && i < n && mask[i] }
+    func text(_ a: Int, _ b: Int) -> String { String(decoding: s[a ..< b], as: UTF8.self) }
+    func skipInlineSpace(_ i: Int) -> Int {
+        var j = i
+        while j < n && (s[j] == 32 || s[j] == 9) { j += 1 }
+        return j
+    }
+    func skipSpace(_ i: Int) -> Int {
+        var j = i
+        while j < n && (s[j] == 32 || s[j] == 9 || s[j] == 10 || s[j] == 13) { j += 1 }
+        return j
+    }
+    /// 1-based line of offset i (binary search over the newlines).
+    func lineOf(_ i: Int) -> Int {
+        var lo = 0, hi = newlines.count
+        while lo < hi { let mid = (lo + hi) / 2; if newlines[mid] < i { lo = mid + 1 } else { hi = mid } }
+        return lo + 1
+    }
+
+    func identEnd(_ i: Int) -> Int {
+        guard code(i) else { return -1 }
+        if s[i] == UInt8(ascii: "`") {
+            var j = i + 1
+            while j < n && s[j] != UInt8(ascii: "`") { j += 1 }
+            return j < n ? j + 1 : -1
+        }
+        let e = Lowerer.identEnd(s, i)
+        return e > i ? e : -1
+    }
+
+    /// Index after the closer matching the opener at `i`.
+    func balanced(_ i: Int) -> Int {
+        func closer(_ c: UInt8) -> UInt8 {
+            switch c { case 40: return 41; case 91: return 93; case 123: return 125; default: return 62 }
+        }
+        var stack = [closer(s[i])]
+        var j = i + 1
+        while j < n {
+            if code(j) {
+                let c = s[j]
+                if c == stack[stack.count - 1] {
+                    stack.removeLast()
+                    if stack.isEmpty { return j + 1 }
+                } else if c == 40 || c == 91 || c == 123 || (c == 60 && stack[stack.count - 1] == 62) {
+                    stack.append(closer(c))
+                } else if (c == 41 || c == 93 || c == 125) && stack[stack.count - 1] != c {
+                    return -1
+                } else if stack[stack.count - 1] == 62 && (c == 59 || c == 61) {
+                    return -1
+                }
+            }
+            j += 1
+        }
+        return -1
+    }
+
+    static let notDestination: Set<String> = [
+        "is", "as", "in", "where", "else", "try", "await", "return", "throws", "rethrows", "async", "let", "var",
+        "func", "case", "default", "if", "guard", "for", "while", "switch", "do", "catch", "inout", "some", "any",
+    ]
+
+    func postfix(_ i: Int, generic: Bool) -> Int {
+        guard code(i) else { return -1 }
+        var j: Int
+        if s[i] == 40 || s[i] == 91 { j = balanced(i) } else {
+            j = identEnd(i)
+            if j < 0 || Lowerer.notDestination.contains(text(i, j)) { return -1 }
+        }
+        while j > 0 && j < n && code(j) {
+            let c = s[j]
+            if c == 46, identEnd(j + 1) > 0 { j = identEnd(j + 1) }
+            else if c == 40 || c == 91 || (c == 60 && generic) {
+                let k = balanced(j)
+                if k < 0 { return -1 }
+                j = k
+            } else if c == 33 || (c == 63 && j + 1 < n && (s[j + 1] == 46 || s[j + 1] == 91)) {
+                j += 1
+            } else { break }
+        }
+        return j
+    }
+
+    func keywordAt(_ i: Int, _ word: String) -> Bool {
+        guard code(i), Lowerer.isWord(s, i, word) else { return false }
+        if i > 0 {
+            let p = s[i - 1]
+            if Lowerer.identChar(p) || p == 46 || p == 96 || p == 36 || p == 35 || p == 64 { return false }
+        }
+        let e = i + word.utf8.count
+        return e < n && (s[e] == 32 || s[e] == 9)
+    }
+
+    mutating func lower(_ options: LoweringOptions) -> String {
+        var out = [UInt8]()
+        out.reserveCapacity(n + 256)
+        var last = 0
+        var i = 0
+        while i < n {
+            if !code(i) { i += 1; continue }
+            let c = s[i]
+            if c == UInt8(ascii: "p") && keywordAt(i, "place") {
+                let d0 = skipInlineSpace(i + 5), d1 = postfix(d0, generic: false)
+                if d1 > 0 && d1 < n && (s[d1] == 32 || s[d1] == 9) {
+                    let c0 = skipInlineSpace(d1)
+                    let c1 = identEnd(c0) > 0 ? postfix(c0, generic: true) : -1
+                    if c1 > 0 && s[c1 - 1] == 41 {
+                        out += s[last ..< i]
+                        out += Array("_mppPlace(into: \(text(d0, d1)), \(text(c0, c1)))".utf8)
+                        last = c1; i = c1
+                        continue
+                    }
+                }
+            } else if c == UInt8(ascii: "u") && keywordAt(i, "unplace") {
+                let p0 = skipInlineSpace(i + 7), p1 = postfix(p0, generic: false)
+                if p1 > 0 {
+                    out += s[last ..< i]
+                    out += Array("_mppUnplace(\(text(p0, p1)))".utf8)
+                    last = p1; i = p1
+                    continue
+                }
+            } else if (c == UInt8(ascii: "s") && keywordAt(i, "serial")) || (c == UInt8(ascii: "p") && keywordAt(i, "parallel")) {
+                let forced = c == UInt8(ascii: "p")
+                let f = skipInlineSpace(i + (forced ? 8 : 6))
+                if keywordAt(f, "for") {
+                    out += s[last ..< i]
+                    out += [UInt8](repeating: 32, count: f - i)      // keep columns
+                    last = f; i = f
+                    if forced, let (lowered, end) = lowerLoop(at: f, force: true) {
+                        out += lowered
+                        last = end; i = end
+                    } else if !forced, let end = loopEnd(f) {
+                        // serial: nested loops stay serial too, but may still be proven-safe
+                        var o = options
+                        o.autoParallel = false
+                        if o.fastLoops, !o.plainLoops.contains(lineOf(f)), let (lowered, e) = lowerFastLoop(at: f, o) {
+                            out += lowered; last = e; i = e
+                        } else {
+                            out += s[f ..< f + 3] + lowerSub(f + 3, end, o)
+                            last = end; i = end
+                        }
+                    }
+                    continue
+                }
+            } else if c == UInt8(ascii: "f") && keywordAt(i, "for") && atStatementStart(i) {
+                let line = lineOf(i)
+                if !options.plainLoops.contains(line) {
+                    if options.autoParallel && !options.serialLoops.contains(line), let (lowered, end) = lowerLoop(at: i, force: false) {
+                        out += s[last ..< i]
+                        out += lowered
+                        last = end; i = end
+                        continue
+                    }
+                    if options.fastLoops, let (lowered, end) = lowerFastLoop(at: i, options) {
+                        out += s[last ..< i]
+                        out += lowered
+                        last = end; i = end
+                        continue
+                    }
+                }
+            }
+            i += 1
+        }
+        out += s[last...]
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    func atStatementStart(_ i: Int) -> Bool {
+        var j = i - 1
+        while j >= 0 && (s[j] == 32 || s[j] == 9) { j -= 1 }
+        return j < 0 || s[j] == 10 || s[j] == 123 || s[j] == 59 || s[j] == 125
+    }
+
+    /// End index of `for ... { ... }` starting at `i`.
+    func loopEnd(_ i: Int) -> Int? {
+        var j = i + 3
+        while j < n {
+            if code(j) && s[j] == 123 { let e = balanced(j); return e > 0 ? e : nil }
+            if code(j) && (s[j] == 40 || s[j] == 91) { let e = balanced(j); if e < 0 { return nil }; j = e; continue }
+            j += 1
+        }
+        return nil
+    }
+
+    // MARK: Loop analysis
+
+    struct Token { let text: String; let start: Int; let end: Int }
+
+    func tokens(_ a: Int, _ b: Int) -> [Token] {
+        var out: [Token] = []
+        var i = a
+        while i < b {
+            if !code(i) || s[i] == 32 || s[i] == 9 || s[i] == 10 || s[i] == 13 {
+                // String literals and comments become one opaque token.
+                if !code(i) && (out.last?.text != "\"…\"") { out.append(Token(text: "\"…\"", start: i, end: i + 1)) }
+                i += 1
+                continue
+            }
+            let e = Lowerer.identEnd(s, i)
+            if e > i { out.append(Token(text: text(i, e), start: i, end: e)); i = e; continue }
+            if s[i] >= 48 && s[i] <= 57 {
+                var j = i + 1
+                // digits, letters (hex, exponents) and a decimal point followed by a digit
+                while j < b && code(j) && (Lowerer.identChar(s[j]) || (s[j] == 46 && j + 1 < b && s[j + 1] >= 48 && s[j + 1] <= 57)) { j += 1 }
+                out.append(Token(text: text(i, j), start: i, end: j)); i = j
+                continue
+            }
+            // Operators: maximal run of operator characters; brackets alone.
+            let ops = Set("=+-*/%<>!&|^~?.".utf8)
+            if ops.contains(s[i]) {
+                var j = i + 1
+                while j < b && ops.contains(s[j]) && code(j) { j += 1 }
+                out.append(Token(text: text(i, j), start: i, end: j)); i = j
+                continue
+            }
+            out.append(Token(text: text(i, i + 1), start: i, end: i + 1))
+            i += 1
+        }
+        return out
+    }
+
+    static let forbidden: Set<String> = [
+        "break", "continue", "return", "throw", "try", "await", "yield", "fallthrough", "defer", "inout", "async",
+        "Task", "print", "println", "debugPrint", "dump", "fputs", "puts", "putchar", "readLine", "logger", "log",
+        "exit", "fatalError", "precondition", "assert", "for", "while", "repeat", "#if",
+    ]
+    static let mutatingMethods: Set<String> = [
+        "append", "insert", "remove", "removeAll", "removeFirst", "removeLast", "removeSubrange", "popLast",
+        "popFirst", "sort", "reverse", "shuffle", "swapAt", "merge", "updateValue", "removeValue", "formUnion",
+        "formIntersection", "subtract", "reserveCapacity", "replaceSubrange", "write", "push", "flush", "next",
+    ]
+    static let assignmentOps: Set<String> = ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+                                             "&+=", "&-=", "&*=", "&<<=", "&>>="]
+
+    /// Tries to lower `for v in lo..<hi { body }` at `i` to a parallel loop.
+    mutating func lowerLoop(at i: Int, force: Bool) -> ([UInt8], Int)? {
+        // for <name> in <range> {
+        let v0 = skipInlineSpace(i + 3)
+        let v1 = identEnd(v0)
+        guard v1 > 0 else { return nil }
+        let loopVar = text(v0, v1)
+        let inAt = skipInlineSpace(v1)
+        guard keywordAt(inAt, "in") else { return nil }
+        let r0 = skipInlineSpace(inAt + 2)
+        var j = r0
+        var rangeEnd = -1
+        while j < n {
+            if code(j) && s[j] == 123 { rangeEnd = j; break }
+            if code(j) && (s[j] == 40 || s[j] == 91) { let e = balanced(j); if e < 0 { return nil }; j = e; continue }
+            if s[j] == 10 { return nil }
+            j += 1
+        }
+        guard rangeEnd > r0 else { return nil }
+        let rangeText = text(r0, rangeEnd).trimmingSpaces
+        let rangeTokens = tokens(r0, rangeEnd).map(\.text)
+        guard rangeTokens.contains("..<") || rangeTokens.contains("..."), !rangeTokens.contains("where"),
+              !rangeTokens.contains("stride") else { return nil }
+        let bodyEnd = balanced(rangeEnd)
+        guard bodyEnd > 0 else { return nil }
+        let toks = tokens(rangeEnd + 1, bodyEnd - 1)
+
+        // Locals declared in the body (let/var/closure params/case lets are treated alike).
+        var locals: Set<String> = [loopVar]
+        for (k, t) in toks.enumerated() where (t.text == "let" || t.text == "var") && k + 1 < toks.count {
+            locals.insert(toks[k + 1].text)
+            // tuple patterns: let (a, b) = ...
+            if toks[k + 1].text == "(" {
+                var m = k + 2
+                while m < toks.count && toks[m].text != ")" { if toks[m].text != "," { locals.insert(toks[m].text) }; m += 1 }
+            }
+        }
+        for (k, t) in toks.enumerated() where t.text == "in" && k > 0 {
+            // closure parameters `{ a, b in`
+            var m = k - 1
+            while m >= 0 && toks[m].text != "{" { if Lowerer.identStart(toks[m].text.utf8.first ?? 0) { locals.insert(toks[m].text) }; m -= 1 }
+        }
+
+        var outputs: [String] = []          // arrays written as name[loopVar]
+        var outputUses: [Int] = []           // token indices of name[loopVar] uses to rewrite
+        var captures = Set<String>()
+        for (k, t) in toks.enumerated() {
+            if !force && (Lowerer.forbidden.contains(t.text) || t.text == "&") { return nil }
+            if t.text == "&" && !force { return nil }
+            let prev = k > 0 ? toks[k - 1].text : ""
+            guard Lowerer.identStart(t.text.utf8.first ?? 0), prev != "." else { continue }
+            if locals.contains(t.text) { continue }
+            // Calls: only to functions declared in this file (the compiler
+            // checks those for races), pure math, and initializers. A
+            // function from another module or from C may change shared
+            // state the compiler can't see.
+            if !force && k + 1 < toks.count && toks[k + 1].text == "(" && !Lowerer.keywords.contains(t.text)
+                && !funcNames.contains(t.text) && !Lowerer.pureFunctions.contains(t.text)
+                && !(t.text.utf8.first.map { $0 >= 65 && $0 <= 90 } ?? false) {
+                return nil
+            }
+            // name[loopVar] ...
+            let isElement = k + 3 < toks.count && toks[k + 1].text == "[" && toks[k + 2].text == loopVar && toks[k + 3].text == "]"
+            if isElement && (outputs.contains(t.text) || assigns(toks, from: k + 4)) {
+                if !outputs.contains(t.text) { outputs.append(t.text) }
+                continue
+            }
+            // Any other assignment or mutating call on an outer name rules the loop out.
+            if !force {
+                if let root = assignmentRoot(toks, k), !locals.contains(root) { _ = root; return nil }
+                if k + 2 < toks.count && toks[k + 1].text == "." && Lowerer.mutatingMethods.contains(toks[k + 2].text) { return nil }
+            }
+            if varNames.contains(t.text) { captures.insert(t.text) }
+        }
+        // Outputs may only be touched as name[loopVar].
+        for (k, t) in toks.enumerated() where outputs.contains(t.text) && (k == 0 || toks[k - 1].text != ".") {
+            let ok = k + 3 < toks.count && toks[k + 1].text == "[" && toks[k + 2].text == loopVar && toks[k + 3].text == "]"
+            if !ok { return nil }
+            outputUses.append(k)
+        }
+        captures.subtract(outputs)
+
+        // Build: outer wrappers for output buffers, then _mppAutoFor with a capture list.
+        var head = ""
+        for o in outputs { head += "\(o).withUnsafeMutableBufferPointer { __mppBuf_\(o) in let __mppOut_\(o) = _MppSendable(__mppBuf_\(o)); " }
+        let bounds = outputs.map { "__mppBuf_\($0).count" }.joined(separator: ", ")
+        let captureList = (outputs.map { "__mppOut_\($0)" } + captures.sorted()).joined(separator: ", ")
+        head += "_mppAutoFor(\(rangeText)\(bounds.isEmpty ? "" : ", bounds: [\(bounds)]")) { "
+        head += captureList.isEmpty ? "\(loopVar) in" : "[\(captureList)] \(loopVar) in"
+
+        // Body with name[loopVar] -> __mppOut_name.value[loopVar]
+        var body = [UInt8]()
+        var last = rangeEnd + 1
+        for k in outputUses {
+            body += s[last ..< toks[k].start]
+            body += Array("__mppOut_\(toks[k].text).value".utf8)
+            last = toks[k].end
+        }
+        body += s[last ..< bodyEnd - 1]
+        let tail = "}" + String(repeating: " }", count: outputs.count)
+
+        let lowered = Array((head).utf8) + body + Array(tail.utf8)
+        parallel.append(ParallelLoop(firstLine: lineOf(i), lastLine: lineOf(bodyEnd - 1)))
+        return (lowered, bodyEnd)
+    }
+
+    // MARK: Proven-safe sequential loops
+
+    /// Lowers the code in s[a ..< b] (nested loops), keeping its loops' line numbers.
+    mutating func lowerSub(_ a: Int, _ b: Int, _ options: LoweringOptions) -> [UInt8] {
+        let offset = lineOf(a) - 1
+        func shift(_ lines: Set<Int>) -> Set<Int> { Set(lines.compactMap { $0 > offset ? $0 - offset : nil }) }
+        var o = options
+        o.serialLoops = shift(options.serialLoops)
+        o.plainLoops = shift(options.plainLoops)
+        var sub = Lowerer(Array(s[a ..< b]), varNames: varNames, funcNames: funcNames)
+        let text = sub.lower(o)
+        for l in sub.parallel {
+            parallel.append(ParallelLoop(firstLine: l.firstLine + offset, lastLine: l.lastLine + offset, parallel: l.parallel))
+        }
+        return Array(text.utf8)
+    }
+
+    static let pureFunctions: Set<String> = [
+        "min", "max", "abs", "sqrt", "cbrt", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "sin", "cos", "tan",
+        "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "pow", "floor", "ceil", "round", "trunc", "fma", "hypot",
+        "fmod", "remainder", "copysign", "sqrtf", "expf", "logf", "sinf", "cosf", "tanf", "powf", "floorf", "ceilf", "fabs", "fabsf",
+    ]
+    static let pureMethods: Set<String> = [
+        "squareRoot", "rounded", "addingProduct", "isMultiple", "signum", "distance", "advanced", "quotientAndRemainder",
+        "addingReportingOverflow", "subtractingReportingOverflow", "multipliedReportingOverflow", "multipliedFullWidth",
+        "truncatingRemainder", "remainder", "nonzeroBitCount", "leadingZeroBitCount", "trailingZeroBitCount", "byteSwapped",
+    ]
+    static let pureTypes: Set<String> = [
+        "Int", "Int8", "Int16", "Int32", "Int64", "UInt", "UInt8", "UInt16", "UInt32", "UInt64", "Double", "Float",
+        "Float16", "Float80", "Bool", "SIMD2", "SIMD3", "SIMD4", "SIMD8", "SIMD16", "SIMD32", "SIMD64",
+    ]
+    static let controlKeywords: Set<String> = ["if", "guard", "while", "for", "switch", "catch"]
+    static let keywords: Set<String> = [
+        "if", "guard", "while", "for", "switch", "catch", "else", "do", "repeat", "in", "where", "case", "let", "var",
+        "return", "break", "continue", "defer", "is", "as", "true", "false", "nil", "self", "Self", "default",
+    ]
+
+    /// Lowers `for v in a..<b { body }` (or `a...b`, with an optional
+    /// `where`) to a proven-safe sequential loop. nil: not a range loop.
+    mutating func lowerFastLoop(at i: Int, _ options: LoweringOptions) -> ([UInt8], Int)? {
+        let v0 = skipInlineSpace(i + 3)
+        let v1 = identEnd(v0)
+        guard v1 > 0 else { return nil }
+        let loopVar = text(v0, v1)
+        let inAt = skipInlineSpace(v1)
+        guard keywordAt(inAt, "in") else { return nil }
+        let r0 = skipInlineSpace(inAt + 2)
+        var j = r0
+        var braceAt = -1
+        while j < n {
+            if code(j) && s[j] == 123 { braceAt = j; break }
+            if code(j) && (s[j] == 40 || s[j] == 91) { let e = balanced(j); if e < 0 { return nil }; j = e; continue }
+            if s[j] == 10 || !code(j) { return nil }
+            j += 1
+        }
+        guard braceAt > r0 else { return nil }
+        let bodyEnd = balanced(braceAt)
+        guard bodyEnd > 0 else { return nil }
+
+        // Range (depth-0 `..<` or `...`) and optional where-clause.
+        let header = tokens(r0, braceAt)
+        var depth = 0, op = "", whereAt = -1
+        for (k, t) in header.enumerated() {
+            switch t.text {
+            case "(", "[": depth += 1
+            case ")", "]": depth -= 1
+            case "..<", "...": if depth == 0 && whereAt < 0 { if !op.isEmpty { return nil }; op = t.text }
+            case "where": if depth == 0 && whereAt < 0 { whereAt = k }
+            default: break
+            }
+        }
+        guard !op.isEmpty else { return nil }
+        let rangeText = whereAt < 0 ? text(r0, braceAt).trimmingSpaces : text(r0, header[whereAt].start).trimmingSpaces
+        let whereText = whereAt < 0 ? nil : text(header[whereAt].end, braceAt).trimmingSpaces
+        guard !rangeText.isEmpty, whereText.map({ !$0.isEmpty }) ?? true else { return nil }
+        let closed = op == "..."
+
+        let toks = tokens(braceAt + 1, bodyEnd - 1)
+        var arrays = hoistableArrays(toks, loopVar: loopVar)
+        if whereAt >= 0 {
+            let used = Set(header[(whereAt + 1)...].map(\.text))
+            arrays.removeAll { used.contains($0.name) }
+        }
+
+        // Nested loops are lowered on their own.
+        let inner = lowerSub(braceAt + 1, bodyEnd - 1, options)
+
+        // The counter steps at the end of the body. With `continue` in the body
+        // it steps at the start instead.
+        // (Also when the body may end in return/throw/break: a step after it would warn.)
+        let hasContinue = toks.contains { ["continue", "return", "throw", "break", "fatalError"].contains($0.text) }
+        let step = closed ? "if __mppI == __mppR.upperBound { break }; __mppI &+= 1" : "__mppI &+= 1"
+        let counter: String
+        var end = ""
+        if hasContinue {
+            // Step first, so `continue` needs no `defer` (newer Swift misreads a
+            // `defer` step and warns that code after the loop never runs).
+            counter = closed
+                ? "var __mppN = __mppR.lowerBound, __mppMore = __mppR.lowerBound <= __mppR.upperBound; while __mppMore { let __mppI = __mppN; if __mppN == __mppR.upperBound { __mppMore = false } else { __mppN &+= 1 }; "
+                : "var __mppN = __mppR.lowerBound; while __mppN < __mppR.upperBound { let __mppI = __mppN; __mppN &+= 1; "
+        } else {
+            counter = closed ? "var __mppI = __mppR.lowerBound; while true { "
+                             : "var __mppI = __mppR.lowerBound; while __mppI < __mppR.upperBound { "
+            var k = inner.count
+            while k > 0 && (inner[k - 1] == 32 || inner[k - 1] == 9) { k -= 1 }
+            let needsSeparator = k > 0 && inner[k - 1] != 10 && inner[k - 1] != 59 && inner[k - 1] != 123
+            end = (needsSeparator ? "; " : "") + step + " "
+        }
+        let skip = hasContinue ? "continue" : step + "; continue"
+        let bind = "let \(loopVar) = __mppI; " + (whereText.map { "guard \($0) else { \(skip) }; " } ?? "")
+
+        var head = "do { let __mppR = (\(rangeText)); "
+        var tail = "} }"
+        if !arrays.isEmpty {
+            let lowest = arrays.map(\.minOffset).min() ?? 0
+            var checks = ["__mppR.lowerBound >= \(-lowest)"]
+            for a in arrays {
+                checks.append(closed ? "__mppR.upperBound < \(a.name).count - (\(a.maxOffset))"
+                                     : "__mppR.upperBound <= \(a.name).count - (\(a.maxOffset))")
+            }
+            head += "let __mppFast = " + (closed ? "" : "__mppR.isEmpty || ") + "(" + checks.joined(separator: " && ") + "); "
+            for (k, a) in arrays.enumerated() {
+                head += a.written ? "\(a.name).withUnsafeMutableBufferPointer { __mppB\(k) in "
+                                  : "\(a.name).withUnsafeBufferPointer { __mppB\(k) in "
+            }
+            head += "func __mppRun<__C: _MppBoundsPolicy>(_: __C.Type) { "
+            for (k, a) in arrays.enumerated() {
+                head += "let \(a.name) = \(a.written ? "_MppSpan" : "_MppReadSpan")(__mppB\(k), __C.self); "
+            }
+            tail = "} }; if __mppFast { __mppRun(_MppUnchecked.self) } else { __mppRun(_MppChecked.self) }"
+                + String(repeating: " }", count: arrays.count) + " }"
+        }
+        head += counter + bind
+        parallel.append(ParallelLoop(firstLine: lineOf(i), lastLine: lineOf(bodyEnd - 1), parallel: false))
+        return (Array(head.utf8) + inner + Array((end + tail).utf8), bodyEnd)
+    }
+
+    struct HoistedArray { let name: String; var minOffset: Int; var maxOffset: Int; var written: Bool }
+
+    /// Arrays in the loop body whose every access is provably in bounds once
+    /// the range is checked against them, and which nothing else can reach.
+    func hoistableArrays(_ toks: [Token], loopVar: String) -> [HoistedArray] {
+        guard loopVar != "_" else { return [] }
+        let banned: Set<String> = ["return", "throw", "try", "await", "yield", "fallthrough", "#if", "inout", "async"]
+        var locals: Set<String> = [loopVar]
+        for (k, t) in toks.enumerated() {
+            if banned.contains(t.text) { return [] }
+            // `&x` passes x inout (it could alias); `a & b` is a bitwise and.
+            if t.text == "&" && (k == 0 || ["(", ",", ":", "=", "[", "{", ";"].contains(toks[k - 1].text)) { return [] }
+            if (t.text == "let" || t.text == "var") && k + 1 < toks.count { locals.insert(toks[k + 1].text) }
+            // The loop variable must mean the loop index everywhere in the body.
+            if (t.text == "let" || t.text == "var") && toks[(k + 1)...].prefix(12).contains(where: { $0.text == loopVar })
+                && toks[(k + 1)...].prefix(12).prefix(while: { $0.text != "=" && $0.text != "{" }).contains(where: { $0.text == loopVar }) { return [] }
+            if t.text == "for" {
+                var m = k + 1
+                while m < toks.count && toks[m].text != "in" { if toks[m].text == loopVar { return [] }; m += 1 }
+            }
+            if t.text == "case" && k + 2 < toks.count && (toks[k + 1].text == "let" || toks[k + 1].text == "var") { locals.insert(toks[k + 2].text) }
+            // labeled break/continue could leave an outer loop
+            if (t.text == "break" || t.text == "continue") && k + 1 < toks.count
+                && Lowerer.identStart(toks[k + 1].text.utf8.first ?? 0) && lineOf(toks[k + 1].start) == lineOf(t.start) { return [] }
+        }
+
+        // Every `{` must open a control-flow body (no closures, nested functions or accessors).
+        var control = Set<Int>()
+        for (k, t) in toks.enumerated() where t.text == "{" && k > 0 && ["else", "do", "repeat", "defer"].contains(toks[k - 1].text) {
+            control.insert(k)
+        }
+        for (k, t) in toks.enumerated() where Lowerer.controlKeywords.contains(t.text)
+            && (k == 0 || toks[k - 1].text == "else" || toks[k - 1].text == "}" || toks[k - 1].text == "{" || toks[k - 1].text == ";"
+                || lineOf(toks[k - 1].start) != lineOf(t.start)) {
+            var m = k + 1, d = 0
+            while m < toks.count {
+                let x = toks[m].text
+                if lineOf(toks[m].start) != lineOf(t.start) { break }
+                if x == "(" || x == "[" { d += 1 } else if x == ")" || x == "]" { d -= 1 }
+                else if x == "{" { if d == 0 { control.insert(m) }; break }
+                m += 1
+            }
+        }
+        for (k, t) in toks.enumerated() where t.text == "{" && !control.contains(k) { _ = t; return [] }
+
+        // Only pure calls; no writes through dotted paths.
+        for (k, t) in toks.enumerated() {
+            guard Lowerer.identStart(t.text.utf8.first ?? 0), !Lowerer.keywords.contains(t.text) else { continue }
+            let next = k + 1 < toks.count ? toks[k + 1].text : ""
+            let prev = k > 0 ? toks[k - 1].text : ""
+            if next == "(" || next == "{" {
+                if prev == "." { if !Lowerer.pureMethods.contains(t.text) { return [] } }
+                else if !(Lowerer.pureFunctions.contains(t.text) || Lowerer.pureTypes.contains(t.text)) { return [] }
+            }
+            if prev != ".", !locals.contains(t.text), k + 2 < toks.count, next == ".", assignmentRoot(toks, k) != nil { return [] }
+        }
+
+        // Candidates: name[loopVar], name[loopVar + k], name[loopVar - k]; otherwise only name.count.
+        var found: [String: HoistedArray] = [:]
+        var rejected = Set<String>()
+        for (k, t) in toks.enumerated() {
+            guard Lowerer.identStart(t.text.utf8.first ?? 0), !Lowerer.keywords.contains(t.text), !locals.contains(t.text) else { continue }
+            if k > 0 && toks[k - 1].text == "." { continue }
+            let name = t.text
+            if k + 2 < toks.count && toks[k + 1].text == "." && toks[k + 2].text == "count"
+                && (k + 3 >= toks.count || toks[k + 3].text != "(") { continue }
+            guard k + 3 < toks.count, toks[k + 1].text == "[", toks[k + 2].text == loopVar else {
+                if found[name] != nil || k + 1 < toks.count && toks[k + 1].text == "[" { rejected.insert(name) }
+                if found[name] == nil { rejected.insert(name) }
+                continue
+            }
+            var offset = 0, close = k + 3
+            if toks[k + 3].text == "+" || toks[k + 3].text == "-" {
+                guard k + 5 < toks.count, let v = Int(toks[k + 4].text), v < 1 << 20, toks[k + 5].text == "]" else { rejected.insert(name); continue }
+                offset = toks[k + 3].text == "+" ? v : -v
+                close = k + 5
+            }
+            guard toks[close].text == "]" else { rejected.insert(name); continue }
+            var written = assignmentRoot(toks, k) != nil
+            if close + 2 < toks.count && toks[close + 1].text == "." && Lowerer.mutatingMethods.contains(toks[close + 2].text) { written = true }
+            var a = found[name] ?? HoistedArray(name: name, minOffset: offset, maxOffset: offset, written: false)
+            a.minOffset = Swift.min(a.minOffset, offset)
+            a.maxOffset = Swift.max(a.maxOffset, offset)
+            a.written = a.written || written
+            found[name] = a
+        }
+        return found.values.filter { !rejected.contains($0.name) }.sorted { $0.name < $1.name }
+    }
+
+    /// True when the tokens from `k` start with an assignment operator.
+    func assigns(_ toks: [Token], from k: Int) -> Bool {
+        k < toks.count && Lowerer.assignmentOps.contains(toks[k].text)
+    }
+
+    /// If the postfix expression starting at token `k` is the target of an assignment, its root name.
+    func assignmentRoot(_ toks: [Token], _ k: Int) -> String? {
+        var m = k + 1
+        while m < toks.count {
+            let t = toks[m].text
+            if t == "." && m + 1 < toks.count { m += 2; continue }
+            if t == "[" || t == "(" {
+                var depth = 0
+                while m < toks.count {
+                    if toks[m].text == "[" || toks[m].text == "(" { depth += 1 }
+                    if toks[m].text == "]" || toks[m].text == ")" { depth -= 1; if depth == 0 { break } }
+                    m += 1
+                }
+                m += 1
+                continue
+            }
+            if t == "!" || t == "?" { m += 1; continue }
+            break
+        }
+        return m < toks.count && Lowerer.assignmentOps.contains(toks[m].text) ? toks[k].text : nil
+    }
+}
+
+extension String {
+    var trimmingSpaces: String {
+        var u = Substring(self)
+        while u.first == " " || u.first == "\t" { u = u.dropFirst() }
+        while u.last == " " || u.last == "\t" { u = u.dropLast() }
+        return String(u)
+    }
+}

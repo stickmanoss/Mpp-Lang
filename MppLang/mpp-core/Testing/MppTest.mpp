@@ -1,0 +1,106 @@
+// MppTest — assertions and the test runner used by `mpp pm test`.
+//
+// In a test target, every top-level function named `test...()` is a test:
+//
+//     import Geometry
+//
+//     func testCentroid() throws {
+//         let c = Polygon(...).centroid
+//         expectEqual(c.x, 1)
+//         expect(c.y > 0, "y should be positive")
+//     }
+//
+// `mpp pm test` finds them, generates the runner, and reports results.
+// Failed expectations are recorded and the test keeps going; a thrown
+// error ends that test as a failure.
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+/// Throw this to skip the rest of a test without failing it.
+public struct TestSkipped: Error, CustomStringConvertible {
+    public let reason: String
+    public init(_ reason: String = "") { self.reason = reason }
+    public var description: String { reason }
+}
+
+enum _TestState {
+    nonisolated(unsafe) static var failures: [String] = []
+}
+
+/// #fileID names the generated Swift file; show the .mpp source instead.
+func _where(_ file: StaticString, _ line: UInt) -> String {
+    var f = "\(file)"
+    if f.hasSuffix(".swift") { f = String(f.dropLast(6)) + ".mpp" }
+    return "\(f):\(line)"
+}
+
+/// Records a failure (the test continues) when `condition` is false.
+public func expect(_ condition: @autoclosure () throws -> Bool, _ message: @autoclosure () -> String = "",
+                   file: StaticString = #fileID, line: UInt = #line) rethrows {
+    if try !condition() {
+        let m = message()
+        _TestState.failures.append("\(_where(file, line)): expectation failed" + (m.isEmpty ? "" : ": \(m)"))
+    }
+}
+
+/// Records a failure when `a != b`, showing both values.
+public func expectEqual<T: Equatable>(_ a: @autoclosure () throws -> T, _ b: @autoclosure () throws -> T,
+                                      _ message: @autoclosure () -> String = "",
+                                      file: StaticString = #fileID, line: UInt = #line) rethrows {
+    let x = try a(), y = try b()
+    if x != y {
+        let m = message()
+        _TestState.failures.append("\(_where(file, line)): expected \(x) == \(y)" + (m.isEmpty ? "" : ": \(m)"))
+    }
+}
+
+/// Records a failure when `body` does not throw.
+public func expectThrows<R>(_ body: () throws -> R, file: StaticString = #fileID, line: UInt = #line) {
+    do {
+        _ = try body()
+        _TestState.failures.append("\(_where(file, line)): expected an error to be thrown")
+    } catch {}
+}
+
+/// Records an unconditional failure.
+public func fail(_ message: String, file: StaticString = #fileID, line: UInt = #line) {
+    _TestState.failures.append("\(_where(file, line)): \(message)")
+}
+
+/// Generated runners call this with every discovered test.
+public func _mppRunTests(_ tests: [(String, () throws -> Void)]) -> Never {
+    var filter: String? = nil
+    let args = CommandLine.arguments
+    if let i = args.firstIndex(of: "--filter"), i + 1 < args.count { filter = args[i + 1] }
+    let tty = isatty(1) != 0
+    let green = tty ? "\u{1B}[32m" : "", red = tty ? "\u{1B}[31m" : "", yellow = tty ? "\u{1B}[33m" : "", reset = tty ? "\u{1B}[0m" : ""
+
+    var passed = 0, failed = 0, skipped = 0
+    for (name, body) in tests {
+        if let f = filter, !name.contains(f) { continue }
+        _TestState.failures = []
+        var skipReason: String? = nil
+        do { try body() }
+        catch let s as TestSkipped { skipReason = s.reason }
+        catch { _TestState.failures.append("threw \(error)") }
+        if let reason = skipReason, _TestState.failures.isEmpty {
+            skipped += 1
+            print("\(yellow)○\(reset) \(name) skipped" + (reason.isEmpty ? "" : ": \(reason)"))
+        } else if _TestState.failures.isEmpty {
+            passed += 1
+            print("\(green)✔\(reset) \(name)")
+        } else {
+            failed += 1
+            print("\(red)✘\(reset) \(name)")
+            for f in _TestState.failures { print("    \(f)") }
+        }
+    }
+    print("\(failed == 0 ? green : red)\(passed) passed, \(failed) failed\(skipped > 0 ? ", \(skipped) skipped" : "")\(reset)")
+    exit(failed == 0 ? 0 : 1)
+}

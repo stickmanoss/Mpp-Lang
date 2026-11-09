@@ -1,0 +1,98 @@
+// MppCore — bit-twiddling primitives behind the fast I/O paths.
+//
+// Bits.digitCount     decimal digit count from the leading-zero count (no loop)
+// Bits.pow10          10^n for n in 0...19
+// Bits.digitPairs     "00".."99" table: integers are printed two digits per divide
+// Bits.digitRun       SWAR: how many of the next 8 bytes are ASCII digits
+// Bits.parse8         SWAR: up to 8 ASCII digits -> integer with 3 multiplies
+//
+// These are public so libraries can build their own fast formatters.
+
+public enum Bits {
+    /// 10^n for 0 <= n <= 19 (the largest power of ten in a UInt64).
+    @inlinable @inline(__always)
+    public static func pow10(_ n: Int) -> UInt64 {
+        switch n {
+        case 0: return 1
+        case 1: return 10
+        case 2: return 100
+        case 3: return 1_000
+        case 4: return 10_000
+        case 5: return 100_000
+        case 6: return 1_000_000
+        case 7: return 10_000_000
+        case 8: return 100_000_000
+        case 9: return 1_000_000_000
+        case 10: return 10_000_000_000
+        case 11: return 100_000_000_000
+        case 12: return 1_000_000_000_000
+        case 13: return 10_000_000_000_000
+        case 14: return 100_000_000_000_000
+        case 15: return 1_000_000_000_000_000
+        case 16: return 10_000_000_000_000_000
+        case 17: return 100_000_000_000_000_000
+        case 18: return 1_000_000_000_000_000_000
+        default: return 10_000_000_000_000_000_000
+        }
+    }
+
+    /// Number of decimal digits in `v` (1 for 0).
+    /// log10(v) ≈ log2(v) * 1233 / 4096, then one comparison fixes it up.
+    @inlinable @inline(__always)
+    public static func digitCount(_ v: UInt64) -> Int {
+        let bits = 64 &- (v | 1).leadingZeroBitCount
+        let t = (bits &* 1233) &>> 12
+        return t &+ 1 &- ((v | 1) < pow10(t) ? 1 : 0)
+    }
+
+    /// "000102...9899": two ASCII digits per entry. A StaticString lives in
+    /// the binary's read-only data, so reading it needs no lazy-init check.
+    @inlinable
+    public static var digitPairs: StaticString { "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899" }
+
+    /// Writes the decimal digits of `v` ending just before `end` (exactly
+    /// `digitCount(v)` bytes), two digits per division.
+    @inlinable @inline(__always)
+    public static func writeDigits(_ v: UInt64, endingAt end: UnsafeMutablePointer<UInt8>) {
+        let lut = digitPairs.utf8Start
+        var v = v
+        var p = end
+        while v >= 100 {
+            let q = v / 100
+            let r = Int(truncatingIfNeeded: v &- q &* 100) &* 2
+            v = q
+            p -= 2
+            p[0] = lut[r]
+            p[1] = lut[r &+ 1]
+        }
+        if v >= 10 {
+            let r = Int(truncatingIfNeeded: v) &* 2
+            p -= 2
+            p[0] = lut[r]
+            p[1] = lut[r &+ 1]
+        } else {
+            p -= 1
+            p[0] = 48 &+ UInt8(truncatingIfNeeded: v)
+        }
+    }
+
+    /// Given 8 bytes loaded little-endian (first byte lowest), returns how many
+    /// leading bytes are ASCII digits (0...8), with no per-byte branches.
+    @inlinable @inline(__always)
+    public static func digitRun(_ chunk: UInt64) -> Int {
+        let t = chunk ^ 0x3030_3030_3030_3030          // digits become 0...9
+        let nonDigit = ((t &+ 0x7676_7676_7676_7676) | t) & 0x8080_8080_8080_8080
+        return nonDigit == 0 ? 8 : nonDigit.trailingZeroBitCount &>> 3
+    }
+
+    /// Value of the first `count` (1...8) ASCII digits in `chunk` (loaded
+    /// little-endian). Three multiply-and-mask steps combine 8 digits.
+    @inlinable @inline(__always)
+    public static func parse8(_ chunk: UInt64, count: Int) -> UInt64 {
+        var v = (chunk ^ 0x3030_3030_3030_3030) &<< UInt64(truncatingIfNeeded: (8 &- count) &* 8)
+        v = (v &* 10 &+ (v &>> 8)) & 0x00FF_00FF_00FF_00FF
+        v = (v &* 100 &+ (v &>> 16)) & 0x0000_FFFF_0000_FFFF
+        v = (v &* 10_000 &+ (v &>> 32)) & 0x0000_0000_FFFF_FFFF
+        return v
+    }
+}

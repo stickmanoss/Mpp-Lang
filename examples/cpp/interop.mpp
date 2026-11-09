@@ -1,0 +1,24 @@
+// M++ calling C++ (MppxxCpp): `mpp examples/cpp/interop.mpp`
+import cpp "fastmath.hpp"     // compiles fastmath.cpp beside it, too
+
+// C++ written right here. Errors in it point at this file's lines.
+#cpp {
+    inline mpp::Int collatzSteps(mpp::Int n) {
+        mpp::Int steps = 0;
+        while (n != 1) { n = (n % 2 == 0) ? n / 2 : 3 * n + 1; steps += 1; }
+        return steps;
+    }
+    inline void shout(const char* text) { mpp::print("C++ says:", text); }
+}
+
+let values: [Double] = [2, 4, 4, 4, 5, 5, 7, 9]
+let mean = values.withUnsafeBufferPointer { fastmath.mean($0.baseAddress, $0.count) }
+print("mean:", mean)
+
+var stats = fastmath.Stats()
+for v in values { stats.add(v) }
+print("count:", stats.count, "variance:", stats.variance())
+
+print(String(cpp: fastmath.greeting("Omar")))
+print("collatz(27):", collatzSteps(27))
+shout("hi from M++")

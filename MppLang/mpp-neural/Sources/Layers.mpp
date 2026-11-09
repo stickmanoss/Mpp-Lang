@@ -1,0 +1,436 @@
+// neural — Layers: MLX-nn / Swift for TensorFlow style modules.
+//
+//   let model = Sequential(
+//       Linear(784, 128), ReLU(),
+//       Dropout(0.1),
+//       Linear(128, 10))
+//   let logits = model(x)
+//   model.parameters()          // found automatically by reflection
+//
+// Subclass `Module` and override `callAsFunction`. Stored Tensor, Module
+// and [Module] properties are discovered automatically (as in MLX), so
+// optimizers, `summary()` and save/load just work.
+
+open class Module {
+    /// Training mode affects Dropout and BatchNorm.
+    public private(set) var training = true
+
+    public init() {}
+
+    open func callAsFunction(_ x: Tensor) -> Tensor {
+        fatalError("\(Swift.type(of: self)) must override callAsFunction(_:)")
+    }
+
+    /// Every tensor this module and its children own, with dotted paths
+    /// ("layers.0.weight"). Includes non-trainable state such as running means.
+    public func namedTensors() -> [(name: String, tensor: Tensor)] {
+        var out: [(String, Tensor)] = []
+        func visit(_ value: Any, _ path: String) {
+            switch value {
+            case let t as Tensor: out.append((path, t))
+            case let m as Module: m.collect(prefix: path, into: &out)
+            case let ms as [Module]: for (i, m) in ms.enumerated() { m.collect(prefix: path + ".\(i)", into: &out) }
+            case let ts as [Tensor]: for (i, t) in ts.enumerated() { out.append((path + ".\(i)", t)) }
+            default:
+                // Optional properties (e.g. `var bias: Tensor?`): unwrap one level.
+                let m = Mirror(reflecting: value)
+                if m.displayStyle == .optional, let wrapped = m.children.first?.value { visit(wrapped, path) }
+            }
+        }
+        var mirror: Mirror? = Mirror(reflecting: self)
+        var children: [(String, Any)] = []
+        while let m = mirror {
+            children = m.children.compactMap { c in c.label.map { ($0, c.value) } } + children
+            mirror = m.superclassMirror
+        }
+        for (label, value) in children where label != "training" {
+            visit(value, label.hasPrefix("_") ? String(label.dropFirst()) : label)
+        }
+        return out
+    }
+
+    func collect(prefix: String, into out: inout [(String, Tensor)]) {
+        for (n, t) in namedTensors() { out.append((prefix + "." + n, t)) }
+    }
+
+    /// Trainable tensors (those with requiresGrad).
+    public func parameters() -> [Tensor] { namedTensors().map(\.tensor).filter(\.requiresGrad) }
+
+    public var parameterCount: Int { parameters().reduce(0) { $0 + $1.count } }
+
+    public func zeroGrad() { for p in parameters() { p.zeroGrad() } }
+
+    /// Switches this module and its children to training / inference mode.
+    public func train(_ on: Bool = true) {
+        training = on
+        for child in children() { child.train(on) }
+    }
+    public func eval() { train(false) }
+
+    func children() -> [Module] {
+        var out: [Module] = []
+        var mirror: Mirror? = Mirror(reflecting: self)
+        while let m = mirror {
+            for c in m.children {
+                if let mod = c.value as? Module { out.append(mod) }
+                if let mods = c.value as? [Module] { out += mods }
+            }
+            mirror = m.superclassMirror
+        }
+        return out
+    }
+
+    /// A Keras/Core ML-style table of layers and parameter counts.
+    public func summary() -> String {
+        var lines = [format("{:<36} {:<18} {:>10}", "Parameter", "Shape", "Count")]
+        lines.append(String(repeating: "─", count: 66))
+        for (name, t) in namedTensors() {
+            lines.append(format("{:<36} {:<18} {:>10,}", name + (t.requiresGrad ? "" : " (state)"), "\(t.shape)", t.count))
+        }
+        lines.append(String(repeating: "─", count: 66))
+        lines.append(format("{:<55} {:>10,}", "Trainable parameters", parameterCount))
+        return lines.joined(separator: "\n")
+    }
+}
+
+// MARK: - Initialization
+
+/// Shared seeded generator for weight initialization (`Init.seed(42)` for reproducibility).
+public enum Init {
+    nonisolated(unsafe) static var rng = PCG32(seed: 0x6E65_7572_616C)
+    public static func seed(_ s: UInt64) { rng = PCG32(seed: s) }
+
+    /// Glorot/Xavier uniform.
+    public static func glorot(_ shape: [Int], fanIn: Int, fanOut: Int) -> Tensor {
+        let limit = (6 / Float(fanIn + fanOut)).squareRoot()
+        return Tensor.uniform(shape, -limit, limit, using: &rng, requiresGrad: true)
+    }
+    /// He/Kaiming normal (for ReLU networks).
+    public static func he(_ shape: [Int], fanIn: Int) -> Tensor {
+        Tensor.randn(shape, std: (2 / Float(fanIn)).squareRoot(), using: &rng, requiresGrad: true)
+    }
+    public static func normal(_ shape: [Int], std: Float = 0.02) -> Tensor {
+        Tensor.randn(shape, std: std, using: &rng, requiresGrad: true)
+    }
+}
+
+// MARK: - Core layers
+
+/// y = x W + b (MLX: nn.Linear, S4TF: Dense).
+public final class Linear: Module {
+    public var weight: Tensor
+    public var bias: Tensor?
+
+    public init(_ inputs: Int, _ outputs: Int, bias: Bool = true) {
+        weight = Init.glorot([inputs, outputs], fanIn: inputs, fanOut: outputs)
+        self.bias = bias ? Tensor.zeros([outputs], requiresGrad: true) : nil
+    }
+
+    public override func callAsFunction(_ x: Tensor) -> Tensor {
+        let y = matmul(x.rank == 1 ? x.reshaped([1, -1]) : x, weight)
+        return bias.map { y + $0 } ?? y
+    }
+}
+
+public final class Sequential: Module {
+    public var layers: [Module]
+    public init(_ layers: Module...) { self.layers = layers }
+    public init(layers: [Module]) { self.layers = layers }
+    public override func callAsFunction(_ x: Tensor) -> Tensor { layers.reduce(x) { $1($0) } }
+}
+
+/// Wraps a tensor function as a layer.
+public final class Lambda: Module {
+    let f: (Tensor) -> Tensor
+    public init(_ f: @escaping (Tensor) -> Tensor) { self.f = f }
+    public override func callAsFunction(_ x: Tensor) -> Tensor { f(x) }
+}
+
+public final class ReLU: Module { public override func callAsFunction(_ x: Tensor) -> Tensor { x.relu() } }
+public final class GELU: Module { public override func callAsFunction(_ x: Tensor) -> Tensor { x.gelu() } }
+public final class SiLU: Module { public override func callAsFunction(_ x: Tensor) -> Tensor { x.silu() } }
+public final class Tanh: Module { public override func callAsFunction(_ x: Tensor) -> Tensor { x.tanh() } }
+public final class Sigmoid: Module { public override func callAsFunction(_ x: Tensor) -> Tensor { x.sigmoid() } }
+public final class LeakyReLU: Module {
+    let slope: Float
+    public init(_ slope: Float = 0.01) { self.slope = slope }
+    public override func callAsFunction(_ x: Tensor) -> Tensor { x.leakyRelu(slope) }
+}
+public final class Softmax: Module { public override func callAsFunction(_ x: Tensor) -> Tensor { x.softmax() } }
+public final class Flatten: Module { public override func callAsFunction(_ x: Tensor) -> Tensor { x.flattened() } }
+
+/// Zeroes activations with probability p during training (inverted dropout).
+public final class Dropout: Module {
+    public let p: Float
+    nonisolated(unsafe) static var rng = PCG32(seed: 0xD80)
+    public init(_ p: Float = 0.5) {
+        precondition(p >= 0 && p < 1, "Dropout: p must be in [0, 1)")
+        self.p = p
+    }
+    public override func callAsFunction(_ x: Tensor) -> Tensor {
+        guard training && p > 0 else { return x }
+        let keep = 1 - p
+        let mask = Tensor(data: (0 ..< x.count).map { _ in Dropout.rng.unit() < Double(keep) ? 1 / keep : 0 }, shape: x.shape)
+        return x * mask
+    }
+}
+
+/// Normalizes the last axis (MLX: nn.LayerNorm).
+public final class LayerNorm: Module {
+    public var weight: Tensor
+    public var bias: Tensor
+    let eps: Float
+    public init(_ dims: Int, eps: Float = 1e-5) {
+        weight = Tensor.ones([dims], requiresGrad: true)
+        bias = Tensor.zeros([dims], requiresGrad: true)
+        self.eps = eps
+    }
+    public override func callAsFunction(_ x: Tensor) -> Tensor {
+        let mean = x.mean(axis: -1, keepDims: true)
+        let centered = x - mean
+        let variance = centered.square().mean(axis: -1, keepDims: true)
+        return centered / (variance + eps).sqrt() * weight + bias
+    }
+}
+
+/// Batch normalization over axis 0 for [N, C] inputs, or over N, H, W for [N, C, H, W].
+public final class BatchNorm: Module {
+    public var weight: Tensor
+    public var bias: Tensor
+    public var runningMean: Tensor
+    public var runningVar: Tensor
+    let momentum: Float
+    let eps: Float
+
+    public init(_ features: Int, momentum: Float = 0.1, eps: Float = 1e-5) {
+        weight = Tensor.ones([features], requiresGrad: true)
+        bias = Tensor.zeros([features], requiresGrad: true)
+        runningMean = Tensor.zeros([features])
+        runningVar = Tensor.ones([features])
+        self.momentum = momentum
+        self.eps = eps
+    }
+
+    public override func callAsFunction(_ x: Tensor) -> Tensor {
+        // Move channels last so statistics are over every other axis.
+        let channelsLast = x.rank == 4 ? x.transposed([0, 2, 3, 1]) : x
+        let c = channelsLast.shape.last!
+        let flat = channelsLast.reshaped([-1, c])
+        let y: Tensor
+        if training {
+            let mean = flat.mean(axis: 0)
+            let variance = (flat - mean).square().mean(axis: 0)
+            withNoGrad {
+                for j in 0 ..< c {
+                    runningMean.data[j] = (1 - momentum) * runningMean.data[j] + momentum * mean.data[j]
+                    runningVar.data[j] = (1 - momentum) * runningVar.data[j] + momentum * variance.data[j]
+                }
+            }
+            y = (flat - mean) / (variance + eps).sqrt() * weight + bias
+        } else {
+            y = (flat - runningMean) / (runningVar + eps).sqrt() * weight + bias
+        }
+        let restored = y.reshaped(channelsLast.shape)
+        return x.rank == 4 ? restored.transposed([0, 3, 1, 2]) : restored
+    }
+}
+
+/// Token embeddings (MLX: nn.Embedding).
+public final class Embedding: Module {
+    public var weight: Tensor
+    public init(_ vocabulary: Int, _ dims: Int) { weight = Init.normal([vocabulary, dims], std: 0.1) }
+    /// `tokens` → [tokens.count, dims].
+    public func callAsFunction(_ tokens: [Int]) -> Tensor { weight.rows(tokens) }
+    public override func callAsFunction(_ x: Tensor) -> Tensor { weight.rows(x.data.map { Int($0) }).reshaped(x.shape + [weight.shape[1]]) }
+}
+
+// MARK: - Convolution
+
+extension Tensor {
+    /// [N, C, H, W] → [N * OH * OW, C * KH * KW] patches (gradient: col2im).
+    public func im2col(kernel: (Int, Int), stride: Int, padding: Int) -> (Tensor, Int, Int) {
+        precondition(rank == 4, "im2col needs [N, C, H, W], got \(shape)")
+        let (n, c, h, w) = (shape[0], shape[1], shape[2], shape[3])
+        let (kh, kw) = kernel
+        let oh = (h + 2 * padding - kh) / stride + 1, ow = (w + 2 * padding - kw) / stride + 1
+        let cols = c * kh * kw, rowsCount = n * oh * ow
+        var idx = [Int](repeating: -1, count: rowsCount * cols)   // source index per output cell (-1 = padding)
+        for b in 0 ..< n {
+            for y in 0 ..< oh {
+                for x in 0 ..< ow {
+                    let r = (b * oh + y) * ow + x
+                    for ch in 0 ..< c {
+                        for i in 0 ..< kh {
+                            for j in 0 ..< kw {
+                                let sy = y * stride + i - padding, sx = x * stride + j - padding
+                                if sy >= 0 && sy < h && sx >= 0 && sx < w {
+                                    idx[r * cols + (ch * kh + i) * kw + j] = ((b * c + ch) * h + sy) * w + sx
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let out = idx.map { $0 >= 0 ? data[$0] : 0 }
+        let t = Tensor.result([rowsCount, cols], out, [self]) { r in
+            let g = r.gradStorage!
+            var gx = [Float](repeating: 0, count: self.count)
+            for k in 0 ..< idx.count where idx[k] >= 0 { gx[idx[k]] += g[k] }
+            self.accumulate(gx)
+        }
+        return (t, oh, ow)
+    }
+}
+
+/// 2-D convolution on [N, C, H, W] (im2col + one matrix product).
+public final class Conv2d: Module {
+    public var weight: Tensor   // [C * KH * KW, outChannels]
+    public var bias: Tensor
+    let kernel: (Int, Int)
+    let stride: Int
+    let padding: Int
+    let outChannels: Int
+
+    public init(_ inChannels: Int, _ outChannels: Int, kernel: Int, stride: Int = 1, padding: Int = 0) {
+        let fanIn = inChannels * kernel * kernel
+        weight = Init.he([fanIn, outChannels], fanIn: fanIn)
+        bias = Tensor.zeros([outChannels], requiresGrad: true)
+        self.kernel = (kernel, kernel)
+        self.stride = stride
+        self.padding = padding
+        self.outChannels = outChannels
+    }
+
+    public override func callAsFunction(_ x: Tensor) -> Tensor {
+        let (cols, oh, ow) = x.im2col(kernel: kernel, stride: stride, padding: padding)
+        let y = matmul(cols, weight) + bias                          // [N*OH*OW, OC]
+        return y.reshaped([x.shape[0], oh, ow, outChannels]).transposed([0, 3, 1, 2])
+    }
+}
+
+/// Max pooling on [N, C, H, W].
+public final class MaxPool2d: Module {
+    let size: Int
+    let stride: Int
+    public init(_ size: Int = 2, stride: Int? = nil) {
+        self.size = size
+        self.stride = stride ?? size
+    }
+    public override func callAsFunction(_ x: Tensor) -> Tensor {
+        let (n, c, h, w) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3])
+        let oh = (h - size) / stride + 1, ow = (w - size) / stride + 1
+        var out = [Float](repeating: -.infinity, count: n * c * oh * ow)
+        var arg = [Int](repeating: 0, count: out.count)
+        for p in 0 ..< n * c {
+            for y in 0 ..< oh {
+                for xx in 0 ..< ow {
+                    let o = (p * oh + y) * ow + xx
+                    for i in 0 ..< size {
+                        for j in 0 ..< size {
+                            let s = (p * h + y * stride + i) * w + xx * stride + j
+                            if x.data[s] > out[o] { out[o] = x.data[s]; arg[o] = s }
+                        }
+                    }
+                }
+            }
+        }
+        return Tensor.result([n, c, oh, ow], out, [x]) { r in
+            let g = r.gradStorage!
+            var gx = [Float](repeating: 0, count: x.count)
+            for o in 0 ..< g.count { gx[arg[o]] += g[o] }
+            x.accumulate(gx)
+        }
+    }
+}
+
+// MARK: - Recurrent
+
+/// Long short-term memory over [T, N, inputs] (or [T, inputs]) sequences.
+public final class LSTM: Module {
+    public var inputWeights: Tensor   // [inputs, 4 * hidden]
+    public var hiddenWeights: Tensor  // [hidden, 4 * hidden]
+    public var bias: Tensor
+    public let hidden: Int
+
+    public init(_ inputs: Int, _ hidden: Int) {
+        self.hidden = hidden
+        inputWeights = Init.glorot([inputs, 4 * hidden], fanIn: inputs, fanOut: 4 * hidden)
+        hiddenWeights = Init.glorot([hidden, 4 * hidden], fanIn: hidden, fanOut: 4 * hidden)
+        var b = [Float](repeating: 0, count: 4 * hidden)
+        for j in hidden ..< 2 * hidden { b[j] = 1 }   // forget-gate bias 1
+        bias = Tensor(data: b, shape: [4 * hidden], requiresGrad: true)
+    }
+
+    /// Returns all hidden states, [T, N, hidden].
+    public override func callAsFunction(_ x: Tensor) -> Tensor {
+        let seq = x.rank == 2 ? x.reshaped([x.shape[0], 1, x.shape[1]]) : x
+        let (steps, n) = (seq.shape[0], seq.shape[1])
+        var h = Tensor.zeros([n, hidden]), c = Tensor.zeros([n, hidden])
+        var outputs: [Tensor] = []
+        for t in 0 ..< steps {
+            let xt = seq.narrow(0, t, 1).reshaped([n, -1])
+            let gates = matmul(xt, inputWeights) + matmul(h, hiddenWeights) + bias
+            let parts = gates.split(4, axis: -1)
+            let (i, f, g, o) = (parts[0].sigmoid(), parts[1].sigmoid(), parts[2].tanh(), parts[3].sigmoid())
+            c = f * c + i * g
+            h = o * c.tanh()
+            outputs.append(h)
+        }
+        let out = stack(outputs)
+        return x.rank == 2 ? out.reshaped([steps, hidden]) : out
+    }
+}
+
+// MARK: - Attention
+
+/// Multi-head scaled dot-product attention on [T, dims] (MLX: nn.MultiHeadAttention).
+public final class MultiHeadAttention: Module {
+    public var query: Linear
+    public var key: Linear
+    public var value: Linear
+    public var output: Linear
+    public let heads: Int
+    public let causal: Bool
+
+    public init(_ dims: Int, heads: Int, causal: Bool = false) {
+        precondition(dims % heads == 0, "MultiHeadAttention: dims must divide by heads")
+        query = Linear(dims, dims); key = Linear(dims, dims); value = Linear(dims, dims); output = Linear(dims, dims)
+        self.heads = heads
+        self.causal = causal
+    }
+
+    public override func callAsFunction(_ x: Tensor) -> Tensor {
+        let t = x.shape[0], d = x.shape[1], hd = d / heads
+        func splitHeads(_ y: Tensor) -> Tensor { y.reshaped([t, heads, hd]).transposed([1, 0, 2]) }   // [H, T, hd]
+        let q = splitHeads(query(x)), k = splitHeads(key(x)), v = splitHeads(value(x))
+        var scores = matmul(q, k.T) * (1 / Float(hd).squareRoot())                                     // [H, T, T]
+        if causal {
+            var mask = [Float](repeating: 0, count: t * t)
+            for i in 0 ..< t { for j in (i + 1) ..< Swift.max(t, i + 1) { mask[i * t + j] = -1e9 } }
+            scores = scores + Tensor(data: mask, shape: [t, t])
+        }
+        let attended = matmul(scores.softmax(axis: -1), v)                                             // [H, T, hd]
+        return output(attended.transposed([1, 0, 2]).reshaped([t, d]))
+    }
+}
+
+/// Pre-norm transformer block: x + attn(norm(x)), then x + mlp(norm(x)).
+public final class TransformerBlock: Module {
+    public var norm1: LayerNorm
+    public var attention: MultiHeadAttention
+    public var norm2: LayerNorm
+    public var mlp: Sequential
+
+    public init(_ dims: Int, heads: Int, hidden: Int? = nil, causal: Bool = true) {
+        norm1 = LayerNorm(dims)
+        attention = MultiHeadAttention(dims, heads: heads, causal: causal)
+        norm2 = LayerNorm(dims)
+        mlp = Sequential(Linear(dims, hidden ?? 4 * dims), GELU(), Linear(hidden ?? 4 * dims, dims))
+    }
+
+    public override func callAsFunction(_ x: Tensor) -> Tensor {
+        let h = x + attention(norm1(x))
+        return h + mlp(norm2(h))
+    }
+}

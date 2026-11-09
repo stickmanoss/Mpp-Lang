@@ -1,0 +1,213 @@
+// MppxxKotlin — compiling and running Kotlin through mpp (this is the
+// wrapper's M++ version; it replaced the first one, written in Kotlin).
+//
+//   mpp hello.kt [-- args]          build (cached) and run
+//   mpp --kotlin=2.2 hello.kt       pick the Kotlin language version
+//   mpp --iso-strict hello.kt       warnings are errors (-Werror -progressive)
+//   mpp build hello.kt <dir>        a launcher in <dir>
+//
+// The file can `import mpp.*` (MppLang/mpp-kotlin/lib/mpp.kt): M++'s
+// buffered I/O, checked arithmetic, fatal errors, off-heap Arena. The
+// library is compiled once per Kotlin version. Programs start with a
+// class-data-sharing archive (JDK 19+), created on the first run.
+//
+// Finding Kotlin: $MPP_KOTLIN_HOME, $KOTLIN_HOME, `kotlinc` on PATH
+// (Homebrew: `brew install kotlin`), or the npm package (`npm i -g
+// kotlin-compiler`). Java: $JAVA_HOME, else `java` on PATH.
+
+import MppKit
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+nonisolated(unsafe) var kotlinLanguageVersion: String? = nil
+
+enum Kotlin {
+    static func isSource(_ path: String) -> Bool { Path.ext(path) == ".kt" }
+
+    struct Toolchain {
+        let home: String         // contains lib/kotlin-compiler.jar
+        let java: String
+        let jdkMajor: Int
+        var lib: String { Path.join(home, "lib") }
+        var compilerClasspath: String {
+            ["kotlin-compiler.jar", "kotlin-stdlib.jar", "kotlin-script-runtime.jar", "kotlin-reflect.jar", "annotations-13.0.jar"]
+                .map { Path.join(lib, $0) }.filter { Files.isFile($0) }.joined(separator: ":")
+        }
+        var stdlib: String { Path.join(lib, "kotlin-stdlib.jar") }
+        var version: String { (Files.readIfExists(Path.join(home, "build.txt")) ?? "").trimmingNewlines }
+    }
+
+    static let toolchain: Result<Toolchain, DriverError> = {
+        func valid(_ h: String) -> Bool { Files.isFile(Path.join(h, "lib/kotlin-compiler.jar")) }
+        var home: String? = nil
+        for v in ["MPP_KOTLIN_HOME", "KOTLIN_HOME"] { if let h = Env.get(v), valid(h) { home = h; break } }
+        if home == nil, let kc = Process.which("kotlinc"), let real = Path.realpath(kc) {
+            // <home>/bin/kotlinc
+            let h = Path.dirname(Path.dirname(real))
+            if valid(h) { home = h }
+        }
+        if home == nil, Process.which("npm") != nil, let r = try? Process.run(["npm", "root", "-g"]), r.status == 0 {
+            let h = Path.join(r.output.trimmingNewlines, "kotlin-compiler")
+            if valid(h) { home = h }
+        }
+        guard let home else {
+            return .failure(DriverError("Kotlin not found: install it (`brew install kotlin` or `npm i -g kotlin-compiler`) or set MPP_KOTLIN_HOME"))
+        }
+        var java = Env.get("JAVA_HOME").map { Path.join($0, "bin/java") }.flatMap { Files.isFile($0) ? $0 : nil }
+        if java == nil { java = Process.which("java") }
+        guard let java else { return .failure(DriverError("Java not found (install a JDK 17 or newer, or set JAVA_HOME)")) }
+        // `java -version` prints e.g. openjdk version "21.0.4"
+        var major = 17
+        if let r = try? Process.run([java, "-version"]), let q = r.output.split(separator: "\"").dropFirst().first {
+            major = Int(q.split(separator: ".").first ?? "") ?? 17
+        }
+        return .success(Toolchain(home: home, java: java, jdkMajor: major))
+    }()
+
+    static func libSource() throws(DriverError) -> String { Path.join(try Locations.requireHome(), "MppLang/mpp-kotlin/lib/mpp.kt") }
+
+    /// Runs the Kotlin compiler (in a JVM) with `args`.
+    static func compile(_ args: [String], show: String) throws(DriverError) {
+        let tc = try toolchain.get()
+        if !Env.quiet { status("Compiling", show) }
+        let cmd = [tc.java, "-Xshare:auto", "-XX:TieredStopAtLevel=1", "-cp", tc.compilerClasspath,
+                   "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler", "-no-reflect", "-kotlin-home", tc.home, "-jvm-target", "17"] + args
+        if Env.verbose { writeStderr("+ " + cmd.joined(separator: " ") + "\n") }
+        let r = try Process.run(cmd)
+        let out = r.output.split(separator: "\n").filter { !$0.hasPrefix("Picked up JAVA_TOOL_OPTIONS") }.joined(separator: "\n")
+        if !out.isEmpty { writeStderr(out + "\n") }
+        if r.status != 0 { throw DriverError("could not compile \(show)") }
+    }
+
+    static func languageFlags(_ version: String?, strict: Bool) -> [String] {
+        var f: [String] = []
+        if let v = version { f += ["-language-version", v, "-api-version", v] }
+        if strict { f += ["-Werror", "-progressive"] }
+        return f
+    }
+
+    /// The mpp library (a jar) for this Kotlin version.
+    static func libraryClasses(version: String?, strict: Bool) throws(DriverError) -> String {
+        let tc = try toolchain.get()
+        let src = try libSource()
+        let key = Stamp.of("jar|" + tc.version + "|" + (version ?? "") + "|" + (try Files.read(src)))
+        let dir = Path.join(Locations.cache, "kotlin-lib", String(key.prefix(16)))
+        let jar = Path.join(dir, "mpp.jar")
+        if Files.isFile(Path.join(dir, "ok")) { return jar }
+        Files.makeDirectories(dir)
+        try compile(["-d", jar] + languageFlags(version, strict: false) + [src], show: "MppxxKotlin library")
+        try Files.write(Path.join(dir, "ok"), "")
+        return jar
+    }
+
+    struct Program {
+        let classes: String
+        let classpath: [String]
+        let mainClass: String
+        let archive: String       // class-data-sharing archive
+        let jdkMajor: Int
+        let java: String
+    }
+
+    /// `mpp file.kt`: compiles (cached) and describes how to run it.
+    static func program(_ source: String) throws(DriverError) -> Program {
+        let tc = try toolchain.get()
+        let abs = Path.absolute(source)
+        let text = try Files.read(abs)
+        var version = kotlinLanguageVersion
+        var strict = cppCommandLine.strict ?? false
+        var extra: [String] = []
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingSpacesSub
+            guard line.hasPrefix("// mpp:") else { continue }
+            for w in line.dropFirst(7).split(separator: " ").map(String.init) {
+                if w.hasPrefix("--kotlin=") { if kotlinLanguageVersion == nil { version = String(w.dropFirst(9)) } }
+                else if w == "--iso-strict" || w == "--strict" { strict = true }
+                else if w.hasSuffix(".kt") {
+                    let p = w.hasPrefix("/") ? w : Path.join(Path.dirname(abs), w)
+                    guard Files.isFile(p) else { throw DriverError("`// mpp: \(w)`: file not found: \(p)") }
+                    extra.append(p)
+                } else { throw DriverError("unknown `// mpp:` option `\(w)` (allowed: --kotlin=2.x, --iso-strict, other .kt files)") }
+            }
+        }
+        let lib = try libraryClasses(version: version, strict: strict)
+        let level = (version ?? "default") + (strict ? "-strict" : "")
+        let out = Path.join(Locations.cache, "kotlin", String(Stamp.of(abs).prefix(16)), level)
+        let classes = Path.join(out, "program.jar")         // jars: class-data sharing needs them
+        let mainClass = Kotlin.mainClass(text, stem: Path.stem(abs))
+        let program = Program(classes: classes, classpath: [classes, lib, tc.stdlib], mainClass: mainClass,
+                              archive: Path.join(out, "app.jsa"), jdkMajor: tc.jdkMajor, java: tc.java)
+        let fastFile = Path.join(out, "fast")
+        if let fast = Files.readIfExists(fastFile), Builder.fastPathValid(fast) != nil { return program }
+
+        Files.makeDirectories(out)
+        _ = unlink(classes)
+        try compile(["-d", classes, "-classpath", lib] + languageFlags(version, strict: strict) + [abs] + extra,
+                    show: Path.display(abs))
+        _ = unlink(program.archive)                     // classes changed: rebuild the start-up archive
+        var record = "v1\t\(classes)\t\(Env.get("MPP_MACOS_TARGET") ?? "")\n"
+        for p in [abs] + extra + [try libSource(), Path.join(tc.lib, "kotlin-compiler.jar"), Locations.selfExecutable] {
+            let i = Files.info(p)
+            record += "\(p)\t\(i?.mtimeNanos ?? -1)\t\(i?.size ?? -1)\n"
+        }
+        try Files.write(fastFile, record)
+        return program
+    }
+
+    /// `@file:JvmName("X")`, else `<Stem>Kt`, inside the file's package.
+    static func mainClass(_ text: String, stem: String) -> String {
+        var pkg = ""
+        var jvmName: String? = nil
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingSpacesSub
+            if line.hasPrefix("package ") { pkg = String(line.dropFirst(8)).split(separator: " ").first.map(String.init) ?? ""; break }
+            if line.hasPrefix("@file:JvmName(\""), let end = line.dropFirst(15).firstIndex(of: "\"") {
+                jvmName = String(line.dropFirst(15)[..<end])
+            }
+        }
+        var name = jvmName ?? ""
+        if name.isEmpty {
+            let cleaned = String(stem.map { $0.isLetter || $0.isNumber || $0 == "_" ? $0 : "_" })
+            name = cleaned.prefix(1).uppercased() + cleaned.dropFirst() + "Kt"
+        }
+        return pkg.isEmpty ? name : pkg + "." + name
+    }
+
+    /// The java command line that runs `p`.
+    static func command(_ p: Program, _ args: [String]) -> [String] {
+        var cmd = [p.java, "-XX:+UseSerialGC"]
+        if p.jdkMajor >= 19 { cmd += ["-XX:+AutoCreateSharedArchive", "-XX:SharedArchiveFile=" + p.archive] }
+        cmd += ["-cp", p.classpath.joined(separator: ":"), p.mainClass] + args
+        return cmd
+    }
+
+    /// `mpp build file.kt <dir>`: a launcher script plus its classes.
+    static func build(_ source: String, into dir: String) throws(DriverError) -> String {
+        let p = try program(source)
+        let name = Path.stem(source)
+        let libDir = Path.join(dir, name + ".lib")
+        Files.removeTree(libDir)
+        Files.makeDirectories(libDir)
+        for (i, entry) in p.classpath.enumerated() {
+            let r = try Process.run(["cp", "-R", entry, Path.join(libDir, "\(i)-" + Path.basename(entry))])
+            if r.status != 0 { throw DriverError("could not copy \(entry): \(r.output)") }
+        }
+        let cp = p.classpath.enumerated().map { "\"$here/\(name).lib/\($0.offset)-\(Path.basename($0.element))\"" }.joined(separator: ":")
+        let script = "#!/bin/sh\n# Built by mpp (MppxxKotlin).\nhere=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
+            + "exec java -XX:+UseSerialGC -cp \(cp) \(p.mainClass) \"$@\"\n"
+        let dest = Path.join(dir, name)
+        try Files.write(dest, script)
+        _ = chmod(dest, 0o755)
+        return dest
+    }
+
+    static func parseOption(_ arg: String) -> Bool {
+        if arg.hasPrefix("--kotlin=") { kotlinLanguageVersion = String(arg.dropFirst(9)); return true }
+        return false
+    }
+}

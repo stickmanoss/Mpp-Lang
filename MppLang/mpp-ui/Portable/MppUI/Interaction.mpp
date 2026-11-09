@@ -1,0 +1,416 @@
+// MppUI (portable engine) — gestures, hover, observable models, focus,
+// animation, persistent settings, tab views and disclosure groups.
+
+import MppUIEngine
+
+// MARK: - Gestures
+
+public protocol Gesture {
+    var _attachment: _GestureAttachment { get }
+}
+
+/// How a gesture wraps the node of the view it's attached to.
+public final class _GestureAttachment {
+    let attach: (Node) -> Node
+    init(_ attach: @escaping (Node) -> Node) { self.attach = attach }
+}
+
+public struct DragGesture: Gesture {
+    public struct Value: Sendable, Equatable {
+        public var startLocation: CGPoint
+        public var location: CGPoint
+        public var translation: CGSize { CGSize(width: location.x - startLocation.x, height: location.y - startLocation.y) }
+        public var predictedEndLocation: CGPoint { location }
+    }
+    let minimumDistance: Double
+    var changed: ((Value) -> Void)?
+    var ended: ((Value) -> Void)?
+    public init(minimumDistance: Double = 10, coordinateSpace: CoordinateSpace = .local) { self.minimumDistance = minimumDistance }
+    public func onChanged(_ f: @escaping (Value) -> Void) -> DragGesture { var g = self; g.changed = f; return g }
+    public func onEnded(_ f: @escaping (Value) -> Void) -> DragGesture { var g = self; g.ended = f; return g }
+    public var _attachment: _GestureAttachment { _GestureAttachment { GestureNode($0, drag: self, tap: nil) } }
+}
+
+public struct TapGesture: Gesture {
+    let count: Int
+    var ended: (() -> Void)?
+    public init(count: Int = 1) { self.count = count }
+    public func onEnded(_ f: @escaping () -> Void) -> TapGesture { var g = self; g.ended = f; return g }
+    public var _attachment: _GestureAttachment { _GestureAttachment { GestureNode($0, drag: nil, tap: self) } }
+}
+
+public struct LongPressGesture: Gesture {
+    let minimumDuration: Double
+    var ended: ((Bool) -> Void)?
+    public init(minimumDuration: Double = 0.5) { self.minimumDuration = minimumDuration }
+    public func onEnded(_ f: @escaping (Bool) -> Void) -> LongPressGesture { var g = self; g.ended = f; return g }
+    public var _attachment: _GestureAttachment { _GestureAttachment { node in
+        let start = Box<ContinuousClock.Instant?>(nil)
+        let ended = self.ended, min = minimumDuration
+        return GestureNode(node, drag: nil, tap: nil, down: { start.value = .now }, up: { inside in
+            guard inside, let s = start.value else { return }
+            let d = ContinuousClock.now - s
+            if Double(d.components.seconds) + Double(d.components.attoseconds) * 1e-18 >= min { ended?(true) }
+        })
+    } }
+}
+
+final class Box<T> { var value: T; init(_ v: T) { value = v } }
+
+final class GestureNode: WrapperNode {
+    let drag: DragGesture?
+    let tap: TapGesture?
+    let down: (() -> Void)?
+    let up: ((Bool) -> Void)?
+    init(_ c: Node, drag: DragGesture?, tap: TapGesture?, down: (() -> Void)? = nil, up: ((Bool) -> Void)? = nil) {
+        self.drag = drag; self.tap = tap; self.down = down; self.up = up
+        super.init(c)
+    }
+    override var acceptsClicks: Bool { env.isEnabled }
+    var key: String { path + "#drag" }
+    func local(_ x: Double, _ y: Double) -> CGPoint { CGPoint(x: x - frame.x, y: y - frame.y) }
+    override func mouseDown(_ x: Double, _ y: Double) {
+        Runtime.memory[key] = (local(x, y), false)
+        down?()
+    }
+    override func mouseDragged(_ x: Double, _ y: Double) {
+        guard let drag, let (start, active) = Runtime.memory[key] as? (CGPoint, Bool) else { return }
+        let p = local(x, y)
+        if active || hypot(p.x - start.x, p.y - start.y) >= drag.minimumDistance {
+            Runtime.memory[key] = (start, true)
+            drag.changed?(DragGesture.Value(startLocation: start, location: p))
+            Runtime.invalidate()
+        }
+    }
+    override func mouseUp(_ x: Double, _ y: Double, inside: Bool) {
+        let state = Runtime.memory[key] as? (CGPoint, Bool)
+        Runtime.memory[key] = nil
+        if let drag, let (start, active) = state, active {
+            drag.ended?(DragGesture.Value(startLocation: start, location: local(x, y)))
+        } else if inside {
+            tap?.ended?()
+        }
+        up?(inside)
+        Runtime.invalidate()
+    }
+}
+
+extension View {
+    public func gesture<G: Gesture>(_ g: G) -> some View { _wrap { n, _ in g._attachment.attach(n) } }
+    public func simultaneousGesture<G: Gesture>(_ g: G) -> some View { gesture(g) }
+    public func highPriorityGesture<G: Gesture>(_ g: G) -> some View { gesture(g) }
+    public func onLongPressGesture(minimumDuration: Double = 0.5, perform action: @escaping () -> Void) -> some View {
+        gesture(LongPressGesture(minimumDuration: minimumDuration).onEnded { _ in action() })
+    }
+
+    /// Calls `action(true)` when the pointer enters the view, `action(false)` when it leaves.
+    public func onHover(perform action: @escaping (Bool) -> Void) -> some View {
+        _wrap { n, _ in HoverNode(n, action) }
+    }
+}
+
+final class HoverNode: WrapperNode {
+    let action: (Bool) -> Void
+    init(_ c: Node, _ a: @escaping (Bool) -> Void) { action = a; super.init(c) }
+}
+
+extension Runtime {
+    nonisolated(unsafe) static var hovered = Set<String>()
+
+    /// Pointer moved: update hover highlights and call onHover actions.
+    static func pointerMoved(_ nodes: [Node]) {
+        let now = Set(nodes.compactMap { $0 is HoverNode ? $0.path : nil })
+        var changed = false
+        for n in nodes where n is HoverNode && !hovered.contains(n.path) { (n as! HoverNode).action(true); changed = true }
+        if now != hovered {
+            // Exits: the nodes are gone from under the pointer, so look them up by path.
+            for p in hovered.subtracting(now) { (findAnywhere(p) as? HoverNode)?.action(false); changed = true }
+            hovered = now
+        }
+        let target = nodes.last { $0.acceptsClicks }?.path
+        if target != hoverPath { hoverPath = target; changed = true }
+        if changed { invalidate() }
+    }
+
+    nonisolated(unsafe) static var tree: Node?
+    static func findAnywhere(_ path: String) -> Node? { findInOverlays(path) ?? tree?.find(path: path) }
+}
+
+// MARK: - Observable models
+
+#if !canImport(Combine)
+/// A class whose changes views pick up (they re-render after every event).
+public protocol ObservableObject: AnyObject {}
+
+@propertyWrapper
+public struct Published<Value> {
+    public var wrappedValue: Value
+    public init(wrappedValue: Value) { self.wrappedValue = wrappedValue }
+    public var projectedValue: Published<Value> { self }
+}
+#endif
+
+/// A model object a view owns; created once and kept across re-renders.
+@propertyWrapper
+public struct StateObject<O: AnyObject>: StateProperty {
+    let box: StateBox<O?>
+    let make: () -> O
+    public init(wrappedValue: @autoclosure @escaping () -> O) { box = StateBox(nil); make = wrappedValue }
+    public var wrappedValue: O {
+        if let o = box.value { return o }
+        let o = make()
+        box.value = o
+        return o
+    }
+    public var projectedValue: Bindable<O> { Bindable(wrappedValue) }
+    var stateBox: AnyStateBox { box }
+}
+
+/// A model object passed in from outside.
+@propertyWrapper
+public struct ObservedObject<O: AnyObject> {
+    public var wrappedValue: O
+    public init(wrappedValue: O) { self.wrappedValue = wrappedValue }
+    public var projectedValue: Bindable<O> { Bindable(wrappedValue) }
+}
+
+/// Bindings to an object's properties: `$model.name`.
+@propertyWrapper
+@dynamicMemberLookup
+public struct Bindable<O: AnyObject> {
+    public var wrappedValue: O
+    public init(wrappedValue: O) { self.wrappedValue = wrappedValue }
+    public init(_ object: O) { wrappedValue = object }
+    public var projectedValue: Bindable<O> { self }
+    public subscript<T>(dynamicMember keyPath: ReferenceWritableKeyPath<O, T>) -> Binding<T> {
+        let o = wrappedValue
+        return Binding(get: { o[keyPath: keyPath] }, set: { o[keyPath: keyPath] = $0; Runtime.invalidate() })
+    }
+}
+
+/// A model object from an ancestor's `.environmentObject(_:)`.
+@propertyWrapper
+public struct EnvironmentObject<O: AnyObject>: _EnvironmentCapturing {
+    let box = _EnvBox<O>()
+    public init() {}
+    public var wrappedValue: O {
+        if let o = box.value { return o }
+        guard let o = Runtime.environment.objects[ObjectIdentifier(O.self)] as? O else {
+            preconditionFailure("No \(O.self) in the environment: add .environmentObject(object) to an ancestor view")
+        }
+        return o
+    }
+    public var projectedValue: Bindable<O> { Bindable(wrappedValue) }
+    func capture(_ env: EnvironmentValues) { box.value = env.objects[ObjectIdentifier(O.self)] as? O }
+}
+
+extension View {
+    public func environmentObject<O: AnyObject>(_ o: O) -> some View { _env { $0.objects[ObjectIdentifier(O.self)] = o } }
+    /// Puts an observable object in the environment (read it with `@Environment(Model.self)`).
+    public func environment<O: AnyObject>(_ o: O) -> some View { _env { $0.objects[ObjectIdentifier(O.self)] = o } }
+}
+
+// MARK: - Focus
+
+@propertyWrapper
+public struct FocusState<Value: Hashable>: StateProperty {
+    let box: StateBox<Value>
+    public init() where Value == Bool { box = StateBox(false) }
+    public init<T>() where Value == T? { box = StateBox(nil) }
+    public var wrappedValue: Value {
+        get { box.value }
+        nonmutating set { box.value = newValue; Runtime.invalidate() }
+    }
+    public struct Binding {
+        let box: StateBox<Value>
+        public var wrappedValue: Value { get { box.value } nonmutating set { box.value = newValue } }
+    }
+    public var projectedValue: Binding { Binding(box: box) }
+    var stateBox: AnyStateBox { box }
+}
+
+extension View {
+    /// Focuses this view's text field while the binding is true (and sets it when clicked).
+    public func focused(_ binding: FocusState<Bool>.Binding) -> some View {
+        _wrap { n, _ in
+            var field: Node? = nil
+            func find(_ x: Node) { if field == nil { if x is TextFieldNode { field = x } else { x.children().forEach(find) } } }
+            find(n)
+            if let f = field {
+                if binding.wrappedValue { Runtime.focusPath = f.path } else if Runtime.focusPath == f.path { binding.wrappedValue = true }
+            }
+            return n
+        }
+    }
+    public func focused<V: Hashable>(_ binding: FocusState<V?>.Binding, equals value: V) -> some View {
+        _wrap { n, _ in
+            var field: Node? = nil
+            func find(_ x: Node) { if field == nil { if x is TextFieldNode { field = x } else { x.children().forEach(find) } } }
+            find(n)
+            if let f = field {
+                if binding.wrappedValue == value { Runtime.focusPath = f.path } else if Runtime.focusPath == f.path { binding.wrappedValue = value }
+            }
+            return n
+        }
+    }
+}
+
+// MARK: - Animation
+
+/// Animations are accepted for source compatibility; changes apply at once.
+public struct Animation: Sendable, Equatable {
+    let name: String
+    public static let `default` = Animation(name: "default"), linear = Animation(name: "linear")
+    public static let easeIn = Animation(name: "easeIn"), easeOut = Animation(name: "easeOut"), easeInOut = Animation(name: "easeInOut")
+    public static let spring = Animation(name: "spring"), bouncy = Animation(name: "bouncy"), smooth = Animation(name: "smooth"), snappy = Animation(name: "snappy")
+    public static func linear(duration: Double) -> Animation { .linear }
+    public static func easeInOut(duration: Double) -> Animation { .easeInOut }
+    public static func spring(response: Double = 0.5, dampingFraction: Double = 0.8, blendDuration: Double = 0) -> Animation { .spring }
+    public func delay(_ d: Double) -> Animation { self }
+    public func repeatForever(autoreverses: Bool = true) -> Animation { self }
+}
+
+@discardableResult
+public func withAnimation<R>(_ animation: Animation? = .default, _ body: () throws -> R) rethrows -> R {
+    let r = try body()
+    Runtime.invalidate()
+    return r
+}
+
+// MARK: - Persistent settings
+
+/// A value saved in UserDefaults (survives app restarts), like SwiftUI's @AppStorage.
+@propertyWrapper
+public struct AppStorage<Value> {
+    let key: String
+    let defaultValue: Value
+    public init(wrappedValue: Value, _ key: String) where Value == Bool { self.key = key; defaultValue = wrappedValue }
+    public init(wrappedValue: Value, _ key: String) where Value == Int { self.key = key; defaultValue = wrappedValue }
+    public init(wrappedValue: Value, _ key: String) where Value == Double { self.key = key; defaultValue = wrappedValue }
+    public init(wrappedValue: Value, _ key: String) where Value == String { self.key = key; defaultValue = wrappedValue }
+    public var wrappedValue: Value {
+        get { UserDefaults.standard.object(forKey: key) as? Value ?? defaultValue }
+        nonmutating set { UserDefaults.standard.set(newValue, forKey: key); Runtime.invalidate() }
+    }
+    public var projectedValue: Binding<Value> {
+        let k = key, d = defaultValue
+        return Binding(get: { UserDefaults.standard.object(forKey: k) as? Value ?? d },
+                       set: { UserDefaults.standard.set($0, forKey: k); Runtime.invalidate() })
+    }
+}
+
+// MARK: - TabView
+
+struct _TabItem: View, PrimitiveView {
+    typealias Body = Never
+    let content: any View
+    let label: ViewList
+    func makeNode(_ ctx: inout BuildContext) -> Node { ctx.build(content, index: 0) }
+}
+
+extension View {
+    public func tabItem(@ViewBuilder _ label: () -> ViewList) -> some View { _TabItem(content: self, label: label()) }
+    public func badge(_ count: Int) -> some View { _noop() }
+}
+
+/// Tabs across the top of a bordered box (the macOS look).
+public struct TabView: View, PrimitiveView {
+    public typealias Body = Never
+    let content: ViewList
+    let selection: Binding<AnyHashable>?
+    public init(@ViewBuilder content: () -> ViewList) { self.content = content(); selection = nil }
+    public init<S: Hashable>(selection: Binding<S>, @ViewBuilder content: () -> ViewList) {
+        self.content = content()
+        self.selection = Binding(get: { AnyHashable(selection.wrappedValue) }, set: { if let v = $0.base as? S { selection.wrappedValue = v } })
+    }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        // Tabs: (content, label, tag)
+        var tabs: [(view: any View, label: ViewList, tag: AnyHashable?)] = []
+        func visit(_ v: any View) {
+            if let l = v as? _FlatList { l.items.forEach(visit); return }
+            if let e = v as? _ForEachExpandable { e.expandedViews().forEach(visit); return }
+            var tag: AnyHashable? = nil, label = ViewList([Text("Tab")]), inner: any View = v
+            if let t = inner as? _Tagged { tag = t.tag; inner = t.content }
+            if let ti = inner as? _TabItem { label = ti.label; inner = ti.content }
+            if let t = inner as? _Tagged { tag = t.tag; inner = t.content }
+            tabs.append((inner, label, tag))
+        }
+        content.items.forEach(visit)
+        guard !tabs.isEmpty else { return EmptyNode() }
+        let key = ctx.path + "#tab"
+        var index = Runtime.memory[key] as? Int ?? 0
+        if let selection, let i = tabs.firstIndex(where: { $0.tag == selection.wrappedValue }) { index = i }
+        index = Swift.min(index, tabs.count - 1)
+        var segments: [Node] = []
+        for (i, t) in tabs.enumerated() {
+            let kids = ctx.children(of: t.label)
+            let l = kids.count == 1 ? kids[0] : StackNode(axis: .horizontal, spacing: 4, alignment: .center, children: kids)
+            _ = i
+            segments.append(PaddingNode(l, EdgeInsets(top: 2, leading: 10, bottom: 2, trailing: 10)))
+        }
+        let sel = selection
+        let tags = tabs.map(\.tag)
+        let header = SegmentedNode(segments, selected: index) { i in
+            Runtime.memory[key] = i
+            if let sel, let t = tags[i] { sel.wrappedValue = t }
+        }
+        header.env = Runtime.environment; header.envAssigned = true
+        header.path = ctx.path + "/tabs"
+        let body = ctx.build(tabs[index].view, index: 10_000 + index, id: "tab\(index)")
+        let box = LayerNode(PaddingNode(FrameNode.fill(body, vertical: true), EdgeInsets(top: 22, leading: 14, bottom: 14, trailing: 14)),
+                            layer: { let s = ShapeNode(.rounded(14)); s.fill = Color(white: 0, opacity: 0.03); s.stroke = (Color(white: 0, opacity: 0.09), 0.5); return s }(),
+                            behind: true)
+        return TabNode(header: header, box: box)
+    }
+}
+
+/// The tab header sits centered on the top edge of the box.
+final class TabNode: Node {
+    let header: Node, box: Node
+    init(header: Node, box: Node) { self.header = header; self.box = box }
+    override func children() -> [Node] { [box, header] }
+    override var flexibility: Double { 1e8 }
+    override func size(_ p: Proposal) -> Size {
+        let h = header.measure(Proposal(width: nil, height: nil))
+        let b = box.measure(Proposal(width: p.width, height: p.height.map { $0 - h.height / 2 }))
+        return Size(width: Swift.max(h.width, b.width), height: b.height + h.height / 2)
+    }
+    override func place(_ r: Rect) {
+        frame = r
+        let h = header.measure(Proposal(width: nil, height: nil))
+        box.place(Rect(x: r.x, y: r.y + h.height / 2, width: r.width, height: r.height - h.height / 2))
+        header.place(Rect(x: r.x + (r.width - h.width) / 2, y: r.y, width: h.width, height: h.height))
+    }
+    override func draw() { box.draw(); header.draw() }
+}
+
+// MARK: - DisclosureGroup
+
+public struct DisclosureGroup: View, PrimitiveView {
+    public typealias Body = Never
+    let label: ViewList
+    let content: ViewList
+    let expanded: Binding<Bool>?
+    public init(_ title: String, @ViewBuilder content: () -> ViewList) { label = ViewList([Text(title)]); self.content = content(); expanded = nil }
+    public init(_ title: String, isExpanded: Binding<Bool>, @ViewBuilder content: () -> ViewList) {
+        label = ViewList([Text(title)]); self.content = content(); expanded = isExpanded
+    }
+    public init(@ViewBuilder content: () -> ViewList, @ViewBuilder label: () -> ViewList) { self.label = label(); self.content = content(); expanded = nil }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let key = ctx.path + "#open"
+        let open = expanded?.wrappedValue ?? (Runtime.memory[key] as? Bool ?? false)
+        let chevron = ImageNode(open ? "chevron.down" : "chevron.right")
+        var env = Runtime.environment
+        env.font = Font(size: 10, bold: true)
+        env.foregroundColor = .secondary
+        chevron.env = env; chevron.envAssigned = true
+        let exp = expanded
+        let row = TapNode(StackNode(axis: .horizontal, spacing: 6, alignment: .center, children: [chevron] + ctx.children(of: label))) {
+            if let exp { exp.wrappedValue.toggle() } else { Runtime.memory[key] = !open }
+        }
+        guard open else { return row }
+        let body = StackNode(axis: .vertical, spacing: 8, alignment: .leading, children: ctx.children(of: content))
+        return StackNode(axis: .vertical, spacing: 8, alignment: .leading,
+                         children: [row, PaddingNode(body, EdgeInsets(top: 0, leading: 17, bottom: 0, trailing: 0))])
+    }
+}

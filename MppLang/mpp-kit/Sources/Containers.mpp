@@ -1,0 +1,213 @@
+// MppKit — Containers: Boost-style data structures.
+//
+//   RingBuffer<T>   boost::circular_buffer: fixed capacity, oldest overwritten
+//   BitSet          boost::dynamic_bitset: popcount, set-bit iteration, set algebra
+//   SmallArray<T>   boost::small_vector: first 8 elements stored inline, no heap
+
+// MARK: - RingBuffer
+
+public struct RingBuffer<Element>: RandomAccessCollection, MutableCollection, CustomStringConvertible {
+    @usableFromInline var buffer: [Element?]
+    @usableFromInline var head = 0          // index of the oldest element
+    public private(set) var count = 0
+    public let capacity: Int
+
+    public init(capacity: Int) {
+        precondition(capacity > 0, "RingBuffer: capacity must be positive")
+        self.capacity = capacity
+        buffer = Array(repeating: nil, count: capacity)
+    }
+
+    public var startIndex: Int { 0 }
+    public var endIndex: Int { count }
+    public var isFull: Bool { count == capacity }
+
+    @inlinable
+    public subscript(i: Int) -> Element {
+        get {
+            precondition(i >= 0 && i < count, "RingBuffer: index \(i) out of range 0..<\(count)")
+            return buffer[(head + i) % capacity]!
+        }
+        set {
+            precondition(i >= 0 && i < count, "RingBuffer: index \(i) out of range 0..<\(count)")
+            buffer[(head + i) % capacity] = newValue
+        }
+    }
+
+    /// Appends; when full, overwrites (and returns) the oldest element.
+    @discardableResult
+    public mutating func push(_ e: Element) -> Element? {
+        if count < capacity {
+            buffer[(head + count) % capacity] = e
+            count += 1
+            return nil
+        }
+        let old = buffer[head]
+        buffer[head] = e
+        head = (head + 1) % capacity
+        return old
+    }
+
+    /// Removes and returns the oldest element.
+    public mutating func popFirst() -> Element? {
+        guard count > 0 else { return nil }
+        defer { buffer[head] = nil; head = (head + 1) % capacity; count -= 1 }
+        return buffer[head]
+    }
+
+    /// Removes and returns the newest element.
+    public mutating func popLast() -> Element? {
+        guard count > 0 else { return nil }
+        let i = (head + count - 1) % capacity
+        defer { buffer[i] = nil; count -= 1 }
+        return buffer[i]
+    }
+
+    public var description: String { "RingBuffer(" + map { "\($0)" }.joined(separator: ", ") + ")" }
+}
+
+extension RingBuffer: Sendable where Element: Sendable {}
+
+// MARK: - BitSet
+
+public struct BitSet: Equatable, Hashable, Sendable, Sequence, CustomStringConvertible {
+    @usableFromInline var words: [UInt64]
+    public private(set) var count: Int   // number of bits (not set bits)
+
+    public init(count: Int) {
+        self.count = count
+        words = Array(repeating: 0, count: (count + 63) >> 6)
+    }
+
+    public init<S: Sequence>(count: Int, setting indices: S) where S.Element == Int {
+        self.init(count: count)
+        for i in indices { insert(i) }
+    }
+
+    @inlinable public func contains(_ i: Int) -> Bool {
+        precondition(i >= 0 && i < count, "BitSet: bit \(i) out of range 0..<\(count)")
+        return words[i >> 6] & (1 << UInt64(i & 63)) != 0
+    }
+    @inlinable public mutating func insert(_ i: Int) {
+        precondition(i >= 0 && i < count, "BitSet: bit \(i) out of range 0..<\(count)")
+        words[i >> 6] |= 1 << UInt64(i & 63)
+    }
+    @inlinable public mutating func remove(_ i: Int) {
+        precondition(i >= 0 && i < count, "BitSet: bit \(i) out of range 0..<\(count)")
+        words[i >> 6] &= ~(1 << UInt64(i & 63))
+    }
+    @inlinable public mutating func toggle(_ i: Int) {
+        precondition(i >= 0 && i < count, "BitSet: bit \(i) out of range 0..<\(count)")
+        words[i >> 6] ^= 1 << UInt64(i & 63)
+    }
+    @inlinable public subscript(i: Int) -> Bool {
+        get { contains(i) }
+        set { if newValue { insert(i) } else { remove(i) } }
+    }
+
+    /// Number of set bits (hardware popcount).
+    public var cardinality: Int { words.reduce(0) { $0 + $1.nonzeroBitCount } }
+    public var isEmpty: Bool { words.allSatisfy { $0 == 0 } }
+    /// Lowest set bit, found with a trailing-zero count per word.
+    public var first: Int? {
+        for (w, word) in words.enumerated() where word != 0 { return w << 6 | word.trailingZeroBitCount }
+        return nil
+    }
+
+    public static func & (a: BitSet, b: BitSet) -> BitSet { a.combine(b, &) }
+    public static func | (a: BitSet, b: BitSet) -> BitSet { a.combine(b, |) }
+    public static func ^ (a: BitSet, b: BitSet) -> BitSet { a.combine(b, ^) }
+    public static prefix func ~ (a: BitSet) -> BitSet {
+        var r = a
+        for k in r.words.indices { r.words[k] = ~r.words[k] }
+        r.clearTail()
+        return r
+    }
+    func combine(_ b: BitSet, _ op: (UInt64, UInt64) -> UInt64) -> BitSet {
+        precondition(count == b.count, "BitSet: sizes differ (\(count) vs \(b.count))")
+        var r = self
+        for k in r.words.indices { r.words[k] = op(words[k], b.words[k]) }
+        return r
+    }
+    mutating func clearTail() {
+        if count & 63 != 0 { words[words.count - 1] &= (1 << UInt64(count & 63)) - 1 }
+    }
+
+    /// Iterates set bits in order: isolate the lowest bit, clear it, repeat.
+    public func makeIterator() -> AnyIterator<Int> {
+        var w = 0
+        var word = words.first ?? 0
+        let ws = words
+        return AnyIterator {
+            while word == 0 {
+                w += 1
+                if w >= ws.count { return nil }
+                word = ws[w]
+            }
+            let bit = word.trailingZeroBitCount
+            word &= word &- 1
+            return w << 6 | bit
+        }
+    }
+
+    public var description: String { "BitSet(" + map(String.init).joined(separator: ", ") + ")" }
+}
+
+// MARK: - SmallArray
+
+/// An array that stores up to 8 elements inline and moves to the heap
+/// only when it grows past that (boost::small_vector<T, 8>).
+public struct SmallArray<Element>: RandomAccessCollection, MutableCollection, ExpressibleByArrayLiteral {
+    @usableFromInline var inline: (Element?, Element?, Element?, Element?, Element?, Element?, Element?, Element?) =
+        (nil, nil, nil, nil, nil, nil, nil, nil)
+    @usableFromInline var inlineCount = 0
+    @usableFromInline var heap: [Element]? = nil
+
+    public static var inlineCapacity: Int { 8 }
+
+    public init() {}
+    public init(arrayLiteral elements: Element...) { for e in elements { append(e) } }
+
+    public var startIndex: Int { 0 }
+    public var endIndex: Int { heap?.count ?? inlineCount }
+    /// True while no heap allocation has happened.
+    public var isInline: Bool { heap == nil }
+
+    @inlinable
+    public subscript(i: Int) -> Element {
+        get {
+            if let h = heap { return h[i] }
+            precondition(i >= 0 && i < inlineCount, "SmallArray: index \(i) out of range 0..<\(inlineCount)")
+            return withUnsafeBytes(of: inline) { $0.assumingMemoryBound(to: Element?.self)[i]! }
+        }
+        set {
+            if heap != nil { heap![i] = newValue; return }
+            precondition(i >= 0 && i < inlineCount, "SmallArray: index \(i) out of range 0..<\(inlineCount)")
+            withUnsafeMutableBytes(of: &inline) { $0.assumingMemoryBound(to: Element?.self)[i] = newValue }
+        }
+    }
+
+    public mutating func append(_ e: Element) {
+        if heap != nil { heap!.append(e); return }
+        if inlineCount < 8 {
+            withUnsafeMutableBytes(of: &inline) { $0.assumingMemoryBound(to: Element?.self)[inlineCount] = e }
+            inlineCount += 1
+            return
+        }
+        var h = Array(self)
+        h.append(e)
+        inline = (nil, nil, nil, nil, nil, nil, nil, nil)
+        heap = h
+    }
+
+    public mutating func removeLast() -> Element {
+        if heap != nil { return heap!.removeLast() }
+        precondition(inlineCount > 0, "SmallArray: removeLast on empty array")
+        inlineCount -= 1
+        return withUnsafeMutableBytes(of: &inline) { p in
+            let slot = p.assumingMemoryBound(to: Element?.self)
+            defer { slot[inlineCount] = nil }
+            return slot[inlineCount]!
+        }
+    }
+}

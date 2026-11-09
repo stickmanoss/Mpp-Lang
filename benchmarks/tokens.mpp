@@ -1,0 +1,48 @@
+// Token store: write 1B tokens, then open and read them.
+import MppKit
+
+let path = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "/tmp/bench-1b.mtok"
+let n = 1_000_000_000
+
+// Write 1B 16-bit tokens on all cores (deterministic pseudo-text).
+let (writer, tCreate) = try measure { try TokenWriter(creating: path, width: .u16, capacity: n, vocabulary: 50_000) }
+let (_, tFill) = measure {
+    writer.fill(count: n, as: UInt16.self) { range, buf in
+        var x = UInt32(truncatingIfNeeded: range.lowerBound) &* 2_654_435_761
+        for i in 0 ..< buf.count { x = x &* 1_664_525 &+ 1_013_904_223; buf[i] = UInt16(truncatingIfNeeded: x >> 16) % 50_000 }
+    }
+}
+let (_, tFinish) = try measure { try writer.finish() }
+println("create (reserve 2 GB):  {:>10.1f} µs", tCreate * 1e6)
+println("fill 1B tokens:         {:>10.3f} s  ({:.2f} GB/s)", tFill, 2.0 / tFill)
+println("finish (checksums):     {:>10.3f} s", tFinish)
+
+// Open: header check + mmap only. Best of 1000 opens.
+var best = 1.0
+var sink = 0
+for _ in 0 ..< 1000 {
+    let (f, t) = try measure { try TokenFile(path) }
+    best = min(best, t)
+    sink &+= f.count
+}
+println("open 1B-token file:     {:>10.2f} µs  (best of 1000)", best * 1e6)
+
+let tokens = try TokenFile(path)
+var rng = PCG32(seed: 1)
+let (_, tRandom) = measure { for _ in 0 ..< 1_000_000 { sink &+= tokens[Int(rng.next() % UInt64(n))] } }
+println("random token access:    {:>10.1f} ns each", tRandom * 1e3)
+let (sum, tScan) = measure { () -> UInt64 in
+    tokens.withTokens(UInt16.self) { buf in
+        let b = UnsafeSendable(buf)
+        return Parallel.reduce(0 ..< 64, UInt64(0), grain: 1, { c in
+            let lo = c * b.value.count / 64, hi = (c + 1) * b.value.count / 64
+            var s: UInt64 = 0
+            for i in lo ..< hi { s &+= UInt64(b.value[i]) }
+            return s
+        }, { $0 &+ $1 })
+    }
+}
+println("scan all 1B tokens:     {:>10.3f} s  ({:.2f} GB/s, sum {})", tScan, 2.0 / tScan, sum)
+let (_, tVerify) = try measure { try tokens.verify() }
+println("verify checksums:       {:>10.3f} s  ({:.2f} GB/s)", tVerify, 2.0 / tVerify)
+blackHole(sink)

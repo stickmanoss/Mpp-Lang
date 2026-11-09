@@ -1,0 +1,77 @@
+// MppKit — Benchmark: Google Benchmark-style micro-benchmarks.
+//
+//   benchmark("sum 1M") { blackHole((0..<1_000_000).reduce(0, +)) }
+//   benchmark("sort 10k", bytes: 80_000) { var a = data; a.sort(); blackHole(a) }
+//
+// Runs warm-up, then grows the iteration count until a run lasts long
+// enough to time reliably, and reports time per iteration (and
+// throughput when `bytes` is given). `blackHole` keeps the optimizer
+// from deleting the work being measured.
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+public struct BenchmarkResult: Sendable, CustomStringConvertible {
+    public let name: String
+    public let iterations: Int
+    public let nanosecondsPerIteration: Double
+    public let bytesPerIteration: Int
+
+    public var description: String {
+        var t = nanosecondsPerIteration
+        var unit = "ns"
+        if t >= 1e9 { t /= 1e9; unit = "s" } else if t >= 1e6 { t /= 1e6; unit = "ms" } else if t >= 1e3 { t /= 1e3; unit = "µs" }
+        var line = format("{:<32} {:>10.3f} {:<2} {:>12} iterations", name, t, unit, iterations)
+        if bytesPerIteration > 0 {
+            let gbs = Double(bytesPerIteration) / nanosecondsPerIteration
+            line += format("  {:>8.2f} GB/s", gbs)
+        }
+        return line
+    }
+}
+
+@inlinable
+func _nowNanoseconds() -> UInt64 {
+    var ts = timespec()
+    clock_gettime(CLOCK_MONOTONIC, &ts)
+    return UInt64(ts.tv_sec) &* 1_000_000_000 &+ UInt64(ts.tv_nsec)
+}
+
+/// Prevents the optimizer from treating `value` (and the work producing it) as unused.
+@inline(never) @_optimize(none)
+public func blackHole<T>(_ value: T) {}
+
+/// Times `body` and prints one result line. Returns the result too.
+@discardableResult
+public func benchmark(_ name: String, bytes: Int = 0, minimumTime: Double = 0.25, _ body: () -> Void) -> BenchmarkResult {
+    for _ in 0 ..< 3 { body() }                      // warm-up
+    var iterations = 1
+    var elapsed: UInt64 = 0
+    let target = UInt64(minimumTime * 1e9)
+    while true {
+        let start = _nowNanoseconds()
+        for _ in 0 ..< iterations { body() }
+        elapsed = _nowNanoseconds() &- start
+        if elapsed >= target || iterations >= 1 << 30 { break }
+        // Aim straight for the target, at most 10x per round (like Google Benchmark).
+        let factor = elapsed == 0 ? 10.0 : min(10.0, max(1.5, Double(target) * 1.4 / Double(elapsed)))
+        iterations = Int(Double(iterations) * factor) + 1
+    }
+    let result = BenchmarkResult(name: name, iterations: iterations,
+                                 nanosecondsPerIteration: Double(elapsed) / Double(iterations),
+                                 bytesPerIteration: bytes)
+    print(result)
+    return result
+}
+
+/// Wall-clock time of one call, in seconds.
+public func measure<R>(_ body: () throws -> R) rethrows -> (result: R, seconds: Double) {
+    let start = _nowNanoseconds()
+    let r = try body()
+    return (r, Double(_nowNanoseconds() - start) / 1e9)
+}

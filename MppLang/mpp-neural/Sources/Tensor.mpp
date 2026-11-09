@@ -1,0 +1,736 @@
+// neural — Tensor: n-dimensional Float32 arrays with reverse-mode autodiff.
+//
+//   let x = Tensor([[1, 2], [3, 4]], requiresGrad: true)
+//   let y = (x * x + 1).sum()
+//   y.backward()
+//   x.grad!                      // [[2, 4], [6, 8]]
+//
+// Inspired by MLX (MLXArray, value-and-grad transforms), Swift for
+// TensorFlow / DL4S (define-by-run differentiation) and Surge/Accelerate
+// (vectorized math). Shapes broadcast NumPy-style. Every operation
+// records how to differentiate itself when any input requires gradients.
+
+@_exported import MppKit
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+public final class Tensor: @unchecked Sendable, CustomStringConvertible {
+    public let shape: [Int]
+    /// Row-major values. Optimizers update parameters in place.
+    public var data: [Float]
+    public var requiresGrad: Bool
+    var gradStorage: [Float]?
+    var parents: [Tensor] = []
+    var backwardFn: ((Tensor) -> Void)?
+
+    /// Whether operations record gradients (see `withNoGrad`).
+    nonisolated(unsafe) public static var gradEnabled = true
+
+    // MARK: Construction
+
+    public init(data: [Float], shape: [Int], requiresGrad: Bool = false) {
+        precondition(shape.allSatisfy { $0 >= 0 }, "Tensor: negative dimension in \(shape)")
+        precondition(data.count == shape.reduce(1, *), "Tensor: \(data.count) values for shape \(shape)")
+        self.shape = shape
+        self.data = data
+        self.requiresGrad = requiresGrad
+    }
+
+    public convenience init(_ value: Float, requiresGrad: Bool = false) {
+        self.init(data: [value], shape: [], requiresGrad: requiresGrad)
+    }
+    public convenience init(_ values: [Float], requiresGrad: Bool = false) {
+        self.init(data: values, shape: [values.count], requiresGrad: requiresGrad)
+    }
+    public convenience init(_ rows: [[Float]], requiresGrad: Bool = false) {
+        let c = rows.first?.count ?? 0
+        precondition(rows.allSatisfy { $0.count == c }, "Tensor: ragged rows")
+        self.init(data: rows.flatMap { $0 }, shape: [rows.count, c], requiresGrad: requiresGrad)
+    }
+    public convenience init(_ planes: [[[Float]]], requiresGrad: Bool = false) {
+        let r = planes.first?.count ?? 0, c = planes.first?.first?.count ?? 0
+        self.init(data: planes.flatMap { $0.flatMap { $0 } }, shape: [planes.count, r, c], requiresGrad: requiresGrad)
+    }
+
+    public static func zeros(_ shape: [Int], requiresGrad: Bool = false) -> Tensor {
+        Tensor(data: [Float](repeating: 0, count: shape.reduce(1, *)), shape: shape, requiresGrad: requiresGrad)
+    }
+    public static func ones(_ shape: [Int], requiresGrad: Bool = false) -> Tensor { full(shape, 1, requiresGrad: requiresGrad) }
+    public static func full(_ shape: [Int], _ value: Float, requiresGrad: Bool = false) -> Tensor {
+        Tensor(data: [Float](repeating: value, count: shape.reduce(1, *)), shape: shape, requiresGrad: requiresGrad)
+    }
+    public static func arange(_ n: Int) -> Tensor { Tensor(data: (0 ..< n).map(Float.init), shape: [n]) }
+    public static func eye(_ n: Int) -> Tensor {
+        var d = [Float](repeating: 0, count: n * n)
+        for i in 0 ..< n { d[i * n + i] = 1 }
+        return Tensor(data: d, shape: [n, n])
+    }
+    /// Standard normal samples (MLX: random.normal).
+    public static func randn<G: RandomNumberGenerator>(_ shape: [Int], std: Float = 1, using rng: inout G,
+                                                       requiresGrad: Bool = false) -> Tensor {
+        let n = shape.reduce(1, *)
+        return Tensor(data: (0 ..< n).map { _ in Float(rng.normal()) * std }, shape: shape, requiresGrad: requiresGrad)
+    }
+    /// Uniform samples in [low, high).
+    public static func uniform<G: RandomNumberGenerator>(_ shape: [Int], _ low: Float, _ high: Float, using rng: inout G,
+                                                         requiresGrad: Bool = false) -> Tensor {
+        let n = shape.reduce(1, *)
+        return Tensor(data: (0 ..< n).map { _ in low + (high - low) * Float(rng.unit()) }, shape: shape, requiresGrad: requiresGrad)
+    }
+
+    // MARK: Properties
+
+    public var rank: Int { shape.count }
+    public var count: Int { data.count }
+    /// The single value of a one-element tensor.
+    public var item: Float {
+        precondition(data.count == 1, "Tensor.item needs exactly one element, shape is \(shape)")
+        return data[0]
+    }
+    /// The accumulated gradient after `backward()`.
+    public var grad: Tensor? { gradStorage.map { Tensor(data: $0, shape: shape) } }
+    public func zeroGrad() { gradStorage = nil }
+    /// A copy that is cut off from the gradient graph.
+    public func detached() -> Tensor { Tensor(data: data, shape: shape) }
+
+    /// Value at a full index (no gradient).
+    public subscript(index: Int...) -> Float {
+        precondition(index.count == shape.count, "Tensor: index \(index) for shape \(shape)")
+        var flat = 0
+        for (k, i) in index.enumerated() {
+            precondition(i >= 0 && i < shape[k], "Tensor: index \(index) out of range for \(shape)")
+            flat = flat * shape[k] + i
+        }
+        return data[flat]
+    }
+
+    public var description: String {
+        func render(_ dims: ArraySlice<Int>, _ offset: Int) -> String {
+            guard let d = dims.first else { return format("{:g}", data[offset]) }
+            let stride = dims.dropFirst().reduce(1, *)
+            let items = (0 ..< d).map { render(dims.dropFirst(), offset + $0 * stride) }
+            return "[" + items.joined(separator: dims.count > 1 ? ",\n" : ", ") + "]"
+        }
+        if shape.isEmpty { return format("{:g}", data.first ?? 0) }
+        if data.count > 1000 { return "Tensor(shape: \(shape))" }
+        return render(shape[...], 0)
+    }
+
+    // MARK: Graph plumbing
+
+    /// Builds an op result; records the backward closure when needed.
+    @usableFromInline
+    static func result(_ shape: [Int], _ data: [Float], _ parents: [Tensor],
+                       _ backward: @escaping (Tensor) -> Void) -> Tensor {
+        let t = Tensor(data: data, shape: shape)
+        if gradEnabled && parents.contains(where: { $0.requiresGrad }) {
+            t.requiresGrad = true
+            t.parents = parents
+            t.backwardFn = backward
+        }
+        return t
+    }
+
+    @usableFromInline
+    func accumulate(_ g: [Float]) {
+        guard requiresGrad else { return }
+        if gradStorage == nil { gradStorage = g; return }
+        gradStorage!.withUnsafeMutableBufferPointer { dst in
+            g.withUnsafeBufferPointer { src in for i in 0 ..< src.count { dst[i] += src[i] } }
+        }
+    }
+
+    /// Reverse-mode differentiation from this tensor (seeded with ones, or `seed`).
+    public func backward(_ seed: Tensor? = nil) {
+        var order: [Tensor] = []
+        var visited = Set<ObjectIdentifier>()
+        var stack: [(Tensor, Bool)] = [(self, false)]
+        while let (node, expanded) = stack.popLast() {             // iterative topological sort
+            if expanded { order.append(node); continue }
+            if !visited.insert(ObjectIdentifier(node)).inserted { continue }
+            stack.append((node, true))
+            for p in node.parents where p.requiresGrad && !visited.contains(ObjectIdentifier(p)) { stack.append((p, false)) }
+        }
+        accumulate(seed?.data ?? [Float](repeating: 1, count: count))
+        for node in order.reversed() where node.gradStorage != nil { node.backwardFn?(node) }
+    }
+}
+
+/// Runs `body` without recording gradients (inference, optimizer updates).
+public func withNoGrad<R>(_ body: () throws -> R) rethrows -> R {
+    let old = Tensor.gradEnabled
+    Tensor.gradEnabled = false
+    defer { Tensor.gradEnabled = old }
+    return try body()
+}
+
+// MARK: - Broadcasting
+
+@usableFromInline
+func broadcastShape(_ a: [Int], _ b: [Int]) -> [Int] {
+    let n = max(a.count, b.count)
+    return (0 ..< n).map { k in
+        let x = k < n - a.count ? 1 : a[k - (n - a.count)]
+        let y = k < n - b.count ? 1 : b[k - (n - b.count)]
+        precondition(x == y || x == 1 || y == 1, "Tensor: shapes \(a) and \(b) do not broadcast")
+        return max(x, y)
+    }
+}
+
+/// For each flat index of `out`, the flat index into a tensor of shape `input`
+/// broadcast to `out`. nil when the shapes are identical.
+@usableFromInline
+func broadcastMap(_ out: [Int], _ input: [Int]) -> [Int]? {
+    if out == input { return nil }
+    let n = out.count, total = out.reduce(1, *)
+    var strides = [Int](repeating: 0, count: n)
+    var s = 1
+    for k in stride(from: input.count - 1, through: 0, by: -1) {
+        let dim = n - input.count + k
+        strides[dim] = input[k] == 1 ? 0 : s
+        s *= input[k]
+    }
+    var map = [Int](repeating: 0, count: total)
+    var idx = [Int](repeating: 0, count: n)
+    var flat = 0
+    for i in 0 ..< total {
+        map[i] = flat
+        var k = n - 1
+        while k >= 0 {                     // odometer increment
+            idx[k] += 1
+            flat += strides[k]
+            if idx[k] < out[k] { break }
+            flat -= strides[k] * idx[k]
+            idx[k] = 0
+            k -= 1
+        }
+    }
+    return map
+}
+
+extension Tensor {
+    /// Element-wise binary op with broadcasting. `da`/`db` give the partial
+    /// derivatives from (a, b, out).
+    @usableFromInline
+    static func binary(_ a: Tensor, _ b: Tensor, _ f: (Float, Float) -> Float,
+                       _ da: @escaping (Float, Float, Float) -> Float,
+                       _ db: @escaping (Float, Float, Float) -> Float) -> Tensor {
+        let shape = broadcastShape(a.shape, b.shape)
+        let n = shape.reduce(1, *)
+        let ma = broadcastMap(shape, a.shape), mb = broadcastMap(shape, b.shape)
+        var out = [Float](repeating: 0, count: n)
+        a.data.withUnsafeBufferPointer { ap in
+            b.data.withUnsafeBufferPointer { bp in
+                out.withUnsafeMutableBufferPointer { o in
+                    switch (ma, mb) {
+                    case (nil, nil): for i in 0 ..< n { o[i] = f(ap[i], bp[i]) }
+                    case (nil, let mb?) where b.count == 1: let v = bp[0]; _ = mb; for i in 0 ..< n { o[i] = f(ap[i], v) }
+                    default:
+                        for i in 0 ..< n { o[i] = f(ap[ma?[i] ?? i], bp[mb?[i] ?? i]) }
+                    }
+                }
+            }
+        }
+        return result(shape, out, [a, b]) { t in
+            let g = t.gradStorage!
+            if a.requiresGrad {
+                var ga = [Float](repeating: 0, count: a.count)
+                for i in 0 ..< n { let ia = ma?[i] ?? i; ga[ia] += g[i] * da(a.data[ia], b.data[mb?[i] ?? i], t.data[i]) }
+                a.accumulate(ga)
+            }
+            if b.requiresGrad {
+                var gb = [Float](repeating: 0, count: b.count)
+                for i in 0 ..< n { let ib = mb?[i] ?? i; gb[ib] += g[i] * db(a.data[ma?[i] ?? i], b.data[ib], t.data[i]) }
+                b.accumulate(gb)
+            }
+        }
+    }
+
+    /// Element-wise unary op; `d` gives the derivative from (x, out).
+    @usableFromInline
+    func unary(_ f: (Float) -> Float, _ d: @escaping (Float, Float) -> Float) -> Tensor {
+        let out = data.map(f)
+        return Tensor.result(shape, out, [self]) { t in
+            let g = t.gradStorage!
+            var gx = [Float](repeating: 0, count: g.count)
+            for i in 0 ..< g.count { gx[i] = g[i] * d(self.data[i], t.data[i]) }
+            self.accumulate(gx)
+        }
+    }
+}
+
+// MARK: - Arithmetic
+
+public func + (a: Tensor, b: Tensor) -> Tensor { Tensor.binary(a, b, +, { _, _, _ in 1 }, { _, _, _ in 1 }) }
+public func - (a: Tensor, b: Tensor) -> Tensor { Tensor.binary(a, b, -, { _, _, _ in 1 }, { _, _, _ in -1 }) }
+public func * (a: Tensor, b: Tensor) -> Tensor { Tensor.binary(a, b, *, { _, y, _ in y }, { x, _, _ in x }) }
+public func / (a: Tensor, b: Tensor) -> Tensor { Tensor.binary(a, b, /, { _, y, _ in 1 / y }, { x, y, _ in -x / (y * y) }) }
+public func + (a: Tensor, s: Float) -> Tensor { a + Tensor(s) }
+public func + (s: Float, a: Tensor) -> Tensor { Tensor(s) + a }
+public func - (a: Tensor, s: Float) -> Tensor { a - Tensor(s) }
+public func - (s: Float, a: Tensor) -> Tensor { Tensor(s) - a }
+public func * (a: Tensor, s: Float) -> Tensor { a.unary({ $0 * s }, { _, _ in s }) }
+public func * (s: Float, a: Tensor) -> Tensor { a * s }
+public func / (a: Tensor, s: Float) -> Tensor { a * (1 / s) }
+public prefix func - (a: Tensor) -> Tensor { a * -1 }
+
+public func maximum(_ a: Tensor, _ b: Tensor) -> Tensor {
+    Tensor.binary(a, b, { Swift.max($0, $1) }, { x, y, _ in x >= y ? 1 : 0 }, { x, y, _ in x >= y ? 0 : 1 })
+}
+public func minimum(_ a: Tensor, _ b: Tensor) -> Tensor {
+    Tensor.binary(a, b, { Swift.min($0, $1) }, { x, y, _ in x <= y ? 1 : 0 }, { x, y, _ in x <= y ? 0 : 1 })
+}
+
+// MARK: - Elementary functions (Swift Numerics style)
+
+extension Tensor {
+    public func exp() -> Tensor { unary(Foundation_exp, { _, y in y }) }
+    public func log() -> Tensor { unary(Foundation_log, { x, _ in 1 / x }) }
+    public func sqrt() -> Tensor { unary({ $0.squareRoot() }, { _, y in 0.5 / y }) }
+    public func square() -> Tensor { unary({ $0 * $0 }, { x, _ in 2 * x }) }
+    public func pow(_ p: Float) -> Tensor { unary({ powf($0, p) }, { x, _ in p * powf(x, p - 1) }) }
+    public func abs() -> Tensor { unary({ Swift.abs($0) }, { x, _ in x > 0 ? 1 : (x < 0 ? -1 : 0) }) }
+    public func sin() -> Tensor { unary(sinf, { x, _ in cosf(x) }) }
+    public func cos() -> Tensor { unary(cosf, { x, _ in -sinf(x) }) }
+    public func tanh() -> Tensor { unary(tanhf, { _, y in 1 - y * y }) }
+    public func sigmoid() -> Tensor { unary({ 1 / (1 + expf(-$0)) }, { _, y in y * (1 - y) }) }
+    public func relu() -> Tensor { unary({ Swift.max(0, $0) }, { x, _ in x > 0 ? 1 : 0 }) }
+    public func leakyRelu(_ slope: Float = 0.01) -> Tensor { unary({ $0 > 0 ? $0 : slope * $0 }, { x, _ in x > 0 ? 1 : slope }) }
+    /// GELU (tanh approximation, as in GPT-2 and MLX nn.gelu_approx).
+    public func gelu() -> Tensor {
+        let c: Float = 0.797_884_6   // sqrt(2/pi)
+        return unary({ x in 0.5 * x * (1 + tanhf(c * (x + 0.044715 * x * x * x))) }) { x, _ in
+            let u = c * (x + 0.044715 * x * x * x)
+            let t = tanhf(u)
+            return 0.5 * (1 + t) + 0.5 * x * (1 - t * t) * c * (1 + 3 * 0.044715 * x * x)
+        }
+    }
+    /// SiLU / swish: x * sigmoid(x).
+    public func silu() -> Tensor {
+        unary({ $0 / (1 + expf(-$0)) }) { x, _ in let s = 1 / (1 + expf(-x)); return s * (1 + x * (1 - s)) }
+    }
+    public func clamp(_ lo: Float, _ hi: Float) -> Tensor {
+        unary({ Swift.min(Swift.max($0, lo), hi) }, { x, _ in x >= lo && x <= hi ? 1 : 0 })
+    }
+}
+
+@inline(__always) func Foundation_exp(_ x: Float) -> Float { expf(x) }
+@inline(__always) func Foundation_log(_ x: Float) -> Float { logf(x) }
+
+// MLX-style free functions.
+public func exp(_ x: Tensor) -> Tensor { x.exp() }
+public func log(_ x: Tensor) -> Tensor { x.log() }
+public func sqrt(_ x: Tensor) -> Tensor { x.sqrt() }
+public func tanh(_ x: Tensor) -> Tensor { x.tanh() }
+public func sigmoid(_ x: Tensor) -> Tensor { x.sigmoid() }
+public func relu(_ x: Tensor) -> Tensor { x.relu() }
+public func gelu(_ x: Tensor) -> Tensor { x.gelu() }
+public func silu(_ x: Tensor) -> Tensor { x.silu() }
+
+// MARK: - Shape operations
+
+extension Tensor {
+    @usableFromInline func normalizeAxis(_ axis: Int) -> Int {
+        let a = axis < 0 ? axis + rank : axis
+        precondition(a >= 0 && a < rank, "Tensor: axis \(axis) out of range for rank \(rank)")
+        return a
+    }
+
+    /// Same values, new shape; one dimension may be -1.
+    public func reshaped(_ newShape: [Int]) -> Tensor {
+        var s = newShape
+        if let k = s.firstIndex(of: -1) {
+            let known = s.enumerated().filter { $0.offset != k }.reduce(1) { $0 * $1.element }
+            s[k] = known == 0 ? 0 : count / known
+        }
+        precondition(s.reduce(1, *) == count, "Tensor: cannot reshape \(shape) to \(newShape)")
+        let original = shape
+        return Tensor.result(s, data, [self]) { t in self.accumulate(t.gradStorage!); _ = original }
+    }
+
+    public func flattened(from axis: Int = 1) -> Tensor {
+        let a = normalizeAxis(axis)
+        return reshaped(Array(shape[..<a]) + [shape[a...].reduce(1, *)])
+    }
+
+    /// Permutes axes (default: reverse them).
+    public func transposed(_ perm: [Int]? = nil) -> Tensor {
+        let p = perm ?? Array((0 ..< rank).reversed())
+        precondition(p.sorted() == Array(0 ..< rank), "Tensor: bad permutation \(p) for rank \(rank)")
+        let outShape = p.map { shape[$0] }
+        var inStrides = [Int](repeating: 1, count: rank)
+        for k in stride(from: rank - 2, through: 0, by: -1) { inStrides[k] = inStrides[k + 1] * shape[k + 1] }
+        let n = count
+        var src = [Int](repeating: 0, count: n)        // out flat index -> in flat index
+        var idx = [Int](repeating: 0, count: rank)
+        var flat = 0
+        for i in 0 ..< n {
+            src[i] = flat
+            var k = rank - 1
+            while k >= 0 {
+                idx[k] += 1
+                flat += inStrides[p[k]]
+                if idx[k] < outShape[k] { break }
+                flat -= inStrides[p[k]] * idx[k]
+                idx[k] = 0
+                k -= 1
+            }
+        }
+        let out = src.map { data[$0] }
+        return Tensor.result(outShape, out, [self]) { t in
+            let g = t.gradStorage!
+            var gx = [Float](repeating: 0, count: n)
+            for i in 0 ..< n { gx[src[i]] = g[i] }
+            self.accumulate(gx)
+        }
+    }
+
+    /// Transpose of the last two axes (matrix transpose).
+    public var T: Tensor {
+        var p = Array(0 ..< rank)
+        if rank >= 2 { p.swapAt(rank - 1, rank - 2) }
+        return transposed(p)
+    }
+
+    /// Rows `indices` along axis 0 (gather; gradient scatter-adds).
+    public func rows(_ indices: [Int]) -> Tensor {
+        let inner = shape.dropFirst().reduce(1, *)
+        var out = [Float]()
+        out.reserveCapacity(indices.count * inner)
+        for i in indices {
+            precondition(i >= 0 && i < shape[0], "Tensor.rows: index \(i) out of range 0..<\(shape[0])")
+            out.append(contentsOf: data[i * inner ..< (i + 1) * inner])
+        }
+        return Tensor.result([indices.count] + shape.dropFirst(), out, [self]) { t in
+            let g = t.gradStorage!
+            var gx = [Float](repeating: 0, count: self.count)
+            for (k, i) in indices.enumerated() { for j in 0 ..< inner { gx[i * inner + j] += g[k * inner + j] } }
+            self.accumulate(gx)
+        }
+    }
+
+    /// `length` entries starting at `start` along `axis`.
+    public func narrow(_ axis: Int, _ start: Int, _ length: Int) -> Tensor {
+        let a = normalizeAxis(axis)
+        precondition(start >= 0 && start + length <= shape[a], "Tensor.narrow out of range")
+        let outer = shape[..<a].reduce(1, *), dim = shape[a], inner = shape[(a + 1)...].reduce(1, *)
+        var out = [Float]()
+        out.reserveCapacity(outer * length * inner)
+        for o in 0 ..< outer {
+            let base = (o * dim + start) * inner
+            out.append(contentsOf: data[base ..< base + length * inner])
+        }
+        var s = shape
+        s[a] = length
+        return Tensor.result(s, out, [self]) { t in
+            let g = t.gradStorage!
+            var gx = [Float](repeating: 0, count: self.count)
+            for o in 0 ..< outer {
+                for k in 0 ..< length * inner { gx[(o * dim + start) * inner + k] = g[(o * length) * inner + k] }
+            }
+            self.accumulate(gx)
+        }
+    }
+
+    /// Splits along `axis` into `parts` equal pieces.
+    public func split(_ parts: Int, axis: Int = -1) -> [Tensor] {
+        let a = normalizeAxis(axis)
+        precondition(shape[a] % parts == 0, "Tensor.split: \(shape[a]) not divisible by \(parts)")
+        let w = shape[a] / parts
+        return (0 ..< parts).map { narrow(a, $0 * w, w) }
+    }
+}
+
+/// Joins tensors along an existing axis.
+public func concatenate(_ ts: [Tensor], axis: Int = 0) -> Tensor {
+    precondition(!ts.isEmpty, "concatenate: no tensors")
+    let a = ts[0].normalizeAxis(axis)
+    let outer = ts[0].shape[..<a].reduce(1, *), inner = ts[0].shape[(a + 1)...].reduce(1, *)
+    let dims = ts.map { $0.shape[a] }
+    for t in ts {
+        precondition(t.rank == ts[0].rank && t.shape[..<a] == ts[0].shape[..<a] && t.shape[(a + 1)...] == ts[0].shape[(a + 1)...],
+                     "concatenate: shapes \(ts.map(\.shape)) differ outside axis \(axis)")
+    }
+    let total = dims.reduce(0, +)
+    var out = [Float]()
+    out.reserveCapacity(outer * total * inner)
+    for o in 0 ..< outer {
+        for (k, t) in ts.enumerated() { out.append(contentsOf: t.data[o * dims[k] * inner ..< (o + 1) * dims[k] * inner]) }
+    }
+    var s = ts[0].shape
+    s[a] = total
+    return Tensor.result(s, out, ts) { r in
+        let g = r.gradStorage!
+        var offset = 0
+        for (k, t) in ts.enumerated() {
+            if t.requiresGrad {
+                var gt = [Float](repeating: 0, count: t.count)
+                for o in 0 ..< outer {
+                    for j in 0 ..< dims[k] * inner { gt[o * dims[k] * inner + j] = g[(o * total + offset) * inner + j] }
+                }
+                t.accumulate(gt)
+            }
+            offset += dims[k]
+        }
+    }
+}
+
+/// Stacks equal-shaped tensors along a new leading axis.
+public func stack(_ ts: [Tensor]) -> Tensor {
+    concatenate(ts.map { $0.reshaped([1] + $0.shape) }, axis: 0)
+}
+
+// MARK: - Reductions
+
+extension Tensor {
+    /// (outer, dim, inner) decomposition around `axis`.
+    func around(_ axis: Int) -> (Int, Int, Int) {
+        (shape[..<axis].reduce(1, *), shape[axis], shape[(axis + 1)...].reduce(1, *))
+    }
+
+    /// Sum over all elements, or along `axis`.
+    public func sum(axis: Int? = nil, keepDims: Bool = false) -> Tensor {
+        guard let axis else {
+            let s = data.reduce(0, +)
+            return Tensor.result([], [s], [self]) { t in
+                self.accumulate([Float](repeating: t.gradStorage![0], count: self.count))
+            }
+        }
+        let a = normalizeAxis(axis)
+        let (outer, dim, inner) = around(a)
+        var out = [Float](repeating: 0, count: outer * inner)
+        for o in 0 ..< outer { for d in 0 ..< dim { for i in 0 ..< inner { out[o * inner + i] += data[(o * dim + d) * inner + i] } } }
+        var s = shape
+        if keepDims { s[a] = 1 } else { s.remove(at: a) }
+        return Tensor.result(s, out, [self]) { t in
+            let g = t.gradStorage!
+            var gx = [Float](repeating: 0, count: self.count)
+            for o in 0 ..< outer { for d in 0 ..< dim { for i in 0 ..< inner { gx[(o * dim + d) * inner + i] = g[o * inner + i] } } }
+            self.accumulate(gx)
+        }
+    }
+
+    public func mean(axis: Int? = nil, keepDims: Bool = false) -> Tensor {
+        let n = axis.map { shape[normalizeAxis($0)] } ?? count
+        return sum(axis: axis, keepDims: keepDims) / Float(Swift.max(n, 1))
+    }
+
+    /// Variance (population) over `axis`.
+    public func variance(axis: Int? = nil, keepDims: Bool = false) -> Tensor {
+        let m = mean(axis: axis, keepDims: true)
+        return (self - m).square().mean(axis: axis, keepDims: keepDims)
+    }
+
+    /// Maximum along `axis` (gradient flows to the arg-max).
+    public func max(axis: Int = -1, keepDims: Bool = false) -> Tensor {
+        let a = normalizeAxis(axis)
+        let (outer, dim, inner) = around(a)
+        var out = [Float](repeating: -.infinity, count: outer * inner)
+        var arg = [Int](repeating: 0, count: outer * inner)
+        for o in 0 ..< outer {
+            for d in 0 ..< dim {
+                for i in 0 ..< inner where data[(o * dim + d) * inner + i] > out[o * inner + i] {
+                    out[o * inner + i] = data[(o * dim + d) * inner + i]
+                    arg[o * inner + i] = d
+                }
+            }
+        }
+        var s = shape
+        if keepDims { s[a] = 1 } else { s.remove(at: a) }
+        return Tensor.result(s, out, [self]) { t in
+            let g = t.gradStorage!
+            var gx = [Float](repeating: 0, count: self.count)
+            for o in 0 ..< outer { for i in 0 ..< inner { gx[(o * dim + arg[o * inner + i]) * inner + i] = g[o * inner + i] } }
+            self.accumulate(gx)
+        }
+    }
+
+    /// Index of the maximum along the last axis, for each row.
+    public func argmax() -> [Int] {
+        let dim = shape.last ?? 1
+        return stride(from: 0, to: count, by: Swift.max(dim, 1)).map { base in
+            var best = 0
+            for j in 1 ..< Swift.max(dim, 1) where data[base + j] > data[base + best] { best = j }
+            return best
+        }
+    }
+
+    /// Numerically stable softmax along `axis`.
+    public func softmax(axis: Int = -1) -> Tensor {
+        let a = normalizeAxis(axis)
+        let (outer, dim, inner) = around(a)
+        var out = data
+        for o in 0 ..< outer {
+            for i in 0 ..< inner {
+                var m = -Float.infinity
+                for d in 0 ..< dim { m = Swift.max(m, data[(o * dim + d) * inner + i]) }
+                var s: Float = 0
+                for d in 0 ..< dim { let e = expf(data[(o * dim + d) * inner + i] - m); out[(o * dim + d) * inner + i] = e; s += e }
+                for d in 0 ..< dim { out[(o * dim + d) * inner + i] /= s }
+            }
+        }
+        return Tensor.result(shape, out, [self]) { t in
+            let g = t.gradStorage!, y = t.data
+            var gx = [Float](repeating: 0, count: self.count)
+            for o in 0 ..< outer {
+                for i in 0 ..< inner {
+                    var dot: Float = 0
+                    for d in 0 ..< dim { let k = (o * dim + d) * inner + i; dot += g[k] * y[k] }
+                    for d in 0 ..< dim { let k = (o * dim + d) * inner + i; gx[k] = y[k] * (g[k] - dot) }
+                }
+            }
+            self.accumulate(gx)
+        }
+    }
+
+    /// log(softmax(x)) computed stably.
+    public func logSoftmax(axis: Int = -1) -> Tensor {
+        let a = normalizeAxis(axis)
+        let (outer, dim, inner) = around(a)
+        var out = data
+        for o in 0 ..< outer {
+            for i in 0 ..< inner {
+                var m = -Float.infinity
+                for d in 0 ..< dim { m = Swift.max(m, data[(o * dim + d) * inner + i]) }
+                var s: Float = 0
+                for d in 0 ..< dim { s += expf(data[(o * dim + d) * inner + i] - m) }
+                let lse = m + logf(s)
+                for d in 0 ..< dim { out[(o * dim + d) * inner + i] -= lse }
+            }
+        }
+        return Tensor.result(shape, out, [self]) { t in
+            let g = t.gradStorage!, y = t.data
+            var gx = [Float](repeating: 0, count: self.count)
+            for o in 0 ..< outer {
+                for i in 0 ..< inner {
+                    var gs: Float = 0
+                    for d in 0 ..< dim { gs += g[(o * dim + d) * inner + i] }
+                    for d in 0 ..< dim { let k = (o * dim + d) * inner + i; gx[k] = g[k] - expf(y[k]) * gs }
+                }
+            }
+            self.accumulate(gx)
+        }
+    }
+
+    /// out[n] = self[n, labels[n]] for a 2-D tensor (gradient scatters back).
+    public func pick(_ labels: [Int]) -> Tensor {
+        precondition(rank == 2 && labels.count == shape[0], "Tensor.pick: need [N, C] and N labels")
+        let c = shape[1]
+        let out = labels.enumerated().map { n, l -> Float in
+            precondition(l >= 0 && l < c, "Tensor.pick: label \(l) out of range 0..<\(c)")
+            return data[n * c + l]
+        }
+        return Tensor.result([labels.count], out, [self]) { t in
+            let g = t.gradStorage!
+            var gx = [Float](repeating: 0, count: self.count)
+            for (n, l) in labels.enumerated() { gx[n * c + l] = g[n] }
+            self.accumulate(gx)
+        }
+    }
+}
+
+// MARK: - Matrix multiplication
+
+/// C[M,N] (+)= A[M,K] * B[K,N], row-major, cache-blocked, parallel for big sizes.
+@usableFromInline
+func sgemm(_ m: Int, _ n: Int, _ k: Int, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ c: UnsafeMutablePointer<Float>) {
+    let A = UnsafeSendable(a), B = UnsafeSendable(b), C = UnsafeSendable(c)
+    let kernel: @Sendable (Range<Int>) -> Void = { rows in
+        let a = A.value, b = B.value, c = C.value
+        let kb = 256, nb = 1024
+        var p0 = 0
+        while p0 < k {
+            let p1 = Swift.min(p0 + kb, k)
+            var j0 = 0
+            while j0 < n {
+                let j1 = Swift.min(j0 + nb, n)
+                for i in rows {
+                    let crow = c + i * n
+                    for p in p0 ..< p1 {
+                        let aip = a[i * k + p]
+                        if aip == 0 { continue }
+                        let brow = b + p * n
+                        for j in j0 ..< j1 { crow[j] += aip * brow[j] }
+                    }
+                }
+                j0 = j1
+            }
+            p0 = p1
+        }
+    }
+    if m * n * k >= 1 << 18 && m > 1 {
+        Parallel.forChunks(0 ..< m, grain: Swift.max(1, m / (Parallel.threadCount * 4)), kernel)
+    } else {
+        kernel(0 ..< m)
+    }
+}
+
+@usableFromInline
+func transpose2D(_ x: [Float], _ r: Int, _ c: Int) -> [Float] {
+    var out = [Float](repeating: 0, count: r * c)
+    for i in 0 ..< r { for j in 0 ..< c { out[j * r + i] = x[i * c + j] } }
+    return out
+}
+
+/// Matrix product of the last two axes; leading axes are batch axes. A 2-D
+/// right-hand side is shared across the batch.
+public func matmul(_ a: Tensor, _ b: Tensor) -> Tensor {
+    precondition(a.rank >= 2 && b.rank >= 2, "matmul: needs rank >= 2, got \(a.shape) and \(b.shape)")
+    let m = a.shape[a.rank - 2], k = a.shape[a.rank - 1]
+    let k2 = b.shape[b.rank - 2], n = b.shape[b.rank - 1]
+    precondition(k == k2, "matmul: inner dimensions differ: \(a.shape) x \(b.shape)")
+    let batch = a.shape.dropLast(2).reduce(1, *)
+    let sharedB = b.rank == 2
+    precondition(sharedB || b.shape.dropLast(2) == a.shape.dropLast(2), "matmul: batch shapes differ: \(a.shape) x \(b.shape)")
+    var out = [Float](repeating: 0, count: batch * m * n)
+    a.data.withUnsafeBufferPointer { ap in
+        b.data.withUnsafeBufferPointer { bp in
+            out.withUnsafeMutableBufferPointer { op in
+                for t in 0 ..< batch {
+                    sgemm(m, n, k, ap.baseAddress! + t * m * k, bp.baseAddress! + (sharedB ? 0 : t * k * n), op.baseAddress! + t * m * n)
+                }
+            }
+        }
+    }
+    let shape = Array(a.shape.dropLast(2)) + [m, n]
+    return Tensor.result(shape, out, [a, b]) { r in
+        let g = r.gradStorage!
+        if a.requiresGrad {                       // dA = dC * B^T
+            var ga = [Float](repeating: 0, count: a.count)
+            for t in 0 ..< batch {
+                let bt = transpose2D(Array(b.data[(sharedB ? 0 : t * k * n) ..< (sharedB ? k * n : (t + 1) * k * n)]), k, n)
+                g.withUnsafeBufferPointer { gp in
+                    bt.withUnsafeBufferPointer { btp in
+                        ga.withUnsafeMutableBufferPointer { gap in
+                            sgemm(m, k, n, gp.baseAddress! + t * m * n, btp.baseAddress!, gap.baseAddress! + t * m * k)
+                        }
+                    }
+                }
+            }
+            a.accumulate(ga)
+        }
+        if b.requiresGrad {                       // dB = A^T * dC (summed over a shared batch)
+            var gb = [Float](repeating: 0, count: b.count)
+            for t in 0 ..< batch {
+                let at = transpose2D(Array(a.data[t * m * k ..< (t + 1) * m * k]), m, k)
+                g.withUnsafeBufferPointer { gp in
+                    at.withUnsafeBufferPointer { atp in
+                        gb.withUnsafeMutableBufferPointer { gbp in
+                            sgemm(k, n, m, atp.baseAddress!, gp.baseAddress! + t * m * n, gbp.baseAddress! + (sharedB ? 0 : t * k * n))
+                        }
+                    }
+                }
+            }
+            b.accumulate(gb)
+        }
+    }
+}
+
+infix operator •: MultiplicationPrecedence
+/// Matrix product (same as `matmul`).
+public func • (a: Tensor, b: Tensor) -> Tensor { matmul(a, b) }

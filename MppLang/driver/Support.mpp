@@ -1,0 +1,472 @@
+// mpp driver — support: errors, status lines, processes, files, hashing.
+
+import MppKit
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+#if canImport(Darwin)
+// <crt_externs.h> is not part of Swift's Darwin module.
+@_silgen_name("_NSGetEnviron")
+private func _mppNSGetEnviron() -> UnsafeMutablePointer<UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?>
+#endif
+
+struct DriverError: Error, CustomStringConvertible {
+    let description: String
+    init(_ d: String) { description = d }
+}
+
+// MARK: - Output
+
+enum Env {
+    static func get(_ name: String) -> String? {
+        guard let p = getenv(name) else { return nil }
+        let s = String(cString: p)
+        return s.isEmpty ? nil : s
+    }
+    static let quiet = get("MPP_QUIET") == "1"
+    static let verbose = get("MPP_VERBOSE") == "1"
+    static let stderrIsTTY = isatty(2) != 0
+}
+
+func writeStderr(_ s: String) {
+    var t = s
+    t.withUTF8 { p in
+        var off = 0
+        while off < p.count {
+            let n = write(2, p.baseAddress! + off, p.count - off)
+            if n <= 0 { break }
+            off += n
+        }
+    }
+}
+
+/// Cargo/SwiftPM-style status line: right-aligned green verb, then the message.
+func status(_ verb: String, _ message: String) {
+    if Env.quiet { return }
+    let v = String(repeating: " ", count: max(0, 12 - verb.count)) + verb
+    writeStderr(Env.stderrIsTTY ? "\u{1B}[1;32m\(v)\u{1B}[0m \(message)\n" : "\(v) \(message)\n")
+}
+
+func warn(_ message: String) {
+    writeStderr(Env.stderrIsTTY ? "\u{1B}[1;33mwarning:\u{1B}[0m \(message)\n" : "warning: \(message)\n")
+}
+
+// MARK: - Paths and files
+
+enum Path {
+    static func join(_ parts: String...) -> String { join(parts) }
+    static func join(_ parts: [String]) -> String {
+        var out = ""
+        for p in parts where !p.isEmpty {
+            if p.hasPrefix("/") || out.isEmpty { out = p } else { out += (out.hasSuffix("/") ? "" : "/") + p }
+        }
+        return out
+    }
+    static func dirname(_ p: String) -> String {
+        guard let i = p.lastIndex(of: "/") else { return "." }
+        return i == p.startIndex ? "/" : String(p[..<i])
+    }
+    static func basename(_ p: String) -> String {
+        var s = p
+        while s.count > 1 && s.hasSuffix("/") { s.removeLast() }
+        return s.lastIndex(of: "/").map { String(s[s.index(after: $0)...]) } ?? s
+    }
+    static func stem(_ p: String) -> String {
+        let b = basename(p)
+        guard let dot = b.lastIndex(of: "."), dot != b.startIndex else { return b }
+        return String(b[..<dot])
+    }
+    static func ext(_ p: String) -> String {
+        let b = basename(p)
+        guard let dot = b.lastIndex(of: "."), dot != b.startIndex else { return "" }
+        return String(b[dot...])
+    }
+    static var cwd: String {
+        var buf = [CChar](repeating: 0, count: 4096)
+        guard getcwd(&buf, buf.count) != nil else { return "." }
+        return buf.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+    }
+    /// Absolute, with "." and ".." removed (no symlink resolution).
+    static func absolute(_ p: String, relativeTo base: String = cwd) -> String {
+        normalize(p.hasPrefix("/") ? p : join(base, p))
+    }
+    static func normalize(_ p: String) -> String {
+        var out: [Substring] = []
+        for part in p.split(separator: "/", omittingEmptySubsequences: true) {
+            if part == "." { continue }
+            if part == ".." { if !out.isEmpty { out.removeLast() }; continue }
+            out.append(part)
+        }
+        return "/" + out.joined(separator: "/")
+    }
+    static func realpath(_ p: String) -> String? {
+        guard let r = Glibc_or_Darwin_realpath(p) else { return nil }
+        defer { free(r) }
+        return String(cString: r)
+    }
+    /// `p` relative to `base` when it lies inside it; otherwise `p` unchanged.
+    static func display(_ p: String, from base: String = cwd) -> String {
+        let b = base.hasSuffix("/") ? base : base + "/"
+        return p.hasPrefix(b) ? String(p.dropFirst(b.count)) : p
+    }
+    /// `p` relative to `base`, allowing "../".
+    static func relative(_ p: String, to base: String) -> String {
+        let a = normalize(p).split(separator: "/"), b = normalize(base).split(separator: "/")
+        var k = 0
+        while k < a.count && k < b.count && a[k] == b[k] { k += 1 }
+        let ups = Array(repeating: "..", count: b.count - k)
+        let rest = a[k...].map(String.init)
+        let r = (ups + rest).joined(separator: "/")
+        return r.isEmpty ? "." : r
+    }
+}
+
+func Glibc_or_Darwin_realpath(_ p: String) -> UnsafeMutablePointer<CChar>? { realpath(p, nil) }
+
+struct FileInfo: Equatable {
+    let mtimeNanos: Int64
+    let size: Int64
+    let isDirectory: Bool
+}
+
+enum Files {
+    static func info(_ p: String) -> FileInfo? {
+        var st = stat()
+        guard stat(p, &st) == 0 else { return nil }
+        #if canImport(Darwin)
+        let ns = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
+        #else
+        let ns = Int64(st.st_mtim.tv_sec) * 1_000_000_000 + Int64(st.st_mtim.tv_nsec)
+        #endif
+        return FileInfo(mtimeNanos: ns, size: Int64(st.st_size), isDirectory: (st.st_mode & S_IFMT) == S_IFDIR)
+    }
+    static func exists(_ p: String) -> Bool { access(p, F_OK) == 0 }
+    static func isFile(_ p: String) -> Bool { info(p).map { !$0.isDirectory } ?? false }
+    static func isDirectory(_ p: String) -> Bool { info(p)?.isDirectory ?? false }
+
+    static func read(_ p: String) throws(DriverError) -> String {
+        do { return try FS.read(p) } catch { throw DriverError("cannot read \(p): \(error)") }
+    }
+    static func readIfExists(_ p: String) -> String? { try? FS.read(p) }
+
+    static func write(_ p: String, _ text: String) throws(DriverError) {
+        makeDirectories(Path.dirname(p))
+        do { try FS.write(p, text) } catch { throw DriverError("cannot write \(p): \(error)") }
+    }
+    /// Writes only when the content differs (keeps mtimes stable).
+    @discardableResult
+    static func writeIfChanged(_ p: String, _ text: String) throws(DriverError) -> Bool {
+        if readIfExists(p) == text { return false }
+        try write(p, text)
+        return true
+    }
+
+    static func makeDirectories(_ p: String) {
+        if p.isEmpty || isDirectory(p) { return }
+        makeDirectories(Path.dirname(p))
+        _ = mkdir(p, 0o755)
+    }
+
+    static func list(_ dir: String) -> [String] {
+        guard let d = opendir(dir) else { return [] }
+        defer { closedir(d) }
+        var out: [String] = []
+        while let e = readdir(d) {
+            let name = withUnsafeBytes(of: e.pointee.d_name) { raw in
+                String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+            }
+            if name != "." && name != ".." { out.append(name) }
+        }
+        return out.sorted()
+    }
+
+    /// Files under `dir` (recursively) with one of `extensions`, skipping dot-entries and `excluded` paths.
+    /// Files under `dir` with the given extensions. Hidden entries, `excluded`
+    /// paths and anything a `.mppgnore` file names are skipped.
+    static func walk(_ dir: String, extensions: Set<String>, excluded: Set<String> = [], ignore: MppIgnore = MppIgnore()) -> [String] {
+        var out: [String] = []
+        var rules = ignore
+        rules.load(dir)
+        for name in list(dir) where !name.hasPrefix(".") {
+            let p = Path.join(dir, name)
+            if excluded.contains(p) { continue }
+            let directory = isDirectory(p)
+            if rules.ignores(p, isDirectory: directory) { continue }
+            if directory { out += walk(p, extensions: extensions, excluded: excluded, ignore: rules) }
+            else if extensions.contains(Path.ext(p)) { out.append(p) }
+        }
+        return out.sorted()
+    }
+
+    static func removeTree(_ p: String) {
+        guard let i = info(p) else { return }
+        if i.isDirectory { for n in list(p) { removeTree(Path.join(p, n)) }; rmdir(p) } else { unlink(p) }
+    }
+
+    static func copy(_ from: String, _ to: String) throws(DriverError) {
+        let bytes: [UInt8]
+        do { bytes = try FS.readBytes(from) } catch { throw DriverError("cannot read \(from): \(error)") }
+        do { try FS.write(to, bytes: bytes) } catch { throw DriverError("cannot write \(to): \(error)") }
+        _ = chmod(to, 0o755)
+    }
+}
+
+// MARK: - Processes
+
+struct ProcessResult {
+    let status: Int32      // exit code, or 128 + signal
+    let output: String     // stdout + stderr when captured
+}
+
+enum Process {
+    static func which(_ name: String) -> String? {
+        if name.contains("/") { return access(name, X_OK) == 0 ? name : nil }
+        for dir in (Env.get("PATH") ?? "/usr/bin:/bin").split(separator: ":") {
+            let p = Path.join(String(dir), name)
+            if Files.isFile(p) && access(p, X_OK) == 0 { return p }
+        }
+        return nil
+    }
+
+    static func environment(extra: [String]) -> [UnsafeMutablePointer<CChar>?] {
+        var out: [UnsafeMutablePointer<CChar>?] = []
+        let overridden = Set(extra.map { $0.split(separator: "=", maxSplits: 1)[0] })
+        #if canImport(Darwin)
+        var e = _mppNSGetEnviron().pointee!
+        #else
+        var e = environ
+        #endif
+        while let p = e.pointee {
+            let entry = String(cString: p)
+            if !overridden.contains(entry.split(separator: "=", maxSplits: 1)[0]) { out.append(strdup(p)) }
+            e += 1
+        }
+        for x in extra { out.append(strdup(x)) }
+        return out + [nil]
+    }
+
+    /// Runs a program (found on PATH). With `capture`, stdout and stderr are collected.
+    static func run(_ argv: [String], capture: Bool = true, cwd: String? = nil,
+                    environment extra: [String] = []) throws(DriverError) -> ProcessResult {
+        guard let first = argv.first, let exe = which(first) else {
+            throw DriverError("\(argv.first ?? ""): command not found")
+        }
+        var fds: [Int32] = [-1, -1]
+        if capture && pipe(&fds) != 0 { throw DriverError("pipe failed") }
+        #if canImport(Darwin)
+        var fa: posix_spawn_file_actions_t? = nil
+        #else
+        var fa = posix_spawn_file_actions_t()
+        #endif
+        posix_spawn_file_actions_init(&fa)
+        defer { posix_spawn_file_actions_destroy(&fa) }
+        if capture {
+            posix_spawn_file_actions_adddup2(&fa, fds[1], 1)
+            posix_spawn_file_actions_adddup2(&fa, fds[1], 2)
+            posix_spawn_file_actions_addclose(&fa, fds[0])
+            posix_spawn_file_actions_addclose(&fa, fds[1])
+        }
+        if let cwd { posix_spawn_file_actions_addchdir_np(&fa, cwd) }
+        let args: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
+        let env = environment(extra: extra)
+        defer { for p in args { free(p) }; for p in env { free(p) } }
+        var pid: pid_t = 0
+        let rc = posix_spawn(&pid, exe, &fa, nil, args, env)
+        if capture { close(fds[1]) }
+        guard rc == 0 else {
+            if capture { close(fds[0]) }
+            throw DriverError("cannot run \(exe): \(String(cString: strerror(rc)))")
+        }
+        var output = [UInt8]()
+        if capture {
+            var buf = [UInt8](repeating: 0, count: 65536)
+            while true {
+                let n = buf.withUnsafeMutableBytes { read(fds[0], $0.baseAddress, $0.count) }
+                if n > 0 { output += buf[0 ..< n] } else if n == 0 || errno != EINTR { break }
+            }
+            close(fds[0])
+        }
+        var st: Int32 = 0
+        while waitpid(pid, &st, 0) < 0 && errno == EINTR {}
+        let code: Int32 = (st & 0x7F) == 0 ? (st >> 8) & 0xFF : 128 + (st & 0x7F)
+        return ProcessResult(status: code, output: String(decoding: output, as: UTF8.self))
+    }
+
+    /// Replaces this process with `path` (zero overhead for the launched program).
+    static func exec(_ path: String, _ args: [String]) throws(DriverError) -> Never {
+        let argv: [UnsafeMutablePointer<CChar>?] = ([path] + args).map { strdup($0) } + [nil]
+        execv(path, argv)
+        throw DriverError("cannot run \(path): \(String(cString: strerror(errno)))")
+    }
+}
+
+// MARK: - Hashing (content stamps)
+
+/// 128-bit content stamp from length-delimited fields.
+struct Stamp {
+    var bytes: [UInt8] = []
+    mutating func add(_ s: String) {
+        let n = s.utf8.count
+        for k in 0 ..< 8 { bytes.append(UInt8(truncatingIfNeeded: n >> (8 * k))) }
+        bytes += s.utf8
+    }
+    mutating func add(_ b: [UInt8]) {
+        for k in 0 ..< 8 { bytes.append(UInt8(truncatingIfNeeded: b.count >> (8 * k))) }
+        bytes += b
+    }
+    var hex: String {
+        bytes.withUnsafeBytes { p in
+            let a = hash64(p.baseAddress ?? UnsafeRawPointer(bitPattern: 8)!, p.count, seed: 0x6D70_705F_7374_6D70)
+            let b = hash64(p.baseAddress ?? UnsafeRawPointer(bitPattern: 8)!, p.count, seed: 0x2545_F491_4F6C_DD1D)
+            func h(_ v: UInt64) -> String { let s = String(v, radix: 16); return String(repeating: "0", count: 16 - s.count) + s }
+            return h(a) + h(b)
+        }
+    }
+    static func of(_ s: String) -> String { var st = Stamp(); st.add(s); return st.hex }
+}
+
+// MARK: - Locations
+
+enum Locations {
+    /// The cache root (MPP_CACHE, else $XDG_CACHE_HOME/mpp, else ~/.cache/mpp).
+    static let cache: String = {
+        let base = Env.get("MPP_CACHE")
+            ?? Env.get("XDG_CACHE_HOME").map { $0 + "/mpp" }
+            ?? (Env.get("HOME") ?? "/tmp") + "/.cache/mpp"
+        Files.makeDirectories(base)
+        return base
+    }()
+
+    /// The directory that holds MppLang/ (MPP_HOME, else found from this executable).
+    /// Path, mtime and size of the running `mpp`.
+    static let driverIdentity: String = {
+        let i = Files.info(selfExecutable)
+        return "\(selfExecutable)|\(i?.mtimeNanos ?? 0)|\(i?.size ?? 0)"
+    }()
+
+    static let home: String? = {
+        if let h = Env.get("MPP_HOME") { return h }
+        var exe = CommandLine.arguments[0]
+        #if canImport(Glibc) || canImport(Musl)
+        if let p = Path.realpath("/proc/self/exe") { exe = p }
+        #endif
+        if !exe.contains("/"), let p = Process.which(exe) { exe = p }
+        var dir = Path.dirname(Path.realpath(exe) ?? Path.absolute(exe))
+        for _ in 0 ..< 4 {
+            if Files.isDirectory(Path.join(dir, "MppLang/mpp-core")) { return dir }
+            dir = Path.dirname(dir)
+        }
+        return nil
+    }()
+
+    static func requireHome() throws(DriverError) -> String {
+        guard let h = home else { throw DriverError("cannot find the M++ installation (MppLang/mpp-core); set MPP_HOME") }
+        return h
+    }
+}
+
+
+// MARK: - .mppgnore
+
+/// `.mppgnore`: gitignore-style patterns for files M++ should not treat as
+/// sources (MppPM skips them when it collects a target's files).
+///
+///   # comment
+///   Generated/          a directory, at any depth
+///   /Scratch.mpp        anchored to the folder holding the .mppgnore
+///   *.draft.mpp         a glob (`*`, `?`, `[abc]`; `**` crosses folders)
+///   !keep.draft.mpp     re-include something an earlier line excluded
+///
+/// A `.mppgnore` applies to its folder and everything below it; deeper files
+/// add to the rules above them, and later lines win.
+struct MppIgnore {
+    struct Rule {
+        let base: String
+        let pattern: [UInt8]
+        let negate: Bool
+        let dirOnly: Bool
+        let anchored: Bool        // contains a slash: matched against the path from `base`
+    }
+    var rules: [Rule] = []
+
+    mutating func load(_ dir: String) {
+        guard let text = Files.readIfExists(Path.join(dir, ".mppgnore")) else { return }
+        for raw in text.split(separator: "\n") {
+            var line = raw.hasSuffix("\r") ? raw.dropLast() : raw[...]
+            while line.last == " " { line = line.dropLast() }
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            var negate = false
+            if line.hasPrefix("!") { negate = true; line = line.dropFirst() }
+            if line.hasPrefix("\\") { line = line.dropFirst() }
+            var dirOnly = false
+            if line.hasSuffix("/") { dirOnly = true; line = line.dropLast() }
+            var anchored = line.contains("/")
+            if line.hasPrefix("/") { line = line.dropFirst(); anchored = true }
+            if line.isEmpty { continue }
+            rules.append(Rule(base: dir, pattern: Array(line.utf8), negate: negate, dirOnly: dirOnly, anchored: anchored))
+        }
+    }
+
+    func ignores(_ path: String, isDirectory: Bool) -> Bool {
+        var ignored = false
+        for r in rules {
+            if r.dirOnly && !isDirectory { continue }
+            guard path.hasPrefix(r.base + "/") else { continue }
+            let rel = Array(path.utf8.dropFirst(r.base.utf8.count + 1))
+            let subject: [UInt8]
+            if r.anchored { subject = rel } else {
+                let slash = rel.lastIndex(of: 47).map { $0 + 1 } ?? 0
+                subject = Array(rel[slash...])
+            }
+            if MppIgnore.glob(r.pattern[...], subject[...]) { ignored = !r.negate }
+        }
+        return ignored
+    }
+
+    /// gitignore globbing: `*` and `?` stop at `/`, `**` doesn't.
+    static func glob(_ p: ArraySlice<UInt8>, _ s: ArraySlice<UInt8>) -> Bool {
+        var p = p, s = s
+        while let c = p.first {
+            if c == 42 {                                        // *
+                let double = p.dropFirst().first == 42
+                var rest = p.dropFirst(double ? 2 : 1)
+                if double && rest.first == 47 { rest = rest.dropFirst() }   // "**/" also matches zero folders
+                if rest.isEmpty { return double || !s.contains(47) }
+                var t = s
+                while true {
+                    if glob(rest, t) { return true }
+                    guard let h = t.first, double || h != 47 else { return false }
+                    t = t.dropFirst()
+                }
+            }
+            guard let h = s.first else { return false }
+            if c == 63 {                                        // ?
+                if h == 47 { return false }
+            } else if c == 91, let close = p.firstIndex(of: 93), close > p.startIndex + 1 {   // [set]
+                var set = p[(p.startIndex + 1) ..< close]
+                let invert = set.first == 33 || set.first == 94
+                if invert { set = set.dropFirst() }
+                var hit = false
+                var i = set.startIndex
+                while i < set.endIndex {
+                    if i + 2 < set.endIndex && set[i + 1] == 45 { if h >= set[i] && h <= set[i + 2] { hit = true }; i += 3 }
+                    else { if set[i] == h { hit = true }; i += 1 }
+                }
+                if hit == invert { return false }
+                p = p[(close + 1)...]
+                s = s.dropFirst()
+                continue
+            } else if c != h {
+                return false
+            }
+            p = p.dropFirst()
+            s = s.dropFirst()
+        }
+        return s.isEmpty
+    }
+}

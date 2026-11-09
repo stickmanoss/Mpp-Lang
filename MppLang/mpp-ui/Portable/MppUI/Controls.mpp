@@ -1,0 +1,569 @@
+// MppUI (portable engine) — controls: buttons, toggles, text fields,
+// sliders, steppers and pickers.
+
+import MppUIEngine
+
+// MARK: - Button
+
+public enum ButtonStyleKind: Sendable, Equatable {
+    case automatic, plain, borderless, bordered, borderedProminent, glass, glassProminent
+}
+
+public enum ButtonRole: Sendable { case cancel, destructive }
+
+public struct Button: View, PrimitiveView {
+    public typealias Body = Never
+    let label: ViewList
+    let action: () -> Void
+    let role: ButtonRole?
+
+    public init(_ title: String, role: ButtonRole? = nil, action: @escaping () -> Void) {
+        label = ViewList([Text(title)]); self.action = action; self.role = role
+    }
+    public init(_ title: String, systemImage: String, role: ButtonRole? = nil, action: @escaping () -> Void) {
+        label = ViewList([Label(title, systemImage: systemImage)]); self.action = action; self.role = role
+    }
+    public init(role: ButtonRole? = nil, action: @escaping () -> Void, @ViewBuilder label: () -> ViewList) {
+        self.label = label(); self.action = action; self.role = role
+    }
+
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        var style = Runtime.environment.buttonStyleKind
+        if style == .automatic { style = Runtime.environment.mppStyle == .liquidGlass ? .glass : .bordered }
+        let saved = Runtime.environment
+        let tint = role == .destructive ? Color.red : Runtime.environment.tint
+        switch style {
+        case .borderedProminent, .glassProminent: Runtime.environment.foregroundColor = .white
+        case .borderless: Runtime.environment.foregroundColor = tint
+        case .bordered, .glass: if role == .destructive { Runtime.environment.foregroundColor = .red }
+        default: break
+        }
+        let kids = ctx.children(of: label)
+        Runtime.environment = saved
+        let inner = kids.count == 1 ? kids[0] : StackNode(axis: .horizontal, spacing: 4, alignment: .center, children: kids)
+        let large = Runtime.environment.controlSize == .large || Runtime.environment.controlSize == .extraLarge
+        let padded: Node
+        switch style {
+        case .plain, .borderless: padded = inner
+        case .glass, .glassProminent: padded = PaddingNode(inner, EdgeInsets(top: large ? 9 : 5, leading: 16, bottom: large ? 9 : 5, trailing: 16))
+        default: padded = PaddingNode(inner, EdgeInsets(top: large ? 7 : 4, leading: 12, bottom: large ? 7 : 4, trailing: 12))
+        }
+        let b = ButtonNode(padded, style: style, tint: tint, action: action)
+        b.role = role
+        return b
+    }
+}
+
+final class ButtonNode: WrapperNode {
+    let style: ButtonStyleKind
+    let tint: Color
+    let action: () -> Void
+    init(_ child: Node, style: ButtonStyleKind, tint: Color, action: @escaping () -> Void) {
+        self.style = style; self.tint = tint; self.action = action
+        super.init(child)
+    }
+    override var acceptsClicks: Bool { env.isEnabled }
+    var pressed: Bool { Runtime.pressedPath == path }
+    var role: ButtonRole? = nil
+    var isDefaultCandidate: Bool { role == nil && style == .bordered }
+    func asProminent() -> ButtonNode {
+        let b = ButtonNode(child, style: .borderedProminent, tint: tint, action: action)
+        b.path = path; b.env = env; b.envAssigned = true; b.fillWidth = fillWidth
+        // the label was built for a white button: make it white text
+        func whiten(_ n: Node) { n.env.foregroundColor = .white; n.children().forEach(whiten) }
+        whiten(child)
+        return b
+    }
+    /// Stretch to the offered width (alert buttons).
+    var fillWidth = false
+    override func size(_ p: Proposal) -> Size {
+        let s = child.measure(p)
+        // macOS push buttons are at least 22 points tall.
+        let w = fillWidth ? Swift.max(s.width, Swift.min(p.width ?? s.width, 1e6)) : s.width
+        // Tahoe's regular controls are 26 points tall (glass buttons a little more).
+        let minHeight = style == .glass || style == .glassProminent ? LG.controlHeight + 2 : LG.controlHeight
+        return style == .plain || style == .borderless ? Size(width: w, height: s.height) : Size(width: w, height: Swift.max(s.height, minHeight))
+    }
+    override func place(_ r: Rect) {
+        frame = r
+        let s = child.measure(Proposal(width: r.width, height: nil))
+        child.place(aligned(s, in: r, .center))
+    }
+    override func draw() {
+        let (x, y, w, h) = (Float(frame.x), Float(frame.y), Float(frame.width), Float(frame.height))
+        let press = Springs.value(path + "#press", pressed ? 1 : 0, response: 0.22, bounce: 0.25)
+        let capsule = env.controlSize == .large || env.controlSize == .extraLarge
+        switch style {
+        case .bordered:
+            lgBezel(x, y, w, h, radius: capsule ? h / 2 : nil, press: press, glassBackdrop: env.mppStyle == .liquidGlass)
+        case .borderedProminent:
+            lgProminentBezel(x, y, w, h, tint: tint, radius: capsule ? h / 2 : nil, press: press)
+        case .glass: lgGlass(x, y, w, h, radius: h / 2, press: press)
+        case .glassProminent: lgGlass(x, y, w, h, radius: h / 2, tint: tint.opacity(0.78 + 0.12 * press), press: press)
+        default: break
+        }
+        if !env.isEnabled { mppui_push_opacity(0.35) }
+        if pressed && (style == .plain || style == .borderless) { mppui_push_opacity(0.5) }
+        child.draw()
+        if pressed && (style == .plain || style == .borderless) { mppui_pop_opacity() }
+        if !env.isEnabled { mppui_pop_opacity() }
+    }
+    override func stack(at x: Double, _ y: Double, into out: inout [Node]) {
+        guard frame.contains(x, y) else { return }
+        out.append(self)              // the button takes the click, not its label
+    }
+    override func mouseUp(_ x: Double, _ y: Double, inside: Bool) {
+        if inside { action(); env.menuDismiss?() }
+        Runtime.invalidate()
+    }
+}
+
+// MARK: - Toggle
+
+public enum ToggleStyleKind: Sendable { case automatic, checkbox, `switch`, button }
+
+public struct Toggle: View, PrimitiveView {
+    public typealias Body = Never
+    let label: ViewList
+    let isOn: Binding<Bool>
+    public init(_ title: String, isOn: Binding<Bool>) { label = ViewList([Text(title)]); self.isOn = isOn }
+    public init(isOn: Binding<Bool>, @ViewBuilder label: () -> ViewList) { self.label = label(); self.isOn = isOn }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let style = Runtime.environment.toggleStyleKind
+        let control: Node = style == .switch ? SwitchNode(isOn) : CheckboxNode(isOn)
+        control.path = ctx.path + "/control"
+        control.env = Runtime.environment; control.envAssigned = true
+        if Runtime.environment.labelsHidden { return control }
+        let kids = ctx.children(of: label)
+        let isOn = self.isOn
+        if style == .switch {
+            // macOS: the label on the left, the switch at the trailing edge.
+            return StackNode(axis: .horizontal, spacing: 8, alignment: .center, children: kids + [SpacerNode(8), control])
+        }
+        // macOS checkbox: box first; clicking the label toggles too.
+        let row = StackNode(axis: .horizontal, spacing: 6, alignment: .center, children: [control] + kids)
+        return TapNode(row) { isOn.wrappedValue.toggle() }
+    }
+}
+
+final class CheckboxNode: Node {
+    let isOn: Binding<Bool>
+    init(_ b: Binding<Bool>) { isOn = b }
+    override var acceptsClicks: Bool { env.isEnabled }
+    override func size(_ p: Proposal) -> Size { Size(width: 16, height: 16) }
+    override func draw() {
+        let (x, y) = (Float(frame.x), Float(frame.y + (frame.height - 16) / 2))
+        let on = Springs.value(path + "#on", isOn.wrappedValue ? 1 : 0, response: 0.18)
+        let press = Springs.value(path + "#press", Runtime.pressedPath == path ? 1 : 0, response: 0.15)
+        // A rounded square: a white glass bezel when off, the accent as glass when on.
+        mppui_shadow(x, y + 0.5, 16, 16, 4.5, 1.5, 0x26_00_00_00)
+        mppui_fill_rounded_rect(x, y, 16, 16, 4.5, lgMix(Color.white, Color(argb: 0xFF_EC_EC_EE), press).argb)
+        mppui_stroke_rounded_rect(x, y, 16, 16, 4.5, 0.5, 0x33_00_00_00)
+        if on > 0.01 {
+            mppui_push_opacity(Float(on))
+            lgProminentBezel(x, y, 16, 16, tint: env.tint, radius: 4.5, press: 0)
+            mppui_icon("checkmark", x + 2, y + 2, 12, 0xFF_FF_FF_FF)
+            mppui_pop_opacity()
+        }
+    }
+    override func mouseUp(_ x: Double, _ y: Double, inside: Bool) {
+        if inside { isOn.wrappedValue.toggle() }
+        Runtime.invalidate()
+    }
+}
+
+/// The Liquid Glass switch: a wide track and a capsule knob. The knob slides
+/// on a spring, the track fades to the accent, and while the switch is held
+/// the knob swells into a clear glass lens over the track.
+final class SwitchNode: Node {
+    let isOn: Binding<Bool>
+    var dragged = false
+    init(_ b: Binding<Bool>) { isOn = b }
+    override var acceptsClicks: Bool { env.isEnabled }
+    override func size(_ p: Proposal) -> Size { LG.switchSize }
+    override func draw() {
+        let (tw, th) = (Float(LG.switchSize.width), Float(LG.switchSize.height))
+        let (x, y) = (Float(frame.x), Float(frame.y + (frame.height - Double(th)) / 2))
+        let held = Runtime.pressedPath == path
+        let t = Springs.value(path + "#on", isOn.wrappedValue ? 1 : 0, response: 0.32, bounce: 0.18)
+        let lens = Springs.value(path + "#lens", held ? 1 : 0, response: 0.25, bounce: 0.2)
+        let track = lgMix(LG.track, env.tint, t)
+        mppui_fill_rounded_rect(x, y, tw, th, th / 2, track.argb)
+        // Inner shading at the top of the track, as on Apple's switch.
+        mppui_stroke_rounded_rect(x + 0.5, y + 0.5, tw - 1, th - 1, th / 2 - 0.5, 1, 0x0D_00_00_00)
+        let kw: Float = 26, kh: Float = th - 4
+        let cx = x + 2 + kw / 2 + (tw - 4 - kw) * Float(Swift.max(-0.1, Swift.min(1.1, t)))
+        lgKnob(cx: cx, cy: y + th / 2, w: kw, h: kh, lens: lens)
+    }
+    override func mouseDragged(_ x: Double, _ y: Double) {
+        // Dragging across the middle flips it, like on iOS.
+        let want = x > frame.x + frame.width / 2
+        if want != isOn.wrappedValue { isOn.wrappedValue = want; dragged = true }
+        Runtime.invalidate()
+    }
+    override func mouseUp(_ x: Double, _ y: Double, inside: Bool) {
+        if inside && !dragged { isOn.wrappedValue.toggle() }
+        dragged = false
+        Runtime.invalidate()
+    }
+}
+
+// MARK: - Text fields
+
+public struct TextField: View, PrimitiveView {
+    public typealias Body = Never
+    let title: String
+    let text: Binding<String>
+    let secure: Bool
+    public init(_ title: String, text: Binding<String>) { self.title = title; self.text = text; secure = false }
+    public init(_ title: String, text: Binding<String>, prompt: Text?) { self.title = title; self.text = text; secure = false }
+    init(secure title: String, text: Binding<String>) { self.title = title; self.text = text; secure = true }
+    func makeNode(_ ctx: inout BuildContext) -> Node { TextFieldNode(title, text, secure: secure) }
+}
+
+public struct SecureField: View, PrimitiveView {
+    public typealias Body = Never
+    let field: TextField
+    public init(_ title: String, text: Binding<String>) { field = TextField(secure: title, text: text) }
+    func makeNode(_ ctx: inout BuildContext) -> Node { field.makeNode(&ctx) }
+}
+
+public enum TextFieldStyleKind: Sendable { case automatic, roundedBorder, plain }
+
+final class TextFieldNode: Node {
+    let placeholder: String
+    let text: Binding<String>
+    let secure: Bool
+    init(_ placeholder: String, _ text: Binding<String>, secure: Bool) { self.placeholder = placeholder; self.text = text; self.secure = secure }
+    override var acceptsClicks: Bool { env.isEnabled }
+    override var flexibility: Double { 1e7 }
+    var focused: Bool { Runtime.focusPath == path }
+    var font: Font { env.font }
+    var shown: String { secure ? String(repeating: "•", count: text.wrappedValue.count) : text.wrappedValue }
+    override func size(_ p: Proposal) -> Size {
+        let h = Double(mppui_line_height(Float(font.size), font.engineFont)) + (env.textFieldBordered ? 8 : 2)
+        return Size(width: Swift.min(p.width ?? 180, 1e6), height: Swift.max(h, env.textFieldBordered ? LG.controlHeight : 0))
+    }
+    override func draw() {
+        let (x, y, w, h) = (Float(frame.x), Float(frame.y), Float(frame.width), Float(frame.height))
+        if env.textFieldBordered {
+            let ring = Springs.value(path + "#focus", focused ? 1 : 0, response: 0.2)
+            if env.mppStyle == .liquidGlass {
+                lgGlass(x, y, w, h, radius: h / 2)
+                if ring > 0.01 { mppui_stroke_rounded_rect(x - 2, y - 2, w + 4, h + 4, h / 2 + 2, 3.5, env.tint.opacity(0.5 * ring).argb) }
+            } else {
+                // A Tahoe field: rounder corners, a faint inset shade, the accent focus ring outside it.
+                let r: Float = 8
+                if ring > 0.01 { mppui_stroke_rounded_rect(x - 2, y - 2, w + 4, h + 4, r + 2, 3.5, env.tint.opacity(0.5 * ring).argb) }
+                mppui_fill_rounded_rect(x, y, w, h, r, 0xFF_FF_FF_FF)
+                mppui_stroke_rounded_rect(x, y, w, h, r, 0.5, 0x2E_00_00_00)
+            }
+        }
+        let pad: Float = env.textFieldBordered ? (env.mppStyle == .liquidGlass ? 14 : 8) : 0
+        let base = y + (h - mppui_line_height(Float(font.size), font.engineFont)) / 2 + mppui_ascent(Float(font.size), font.engineFont)
+        mppui_push_clip(x + pad, y, w - 2 * pad, h)
+        let value = shown
+        let tw = mppui_text_width(value, Float(font.size), font.engineFont)
+        let scroll = Swift.max(0, tw - (w - 2 * pad - 4))
+        if value.isEmpty {
+            mppui_text(placeholder, x + pad, base, Float(font.size), font.engineFont, Color.tertiary.argb)
+        } else {
+            mppui_text(value, x + pad - scroll, base, Float(font.size), font.engineFont, env.foregroundColor.argb)
+        }
+        if focused {
+            let cx = x + pad - scroll + tw + 1
+            mppui_fill_rounded_rect(cx, base - mppui_ascent(Float(font.size), font.engineFont), 1.5, mppui_line_height(Float(font.size), font.engineFont), 0, env.tint.argb)
+        }
+        mppui_pop_clip()
+    }
+    override func text(_ s: String) {
+        text.wrappedValue += s
+        Runtime.invalidate()
+    }
+    override func key(_ key: Int32, modifiers: Int32) {
+        switch key {
+        case Int32(MPPUI_KEY_BACKSPACE.rawValue):
+            if !text.wrappedValue.isEmpty { text.wrappedValue.removeLast() }
+        case Int32(MPPUI_KEY_RETURN.rawValue):
+            env.onSubmit?()
+            Runtime.focusPath = nil
+        case Int32(MPPUI_KEY_ESCAPE.rawValue):
+            Runtime.focusPath = nil
+        default: break
+        }
+        Runtime.invalidate()
+    }
+}
+
+// MARK: - Slider
+
+public struct Slider: View, PrimitiveView {
+    public typealias Body = Never
+    let value: Binding<Double>
+    let range: ClosedRange<Double>
+    let step: Double?
+    public init(value: Binding<Double>, in range: ClosedRange<Double> = 0 ... 1, step: Double? = nil) {
+        self.value = value; self.range = range; self.step = step
+    }
+    public init(value: Binding<Float>, in range: ClosedRange<Float> = 0 ... 1) {
+        self.value = Binding(get: { Double(value.wrappedValue) }, set: { value.wrappedValue = Float($0) })
+        self.range = Double(range.lowerBound) ... Double(range.upperBound); step = nil
+    }
+    func makeNode(_ ctx: inout BuildContext) -> Node { SliderNode(value, range, step) }
+}
+
+final class SliderNode: Node {
+    let value: Binding<Double>, range: ClosedRange<Double>, step: Double?
+    init(_ v: Binding<Double>, _ r: ClosedRange<Double>, _ s: Double?) { value = v; range = r; step = s }
+    override var acceptsClicks: Bool { env.isEnabled }
+    override var flexibility: Double { 1e7 }
+    override func size(_ p: Proposal) -> Size { Size(width: Swift.min(p.width ?? 160, 1e6), height: LG.controlHeight) }
+    var fraction: Double { (value.wrappedValue - range.lowerBound) / Swift.max(1e-12, range.upperBound - range.lowerBound) }
+    /// Knob: a white capsule (Tahoe), a glass lens while dragged.
+    static let knob = (w: Float(24), h: Float(16))
+    override func draw() {
+        let (x, w) = (Float(frame.x), Float(frame.width))
+        let cy = Float(frame.y + frame.height / 2)
+        let f = Float(Springs.value(path + "#v", Swift.max(0, Swift.min(1, fraction)), response: 0.12))
+        let lens = Springs.value(path + "#lens", Runtime.pressedPath == path ? 1 : 0, response: 0.25, bounce: 0.2)
+        let k = SliderNode.knob
+        mppui_fill_rounded_rect(x, cy - 3, w, 6, 3, LG.track.argb)
+        let kx = x + k.w / 2 + (w - k.w) * f
+        mppui_fill_rounded_rect(x, cy - 3, kx - x, 6, 3, env.tint.argb)
+        if let step, step > 0, (range.upperBound - range.lowerBound) / step <= 12 {
+            // Tick marks under the track for stepped sliders.
+            let n = Int(((range.upperBound - range.lowerBound) / step).rounded())
+            for i in 0 ... n {
+                let tx = x + k.w / 2 + (w - k.w) * Float(i) / Float(Swift.max(1, n))
+                mppui_fill_rounded_rect(tx - 0.75, cy + 6, 1.5, 4, 0.75, 0x40_00_00_00)
+            }
+        }
+        lgKnob(cx: kx, cy: cy, w: k.w, h: k.h, lens: lens, grow: 0.6)
+    }
+    func set(_ x: Double) {
+        let kw = Double(SliderNode.knob.w)
+        var f = (x - frame.x - kw / 2) / Swift.max(1, frame.width - kw)
+        f = Swift.max(0, Swift.min(1, f))
+        var v = range.lowerBound + f * (range.upperBound - range.lowerBound)
+        if let step, step > 0 { v = (v / step).rounded() * step }
+        value.wrappedValue = Swift.min(range.upperBound, Swift.max(range.lowerBound, v))
+        Runtime.invalidate()
+    }
+    override func mouseDown(_ x: Double, _ y: Double) { set(x) }
+    override func mouseDragged(_ x: Double, _ y: Double) { set(x) }
+}
+
+// MARK: - Stepper
+
+public struct Stepper: View, PrimitiveView {
+    public typealias Body = Never
+    let label: ViewList
+    let increment: () -> Void
+    let decrement: () -> Void
+    public init(_ title: String, value: Binding<Int>, in range: ClosedRange<Int> = Int.min ... Int.max, step: Int = 1) {
+        label = ViewList([Text(title)])
+        increment = { value.wrappedValue = Swift.min(range.upperBound, value.wrappedValue + step) }
+        decrement = { value.wrappedValue = Swift.max(range.lowerBound, value.wrappedValue - step) }
+    }
+    public init(_ title: String, value: Binding<Double>, in range: ClosedRange<Double> = -Double.infinity ... Double.infinity, step: Double = 1) {
+        label = ViewList([Text(title)])
+        increment = { value.wrappedValue = Swift.min(range.upperBound, value.wrappedValue + step) }
+        decrement = { value.wrappedValue = Swift.max(range.lowerBound, value.wrappedValue - step) }
+    }
+    public init(_ title: String, onIncrement: (() -> Void)?, onDecrement: (() -> Void)?) {
+        label = ViewList([Text(title)]); increment = onIncrement ?? {}; decrement = onDecrement ?? {}
+    }
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let arrows = StepperArrowsNode(up: increment, down: decrement)
+        arrows.path = ctx.path + "/arrows"
+        arrows.env = Runtime.environment; arrows.envAssigned = true
+        return StackNode(axis: .horizontal, spacing: 6, alignment: .center, children: ctx.children(of: label) + [arrows])
+    }
+}
+
+/// The stepper: a narrow glass bezel with an up and a down half; the pressed
+/// half lights up.
+final class StepperArrowsNode: Node {
+    let up: () -> Void, down: () -> Void
+    var pressedHalf = 0
+    init(up: @escaping () -> Void, down: @escaping () -> Void) { self.up = up; self.down = down }
+    override var acceptsClicks: Bool { env.isEnabled }
+    override func size(_ p: Proposal) -> Size { Size(width: 17, height: LG.controlHeight) }
+    override func draw() {
+        let (x, y, w, h) = (Float(frame.x), Float(frame.y), Float(17), Float(LG.controlHeight))
+        lgBezel(x, y, w, h, radius: w / 2, glassBackdrop: env.mppStyle == .liquidGlass)
+        let held = Springs.value(path + "#press", Runtime.pressedPath == path ? 1 : 0, response: 0.15)
+        if held > 0.01 {
+            mppui_fill_rounded_rect(x + 2, pressedHalf > 0 ? y + 2 : y + h / 2, w - 4, h / 2 - 2, 5, Color(white: 0, opacity: 0.08 * held).argb)
+        }
+        mppui_icon("chevron.up", x + 3.5, y + 2.5, 10, Color.secondary.argb)
+        mppui_icon("chevron.down", x + 3.5, y + h - 12.5, 10, Color.secondary.argb)
+    }
+    override func mouseDown(_ x: Double, _ y: Double) { pressedHalf = y < frame.y + frame.height / 2 ? 1 : -1; Runtime.invalidate() }
+    override func mouseUp(_ x: Double, _ y: Double, inside: Bool) {
+        if inside { if y < frame.y + frame.height / 2 { up() } else { down() } }
+        Runtime.invalidate()
+    }
+}
+
+// MARK: - Picker
+
+struct _Tagged: View, PrimitiveView {
+    typealias Body = Never
+    let content: any View
+    let tag: AnyHashable
+    func makeNode(_ ctx: inout BuildContext) -> Node { ctx.build(content, index: 0) }
+}
+
+extension View {
+    /// Identifies this view as a Picker option.
+    public func tag<T: Hashable>(_ t: T) -> some View { _Tagged(content: self, tag: AnyHashable(t)) }
+}
+
+public struct Picker<Selection: Hashable>: View, PrimitiveView {
+    public typealias Body = Never
+    let title: String
+    let selection: Binding<Selection>
+    let content: ViewList
+    public init(_ title: String, selection: Binding<Selection>, @ViewBuilder content: () -> ViewList) {
+        self.title = title; self.selection = selection; self.content = content()
+    }
+
+    /// Options in order (tagged views; ForEach rows are expanded).
+    func options() -> [(view: any View, tag: AnyHashable)] {
+        var out: [(any View, AnyHashable)] = []
+        func visit(_ v: any View) {
+            if let t = v as? _Tagged { out.append((t.content, t.tag)) }
+            else if let l = v as? _FlatList { l.items.forEach(visit) }
+            else if let e = v as? _ForEachExpandable { e.expandedViews().forEach(visit) }
+        }
+        content.items.forEach(visit)
+        return out
+    }
+
+    func makeNode(_ ctx: inout BuildContext) -> Node {
+        let opts = options()
+        let selected = AnyHashable(selection.wrappedValue)
+        let sel = selection
+        let tags = opts.map(\.tag)
+        func choose(_ i: Int) { if let v = tags[i].base as? Selection { sel.wrappedValue = v } }
+        let control: Node
+        switch Runtime.environment.pickerStyleKind {
+        case .segmented:
+            var segments: [Node] = []
+            for (i, o) in opts.enumerated() {
+                segments.append(PaddingNode(ctx.build(o.view, index: i), EdgeInsets(top: 2, leading: 10, bottom: 2, trailing: 10)))
+            }
+            control = SegmentedNode(segments, selected: tags.firstIndex(of: selected), choose: choose)
+        case .inline, .radioGroup:
+            var rows: [Node] = []
+            for (i, o) in opts.enumerated() {
+                let radio = RadioNode(on: o.tag == selected)
+                rows.append(TapNode(StackNode(axis: .horizontal, spacing: 6, alignment: .center, children: [radio, ctx.build(o.view, index: i)])) { choose(i) })
+            }
+            control = StackNode(axis: .vertical, spacing: 6, alignment: .leading, children: rows)
+        default:
+            // macOS pop-up button; the menu opens as an overlay.
+            let key = ctx.path + "#open"
+            let open = Runtime.memory[key] as? Bool ?? false
+            let current = tags.firstIndex(of: selected).map { ctx.build(opts[$0].view, index: 1000 + $0) } ?? TextNode(" ")
+            let button = PopUpButtonNode(current) { Runtime.memory[key] = !open }
+            button.path = ctx.path + "/popup"
+            let anchor = button.path
+            if open {
+                Runtime.overlayRequests.append(OverlayRequest(kind: .menu, anchor: anchor, build: { c in
+                    var rows: [Node] = []
+                    for (i, o) in opts.enumerated() {
+                        rows.append(MenuItemNode(c.build(o.view, index: i), checked: o.tag == selected) { choose(i) })
+                    }
+                    return StackNode(axis: .vertical, spacing: 0, alignment: .leading, children: rows)
+                }, dismiss: { Runtime.memory[key] = false }))
+            }
+            control = button
+        }
+        if Runtime.environment.labelsHidden || title.isEmpty { return control }
+        return StackNode(axis: .horizontal, spacing: 8, alignment: .center, children: [TextNode(title), control])
+    }
+}
+
+final class RadioNode: Node {
+    let on: Bool
+    init(on: Bool) { self.on = on }
+    override func size(_ p: Proposal) -> Size { Size(width: 16, height: 16) }
+    override func draw() {
+        let (x, y) = (Float(frame.x), Float(frame.y + (frame.height - 16) / 2))
+        let t = Float(Springs.value(path + "#on", on ? 1 : 0, response: 0.2, bounce: 0.2))
+        mppui_shadow(x, y + 0.5, 16, 16, 8, 1.5, 0x26_00_00_00)
+        mppui_fill_ellipse(x, y, 16, 16, 0xFF_FF_FF_FF)
+        mppui_stroke_rounded_rect(x, y, 16, 16, 8, 0.5, 0x33_00_00_00)
+        if t > 0.01 {
+            mppui_push_opacity(Swift.min(1, t))
+            lgProminentBezel(x, y, 16, 16, tint: env.tint, radius: 8)
+            mppui_pop_opacity()
+            let d = 6 * t
+            mppui_fill_ellipse(x + 8 - d / 2, y + 8 - d / 2, d, d, 0xFF_FF_FF_FF)
+        }
+    }
+}
+
+protocol _ForEachExpandable { func expandedViews() -> [any View] }
+extension ForEach: _ForEachExpandable {
+    func expandedViews() -> [any View] { data.map { content($0) } }
+}
+
+public enum PickerStyleKind: Sendable { case automatic, segmented, menu, inline, wheel, radioGroup }
+
+final class SegmentedNode: Node {
+    let segments: [Node]
+    let selected: Int?
+    let choose: (Int) -> Void
+    init(_ segments: [Node], selected: Int?, choose: @escaping (Int) -> Void) {
+        self.segments = segments; self.selected = selected; self.choose = choose
+    }
+    override func children() -> [Node] { segments }
+    override var acceptsClicks: Bool { env.isEnabled }
+    override func size(_ p: Proposal) -> Size {
+        let s = segments.map { $0.measure(Proposal(width: nil, height: nil)) }
+        let w = ((s.map(\.width).max() ?? 0) + 8) * Double(segments.count)
+        return Size(width: Swift.min(w, p.width ?? w), height: Swift.max(LG.controlHeight, (s.map(\.height).max() ?? 20) + 6))
+    }
+    override func place(_ r: Rect) {
+        frame = r
+        let w = r.width / Double(Swift.max(1, segments.count))
+        for (i, s) in segments.enumerated() {
+            s.place(aligned(s.measure(Proposal(width: w, height: r.height)), in: Rect(x: r.x + Double(i) * w, y: r.y, width: w, height: r.height), .center))
+        }
+    }
+    /// The Liquid Glass segmented control: a capsule track; the selection is a
+    /// white capsule that glides to the chosen segment and turns to glass while held.
+    override func draw() {
+        let (x, y, w, h) = (Float(frame.x), Float(frame.y), Float(frame.width), Float(frame.height))
+        let glass = env.mppStyle == .liquidGlass
+        if glass { lgGlass(x, y, w, h, radius: h / 2) } else { mppui_fill_rounded_rect(x, y, w, h, h / 2, LG.track.argb) }
+        if let sel = selected {
+            let sw = w / Float(segments.count)
+            let pos = Float(Springs.value(path + "#sel", Double(sel), response: 0.3, bounce: 0.15))
+            let lens = Springs.value(path + "#lens", Runtime.pressedPath == path ? 1 : 0, response: 0.25, bounce: 0.2)
+            let (px, py, pw, ph) = (x + sw * pos + 2, y + 2, sw - 4, h - 4)
+            if lens < 0.999 {
+                mppui_push_opacity(Float(1 - lens))
+                mppui_shadow(px, py + 1, pw, ph, ph / 2, 3, 0x26_00_00_00)
+                mppui_fill_rounded_rect(px, py, pw, ph, ph / 2, glass ? 0xD9_FF_FF_FF : 0xFF_FF_FF_FF)
+                mppui_stroke_rounded_rect(px, py, pw, ph, ph / 2, 0.5, 0x14_00_00_00)
+                mppui_pop_opacity()
+            }
+            let grow = Float(lens) * 3
+            lgLens(px - grow, py - grow, pw + 2 * grow, ph + 2 * grow, strength: Float(lens))
+        }
+        for s in segments { s.draw() }
+    }
+    override func stack(at x: Double, _ y: Double, into out: inout [Node]) {
+        if frame.contains(x, y) { out.append(self) }
+    }
+    override func mouseUp(_ x: Double, _ y: Double, inside: Bool) {
+        guard inside, !segments.isEmpty else { return }
+        let i = Swift.min(segments.count - 1, Swift.max(0, Int((x - frame.x) / (frame.width / Double(segments.count)))))
+        choose(i)
+        Runtime.invalidate()
+    }
+}

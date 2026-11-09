@@ -1,0 +1,5 @@
+// Sums whitespace-separated integers from stdin (compare: io_read.cpp).
+var input = TokenReader.standardInput()
+var s = 0
+while let x = try input.next(Int.self) { s += x }
+print(s)

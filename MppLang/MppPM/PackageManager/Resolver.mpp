@@ -1,0 +1,275 @@
+// MppPM (mpp pm) — dependency resolution.
+//
+// Remote packages are git repositories; versions are their semver tags.
+//   * each dependency's requirement (from:, exact:, branch:, revision:,
+//     ranges) constrains the package;
+//   * the newest version that satisfies every constraint wins, unless
+//     Package.resolved pins a version that still satisfies them;
+//   * the chosen versions' own manifests add constraints, repeated until
+//     the choice settles;
+//   * an unsatisfiable set is reported with who required what.
+// Clones live in .build/checkouts/<identity>. Manifests of candidate
+// versions are read with `git show`, so resolving never churns worktrees.
+
+import MppKit
+
+struct ResolvedPackage {
+    var identity: String
+    var remote: Bool
+    var url = ""
+    var revision = ""
+    var version: Version?
+    var branch = ""
+    var root: String
+    var manifest: Manifest
+}
+
+struct Graph {
+    var root: Manifest
+    var packages: [String: ResolvedPackage]
+}
+
+struct ResolveOptions {
+    var updateAll = false
+    var update: Set<String> = []
+    var onlyResolved = false
+}
+
+func git(_ args: [String], in dir: String) throws(DriverError) -> String {
+    let r: ProcessResult
+    do { r = try Process.run(["git"] + args, cwd: dir) }
+    catch { throw DriverError("git is required for remote dependencies but was not found on PATH") }
+    guard r.status == 0 else { throw DriverError("git \(args.joined(separator: " ")) failed:\n\(r.output.trimmingNewlines)") }
+    return r.output.trimmingNewlines
+}
+
+func normalizeURL(_ u: String) -> String {
+    var s = u
+    while s.hasSuffix("/") { s.removeLast() }
+    if s.hasSuffix(".git") { s.removeLast(4) }
+    return s.lowercased()
+}
+
+final class Resolver {
+    struct Pin { var identity = "", url = "", revision = "", branch = ""; var version: Version? }
+    struct Constraint { var requirement: Requirement; var requester: String; var url: String }
+    struct Choice: Equatable { var revision: String; var version: Version?; var branch: String; var url: String }
+    final class Repo {
+        let dir: String
+        let url: String
+        var fetched = false
+        var tagList: [(Version, String)]? = nil
+        init(dir: String, url: String) { self.dir = dir; self.url = url }
+    }
+
+    let root: String
+    let options: ResolveOptions
+    var pins: [String: Pin] = [:]
+    var repos: [String: Repo] = [:]
+    var manifestCache: [String: Manifest] = [:]
+
+    init(root: String, options: ResolveOptions) {
+        self.root = root
+        self.options = options
+        if let text = Files.readIfExists(Path.join(root, "Package.resolved")), let j = try? JSON.parse(text) {
+            for p in j["pins"].array ?? [] {
+                var pin = Pin()
+                pin.identity = p["identity"].string ?? ""
+                pin.url = p["location"].string ?? ""
+                pin.revision = p["state"]["revision"].string ?? ""
+                pin.branch = p["state"]["branch"].string ?? ""
+                pin.version = p["state"]["version"].string.flatMap { Version($0) }
+                pins[pin.identity] = pin
+            }
+        }
+    }
+
+    func updating(_ id: String) -> Bool { options.updateAll || options.update.contains(id) }
+
+    func repo(_ id: String, _ url: String) throws(DriverError) -> Repo {
+        if let r = repos[id] { return r }
+        let r = Repo(dir: Path.join(root, ".build/checkouts", id), url: url)
+        if Files.exists(Path.join(r.dir, ".git")) {
+            let origin = (try? git(["config", "--get", "remote.origin.url"], in: r.dir)) ?? ""
+            if normalizeURL(origin) != normalizeURL(url) { Files.removeTree(r.dir) }
+        }
+        if !Files.exists(Path.join(r.dir, ".git")) {
+            status("Fetching", url)
+            Files.makeDirectories(Path.dirname(r.dir))
+            _ = try git(["clone", "--quiet", "--no-checkout", url, r.dir], in: root)
+            r.fetched = true
+        }
+        repos[id] = r
+        return r
+    }
+
+    func fetch(_ r: Repo) throws(DriverError) {
+        if r.fetched { return }
+        status("Updating", r.url)
+        _ = try git(["fetch", "--quiet", "--tags", "--force", "--prune", "origin"], in: r.dir)
+        r.fetched = true
+        r.tagList = nil
+    }
+
+    func hasCommit(_ r: Repo, _ rev: String) -> Bool {
+        !rev.isEmpty && ((try? Process.run(["git", "cat-file", "-e", rev + "^{commit}"], cwd: r.dir))?.status == 0)
+    }
+
+    func tags(_ r: Repo) throws(DriverError) -> [(Version, String)] {
+        if let t = r.tagList { return t }
+        var out: [(Version, String)] = []
+        let text = try git(["for-each-ref", "--format=%(refname:strip=2) %(objectname) %(*objectname)", "refs/tags"], in: r.dir)
+        for line in text.split(separator: "\n") {
+            let f = line.split(separator: " ")
+            guard f.count >= 2, let v = Version(String(f[0])) else { continue }
+            out.append((v, String(f.count >= 3 ? f[2] : f[1])))
+        }
+        out.sort { $1.0 < $0.0 }
+        r.tagList = out
+        return out
+    }
+
+    func decide(_ id: String, _ cons: [Constraint]) throws(DriverError) -> Choice {
+        let url = cons[0].url
+        for c in cons where normalizeURL(c.url) != normalizeURL(url) {
+            throw DriverError("'\(id)' is required from two different locations:\n  \(cons[0].requester) uses \(url)\n  \(c.requester) uses \(c.url)")
+        }
+        let describe = cons.map { "\n  \($0.requester) requires \(id) \($0.requirement)" }.joined()
+        let r = try repo(id, url)
+        let pin = pins[id].flatMap { normalizeURL($0.url) == normalizeURL(url) ? $0 : nil }
+
+        if cons.contains(where: { $0.requirement.isRef }) {
+            for c in cons where c.requirement != cons[0].requirement { throw DriverError("conflicting requirements for '\(id)':" + describe) }
+            switch cons[0].requirement {
+            case .branch(let b):
+                if let pin, pin.branch == b, !updating(id), hasCommit(r, pin.revision) {
+                    return Choice(revision: pin.revision, version: nil, branch: b, url: url)
+                }
+                if options.onlyResolved { throw DriverError("'\(id)' is not pinned in Package.resolved; run `mpp pm resolve`") }
+                try fetch(r)
+                return Choice(revision: try git(["rev-parse", "--verify", "refs/remotes/origin/\(b)^{commit}"], in: r.dir),
+                              version: nil, branch: b, url: url)
+            case .revision(let rev):
+                if !hasCommit(r, rev) { try fetch(r) }
+                return Choice(revision: try git(["rev-parse", "--verify", rev + "^{commit}"], in: r.dir), version: nil, branch: "", url: url)
+            default: break
+            }
+        }
+        let ok = { (v: Version) in cons.allSatisfy { $0.requirement.allows(v) } }
+        if let pin, let pv = pin.version, !updating(id), ok(pv), hasCommit(r, pin.revision) {
+            return Choice(revision: pin.revision, version: pv, branch: "", url: url)
+        }
+        if options.onlyResolved {
+            throw DriverError("'\(id)' is not pinned in Package.resolved (or the pin no longer fits); run `mpp pm resolve`" + describe)
+        }
+        try fetch(r)
+        for (v, commit) in try tags(r) where ok(v) { return Choice(revision: commit, version: v, branch: "", url: url) }
+        let available = try tags(r).prefix(8).map { "\($0.0)" }.joined(separator: ", ")
+        throw DriverError("no version of '\(id)' satisfies all requirements:" + describe
+                          + "\n  available: " + (available.isEmpty ? "(no version tags)" : available))
+    }
+
+    func remoteManifest(_ id: String, _ c: Choice) throws(DriverError) -> Manifest {
+        let key = id + "@" + c.revision
+        if let m = manifestCache[key] { return m }
+        let r = repos[id]!
+        let text: String
+        do { text = try git(["show", c.revision + ":Package.mpp"], in: r.dir) + "\n" }
+        catch { throw DriverError("'\(id)' at \(c.version.map { "\($0)" } ?? String(c.revision.prefix(10))) has no Package.mpp") }
+        let m = try ManifestLoader.load(text: text, root: r.dir, shown: id + "/Package.mpp")
+        for d in m.dependencies where d.isPath {
+            throw DriverError("remote package '\(id)' has a path dependency ('\(d.location)'); only local packages may")
+        }
+        manifestCache[key] = m
+        return m
+    }
+
+    func run() throws(DriverError) -> Graph {
+        let rootManifest = try ManifestLoader.load(root: root)
+        var chosen: [String: Choice] = [:]
+        var local: [String: String] = [:]
+        var localManifests: [String: Manifest] = [:]
+        var iteration = 0
+        while true {
+            iteration += 1
+            if iteration > 64 { throw DriverError("dependency resolution did not converge") }
+            var cons: [String: [Constraint]] = [:]
+            var consOrder: [String] = []
+            local = [:]
+            var queue: [Manifest] = [rootManifest]
+            var visited: Set<String> = [rootManifest.name.lowercased()]
+            var expanded = Set<String>()
+            repeat {
+                while let m = queue.popLast() {
+                    for d in m.dependencies {
+                        if d.isPath {
+                            if let c = cons[d.identity] { throw DriverError("'\(d.identity)' is required both as a local path and from \(c[0].url)") }
+                            if let other = local[d.identity], other != d.absolutePath {
+                                throw DriverError("'\(d.identity)' is required from two different paths:\n  \(other)\n  \(d.absolutePath)")
+                            }
+                            local[d.identity] = d.absolutePath
+                            if visited.insert(d.identity).inserted {
+                                guard Files.isFile(Path.join(d.absolutePath, "Package.mpp")) else {
+                                    throw DriverError("\(m.name) depends on '\(d.location)', which has no Package.mpp")
+                                }
+                                let lm = try ManifestLoader.load(root: d.absolutePath)
+                                localManifests[d.identity] = lm
+                                queue.append(lm)
+                            }
+                        } else {
+                            if local[d.identity] != nil { throw DriverError("'\(d.identity)' is required both as a local path and from \(d.location)") }
+                            if cons[d.identity] == nil { consOrder.append(d.identity) }
+                            cons[d.identity, default: []].append(Constraint(requirement: d.requirement, requester: m.name, url: d.location))
+                        }
+                    }
+                }
+                for id in consOrder where !expanded.contains(id) {
+                    guard let c = chosen[id], normalizeURL(c.url) == normalizeURL(cons[id]![0].url) else { continue }
+                    expanded.insert(id)
+                    queue.append(try remoteManifest(id, c))
+                }
+            } while !queue.isEmpty
+            var next: [String: Choice] = [:]
+            for id in consOrder { next[id] = try decide(id, cons[id]!) }
+            if next == chosen { break }
+            chosen = next
+        }
+
+        var graph = Graph(root: rootManifest, packages: [:])
+        for (id, c) in chosen.sorted(by: { $0.key < $1.key }) {
+            let r = repos[id]!
+            let head = (try? git(["rev-parse", "HEAD"], in: r.dir)) ?? ""
+            if head != c.revision || !Files.exists(Path.join(r.dir, "Package.mpp")) {
+                _ = try git(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--force", c.revision], in: r.dir)
+            }
+            graph.packages[id] = ResolvedPackage(identity: id, remote: true, url: c.url, revision: c.revision, version: c.version,
+                                                 branch: c.branch, root: r.dir, manifest: try ManifestLoader.load(root: r.dir))
+        }
+        for (id, path) in local {
+            graph.packages[id] = ResolvedPackage(identity: id, remote: false, root: path, manifest: localManifests[id]!)
+        }
+
+        // Package.resolved (SwiftPM format, version 2). Local packages are not pinned.
+        let resolvedPath = Path.join(root, "Package.resolved")
+        if chosen.isEmpty {
+            _ = unlinkFile(resolvedPath)
+        } else if !options.onlyResolved {
+            var pinsJSON: [JSON] = []
+            for (id, c) in chosen.sorted(by: { $0.key < $1.key }) {
+                var state: JSON = [:]
+                if !c.branch.isEmpty { state["branch"] = .string(c.branch) }
+                state["revision"] = .string(c.revision)
+                if let v = c.version { state["version"] = .string("\(v)") }
+                pinsJSON.append(["identity": .string(id), "kind": "remoteSourceControl", "location": .string(c.url), "state": state])
+            }
+            let doc: JSON = ["originHash": .string(Stamp.of(try Files.read(Path.join(root, "Package.mpp")))),
+                             "pins": .array(pinsJSON), "version": 2]
+            try Files.writeIfChanged(resolvedPath, doc.dump(indent: 2) + "\n")
+        }
+        return graph
+    }
+}
+
+func resolve(_ root: String, _ options: ResolveOptions = ResolveOptions()) throws(DriverError) -> Graph {
+    try Resolver(root: root, options: options).run()
+}

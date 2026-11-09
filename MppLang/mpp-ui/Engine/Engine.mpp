@@ -1,0 +1,854 @@
+// MppUI engine — software renderer, text, Liquid Glass, headless backend.
+// Written in M++ (it was C++).
+//
+// Everything is drawn into one 32-bit back buffer (0xAARRGGBB words) at
+// device scale. Shapes are anti-aliased with signed-distance coverage;
+// Liquid Glass (Glass.mpp) runs Metallic shaders over what is already
+// drawn behind a shape. Window systems
+// live in X11.mpp (Linux) and Cocoa.mpp (macOS); without a display (or with
+// MPP_UI_HEADLESS=file.png) frames go to a PNG file instead.
+//
+// The API keeps the names the M++ side of MppUI has always called
+// (mppui_fill_rounded_rect, ...). Bounds: every drawing call clips its box
+// to the buffer once, up front; the pixel loops inside then run unchecked.
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+// MARK: - API types
+
+public struct MppUIEventType: Equatable, Sendable {
+    public var rawValue: UInt32
+    public init(rawValue: UInt32) { self.rawValue = rawValue }
+}
+public let MPPUI_EVENT_NONE = MppUIEventType(rawValue: 0)
+public let MPPUI_EVENT_CLOSE = MppUIEventType(rawValue: 1)
+public let MPPUI_EVENT_RESIZE = MppUIEventType(rawValue: 2)
+public let MPPUI_EVENT_EXPOSE = MppUIEventType(rawValue: 3)
+public let MPPUI_EVENT_MOUSE_DOWN = MppUIEventType(rawValue: 4)
+public let MPPUI_EVENT_MOUSE_UP = MppUIEventType(rawValue: 5)
+public let MPPUI_EVENT_MOUSE_MOVE = MppUIEventType(rawValue: 6)
+public let MPPUI_EVENT_SCROLL = MppUIEventType(rawValue: 7)
+public let MPPUI_EVENT_KEY = MppUIEventType(rawValue: 8)
+public let MPPUI_EVENT_TEXT = MppUIEventType(rawValue: 9)
+
+public struct MppUIKey: Equatable, Sendable {
+    public var rawValue: UInt32
+    public init(rawValue: UInt32) { self.rawValue = rawValue }
+}
+public let MPPUI_KEY_OTHER = MppUIKey(rawValue: 0)
+public let MPPUI_KEY_BACKSPACE = MppUIKey(rawValue: 1)
+public let MPPUI_KEY_DELETE = MppUIKey(rawValue: 2)
+public let MPPUI_KEY_RETURN = MppUIKey(rawValue: 3)
+public let MPPUI_KEY_TAB = MppUIKey(rawValue: 4)
+public let MPPUI_KEY_ESCAPE = MppUIKey(rawValue: 5)
+public let MPPUI_KEY_LEFT = MppUIKey(rawValue: 6)
+public let MPPUI_KEY_RIGHT = MppUIKey(rawValue: 7)
+public let MPPUI_KEY_UP = MppUIKey(rawValue: 8)
+public let MPPUI_KEY_DOWN = MppUIKey(rawValue: 9)
+public let MPPUI_KEY_HOME = MppUIKey(rawValue: 10)
+public let MPPUI_KEY_END = MppUIKey(rawValue: 11)
+
+public struct MppUIFont: Equatable, Sendable {
+    public var rawValue: UInt32
+    public init(rawValue: UInt32) { self.rawValue = rawValue }
+}
+public let MPPUI_FONT_SANS = MppUIFont(rawValue: 0)
+public let MPPUI_FONT_BOLD = MppUIFont(rawValue: 1)
+public let MPPUI_FONT_MONO = MppUIFont(rawValue: 2)
+
+/// An input event. `text` holds UTF-8 (NUL-terminated) for TEXT events.
+public struct MppUIEvent: Sendable {
+    public var type: Int32 = 0
+    public var x: Float = 0, y: Float = 0
+    public var dx: Float = 0, dy: Float = 0
+    public var key: Int32 = 0
+    public var modifiers: Int32 = 0            // bit 0 shift, 1 control, 2 alt, 3 command
+    public var text: (CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar,
+                      CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    public init() {}
+
+    init(_ type: MppUIEventType) { self.type = Int32(type.rawValue) }
+
+    /// Stores up to 15 bytes of UTF-8.
+    mutating func setText(_ bytes: some Collection<UInt8>) {
+        withUnsafeMutableBytes(of: &text) { raw in
+            var i = 0
+            for b in bytes where i < 15 { raw[i] = b; i += 1 }
+            while i < 16 { raw[i] = 0; i += 1 }
+        }
+    }
+}
+
+// MARK: - State
+
+struct _Box {
+    var x0: Int, y0: Int, x1: Int, y1: Int
+    var isEmpty: Bool { x0 >= x1 || y0 >= y1 }
+}
+
+final class _EngineState {
+    var width = 1, height = 1                          // device pixels
+    var scale: Float = 1
+    var pixels = UnsafeMutablePointer<UInt32>.allocate(capacity: 1)
+    var capacity = 1
+    var clips: [_Box] = [_Box(x0: 0, y0: 0, x1: 1, y1: 1)]
+    var translate: [(Float, Float)] = [(0, 0)]
+    var opacity: [Float] = [1]
+    var title = ""
+    var error = ""
+    var errorC: UnsafeMutablePointer<CChar>? = nil
+    var headless = false
+    var headlessPath = ""
+    var script: [MppUIEvent] = []
+    var scriptIndex = 0
+    var frames = 0
+
+    func resize(_ w: Int, _ h: Int) {
+        width = max(w, 1)
+        height = max(h, 1)
+        let n = width * height
+        if n > capacity {
+            pixels.deallocate()
+            pixels = UnsafeMutablePointer<UInt32>.allocate(capacity: n)
+            capacity = n
+        }
+        pixels.update(repeating: 0xFFFF_FFFF, count: n)
+        clips = [_Box(x0: 0, y0: 0, x1: width, y1: height)]
+    }
+
+    func fail(_ message: String) -> Int32 {
+        error = message
+        return -1
+    }
+}
+
+nonisolated(unsafe) let _g = _EngineState()
+
+// MARK: - Helpers
+
+@inline(__always) func _clamp01(_ v: Float) -> Float { v < 0 ? 0 : (v > 1 ? 1 : v) }
+
+/// Float → Int for pixel coordinates; NaN and infinities can't crash a frame.
+@inline(__always) func _int(_ v: Float) -> Int {
+    if !(v > -1e9) { return -1_000_000_000 }
+    if !(v < 1e9) { return 1_000_000_000 }
+    return Int(v)
+}
+@inline(__always) func _floor(_ v: Float) -> Int { _int(v.rounded(.down)) }
+@inline(__always) func _ceil(_ v: Float) -> Int { _int(v.rounded(.up)) }
+
+/// Blends `argb` over the pixel at `p` with `coverage` (0...1).
+@inline(__always) func _blend(_ p: UnsafeMutablePointer<UInt32>, _ argb: UInt32, _ coverage: Float, _ opacity: Float) {
+    var a = Float((argb >> 24) & 255) * (1 / 255) * coverage * opacity
+    if a <= 0 { return }
+    if a > 1 { a = 1 }
+    let d = p.pointee
+    let r = Float((argb >> 16) & 255), gg = Float((argb >> 8) & 255), b = Float(argb & 255)
+    let dr = Float((d >> 16) & 255), dg = Float((d >> 8) & 255), db = Float(d & 255)
+    let nr = UInt32(dr + (r - dr) * a + 0.5), ng = UInt32(dg + (gg - dg) * a + 0.5), nb = UInt32(db + (b - db) * a + 0.5)
+    p.pointee = 0xFF00_0000 | nr << 16 | ng << 8 | nb
+}
+
+/// The device-pixel box of a point-space rect, intersected with the clip.
+func _deviceBox(_ x: Float, _ y: Float, _ w: Float, _ h: Float, pad: Float = 1) -> _Box {
+    let s = _g.scale
+    let (tx, ty) = _g.translate[_g.translate.count - 1]
+    var b = _Box(x0: _floor((x + tx) * s - pad), y0: _floor((y + ty) * s - pad),
+                 x1: _ceil((x + tx + w) * s + pad), y1: _ceil((y + ty + h) * s + pad))
+    return _clip(&b)
+}
+
+/// Intersects with the current clip (which always lies inside the buffer).
+@discardableResult
+func _clip(_ b: inout _Box) -> _Box {
+    let c = _g.clips[_g.clips.count - 1]
+    b.x0 = max(b.x0, c.x0); b.y0 = max(b.y0, c.y0)
+    b.x1 = min(b.x1, c.x1); b.y1 = min(b.y1, c.y1)
+    precondition(b.isEmpty || (b.x0 >= 0 && b.y0 >= 0 && b.x1 <= _g.width && b.y1 <= _g.height), "MppUI: clip outside the buffer")
+    return b
+}
+
+struct _RRect { var cx: Float, cy: Float, hw: Float, hh: Float, r: Float }
+
+func _deviceRRect(_ x: Float, _ y: Float, _ w: Float, _ h: Float, _ radius: Float) -> _RRect {
+    let s = _g.scale
+    let (tx, ty) = _g.translate[_g.translate.count - 1]
+    let hw = w * s / 2, hh = h * s / 2
+    return _RRect(cx: (x + tx) * s + hw, cy: (y + ty) * s + hh, hw: hw, hh: hh, r: min(radius * s, min(hw, hh)))
+}
+
+/// Signed distance from (px, py) to a rounded rect (device pixels); negative inside.
+@inline(__always) func _rrectDistance(_ px: Float, _ py: Float, _ r: _RRect) -> Float {
+    let qx = abs(px - r.cx) - (r.hw - r.r), qy = abs(py - r.cy) - (r.hh - r.r)
+    let ox = max(qx, 0), oy = max(qy, 0)
+    return (ox * ox + oy * oy).squareRoot() + min(max(qx, qy), 0) - r.r
+}
+
+/// Runs `body(row, px)` for each pixel of `b` with a pointer to that row.
+@inline(__always) func _forEachPixel(_ b: _Box, _ body: (UnsafeMutablePointer<UInt32>, Int, Int) -> Void) {
+    if b.isEmpty { return }
+    let base = _g.pixels, w = _g.width
+    var py = b.y0
+    while py < b.y1 {
+        let row = base + py * w
+        var px = b.x0
+        while px < b.x1 { body(row, px, py); px &+= 1 }
+        py &+= 1
+    }
+}
+
+// MARK: - Window and frames
+
+public func mppui_error() -> UnsafePointer<CChar> {
+    free(_g.errorC)
+    _g.errorC = strdup(_g.error)
+    return UnsafePointer(_g.errorC!)
+}
+public func mppui_width() -> Int32 { Int32(_int(Float(_g.width) / _g.scale)) }
+public func mppui_height() -> Int32 { Int32(_int(Float(_g.height) / _g.scale)) }
+public func mppui_is_headless() -> Int32 { _g.headless ? 1 : 0 }
+
+func _env(_ name: String) -> String? {
+    guard let p = getenv(name) else { return nil }
+    let s = String(cString: p)
+    return s.isEmpty ? nil : s
+}
+
+public func mppui_open(_ title: String, _ width: Int32, _ height: Int32) -> Int32 {
+    _g.scale = _env("MPP_UI_SCALE").flatMap { Float($0) }.map { max(0.5, $0) } ?? 1
+    _g.title = title
+    _g.frames = 0
+    if let path = _env("MPP_UI_HEADLESS") {
+        _g.headless = true
+        _g.headlessPath = path
+        _g.resize(_int(Float(width) * _g.scale), _int(Float(height) * _g.scale))
+        if let script = _env("MPP_UI_SCRIPT") { _parseScript(script) }
+        return 0
+    }
+    return _backendOpen(title, Int(width), Int(height))
+}
+
+public func mppui_set_title(_ title: String) {
+    _g.title = title
+    if !_g.headless { _backendSetTitle(title) }
+}
+
+public func mppui_begin_frame(_ clear: UInt32) {
+    _g.pixels.update(repeating: clear | 0xFF00_0000, count: _g.width * _g.height)
+    _g.clips = [_Box(x0: 0, y0: 0, x1: _g.width, y1: _g.height)]
+    _g.translate = [(0, 0)]
+    _g.opacity = [1]
+}
+
+public func mppui_end_frame() {
+    _g.frames += 1
+    if !_g.headless { _backendPresent() }
+}
+
+public func mppui_close() {
+    if _g.headless {
+        if !_g.headlessPath.isEmpty { _ = mppui_save_png(_g.headlessPath) }
+        return
+    }
+    _backendClose()
+}
+
+/// Headless events: MPP_UI_SCRIPT="click 120 40; type hello; key return; scroll 0 -40; wait 200"
+func _parseScript(_ script: String) {
+    for command in script.split(separator: ";") {
+        let words = command.split(whereSeparator: { $0 == " " || $0 == "\t" })
+        guard let verb = words.first else { continue }
+        let nums = words.dropFirst().compactMap { Float($0) }
+        var e = MppUIEvent()
+        switch verb {
+        case "click" where nums.count >= 2:
+            e.type = Int32(MPPUI_EVENT_MOUSE_DOWN.rawValue); e.x = nums[0]; e.y = nums[1]; _g.script.append(e)
+            e.type = Int32(MPPUI_EVENT_MOUSE_UP.rawValue); _g.script.append(e)
+        case "down" where nums.count >= 2:            // press and hold (e.g. to see a control's pressed look)
+            e.type = Int32(MPPUI_EVENT_MOUSE_DOWN.rawValue); e.x = nums[0]; e.y = nums[1]; _g.script.append(e)
+        case "up" where nums.count >= 2:
+            e.type = Int32(MPPUI_EVENT_MOUSE_UP.rawValue); e.x = nums[0]; e.y = nums[1]; _g.script.append(e)
+        case "move" where nums.count >= 2:
+            e.type = Int32(MPPUI_EVENT_MOUSE_MOVE.rawValue); e.x = nums[0]; e.y = nums[1]; _g.script.append(e)
+        case "drag" where nums.count >= 4:
+            e.type = Int32(MPPUI_EVENT_MOUSE_DOWN.rawValue); e.x = nums[0]; e.y = nums[1]; _g.script.append(e)
+            e.type = Int32(MPPUI_EVENT_MOUSE_MOVE.rawValue); e.x = nums[2]; e.y = nums[3]; _g.script.append(e)
+            e.type = Int32(MPPUI_EVENT_MOUSE_UP.rawValue); _g.script.append(e)
+        case "wait" where nums.count >= 1:
+            e.type = Int32(MPPUI_EVENT_NONE.rawValue); e.dx = nums[0]; _g.script.append(e)      // let time pass (ms)
+        case "scroll" where nums.count >= 2:
+            e.type = Int32(MPPUI_EVENT_SCROLL.rawValue); e.dx = nums[0]; e.dy = nums[1]; _g.script.append(e)
+        case "type":
+            // Everything after the word, one TEXT event per character.
+            let rest = command.drop { $0 == " " || $0 == "\t" }.dropFirst(4).drop { $0 == " " || $0 == "\t" }
+            for ch in rest {
+                var t = MppUIEvent(MPPUI_EVENT_TEXT)
+                t.setText(String(ch).utf8)
+                _g.script.append(t)
+            }
+        case "key" where words.count >= 2:
+            let k: MppUIKey
+            switch words[1] {
+            case "return": k = MPPUI_KEY_RETURN
+            case "backspace": k = MPPUI_KEY_BACKSPACE
+            case "tab": k = MPPUI_KEY_TAB
+            case "left": k = MPPUI_KEY_LEFT
+            case "right": k = MPPUI_KEY_RIGHT
+            case "up": k = MPPUI_KEY_UP
+            case "down": k = MPPUI_KEY_DOWN
+            case "escape": k = MPPUI_KEY_ESCAPE
+            default: k = MPPUI_KEY_OTHER
+            }
+            e.type = Int32(MPPUI_EVENT_KEY.rawValue); e.key = Int32(k.rawValue); _g.script.append(e)
+        default:
+            continue
+        }
+    }
+}
+
+public func mppui_next_event(_ e: UnsafeMutablePointer<MppUIEvent>, _ timeoutMs: Int32) -> Int32 {
+    e.pointee = MppUIEvent()
+    if _g.headless {
+        if _g.scriptIndex < _g.script.count {
+            let next = _g.script[_g.scriptIndex]
+            _g.scriptIndex += 1
+            if next.type == Int32(MPPUI_EVENT_NONE.rawValue) {
+                usleep(UInt32(max(0, _int(next.dx))) * 1000)
+                return 0
+            }
+            e.pointee = next
+            return 1
+        }
+        e.pointee = MppUIEvent(MPPUI_EVENT_CLOSE)            // script done: render the last frame and quit
+        return 1
+    }
+    return _backendNextEvent(e, Int(timeoutMs))
+}
+
+// MARK: - Clip, transform, opacity
+
+public func mppui_push_clip(_ x: Float, _ y: Float, _ w: Float, _ h: Float) {
+    var b = _deviceBox(x, y, w, h, pad: 0)
+    if b.x1 < b.x0 { b.x1 = b.x0 }
+    if b.y1 < b.y0 { b.y1 = b.y0 }
+    _g.clips.append(b)
+}
+public func mppui_pop_clip() { if _g.clips.count > 1 { _g.clips.removeLast() } }
+public func mppui_push_translate(_ dx: Float, _ dy: Float) {
+    let t = _g.translate[_g.translate.count - 1]
+    _g.translate.append((t.0 + dx, t.1 + dy))
+}
+public func mppui_pop_translate() { if _g.translate.count > 1 { _g.translate.removeLast() } }
+public func mppui_push_opacity(_ a: Float) { _g.opacity.append(_g.opacity[_g.opacity.count - 1] * _clamp01(a)) }
+public func mppui_pop_opacity() { if _g.opacity.count > 1 { _g.opacity.removeLast() } }
+
+var _opacity: Float { _g.opacity[_g.opacity.count - 1] }
+
+// MARK: - Shapes
+
+public func mppui_fill_rounded_rect(_ x: Float, _ y: Float, _ w: Float, _ h: Float, _ radius: Float, _ argb: UInt32) {
+    if !(w > 0 && h > 0) { return }
+    let r = _deviceRRect(x, y, w, h, radius), op = _opacity
+    _forEachPixel(_deviceBox(x, y, w, h)) { row, px, py in
+        let cov = _clamp01(0.5 - _rrectDistance(Float(px) + 0.5, Float(py) + 0.5, r))
+        if cov > 0 { _blend(row + px, argb, cov, op) }
+    }
+}
+
+public func mppui_stroke_rounded_rect(_ x: Float, _ y: Float, _ w: Float, _ h: Float, _ radius: Float, _ lw: Float, _ argb: UInt32) {
+    if !(w > 0 && h > 0) { return }
+    let r = _deviceRRect(x, y, w, h, radius), op = _opacity
+    let half = lw * _g.scale / 2
+    _forEachPixel(_deviceBox(x, y, w, h, pad: half + 1)) { row, px, py in
+        let d = abs(_rrectDistance(Float(px) + 0.5, Float(py) + 0.5, r) + half)
+        let cov = _clamp01(half + 0.5 - d)
+        if cov > 0 { _blend(row + px, argb, cov, op) }
+    }
+}
+
+public func mppui_fill_ellipse(_ x: Float, _ y: Float, _ w: Float, _ h: Float, _ argb: UInt32) {
+    if !(w > 0 && h > 0) { return }
+    let r = _deviceRRect(x, y, w, h, 0), op = _opacity
+    let minR = min(r.hw, r.hh)
+    _forEachPixel(_deviceBox(x, y, w, h)) { row, px, py in
+        let nx = (Float(px) + 0.5 - r.cx) / r.hw, ny = (Float(py) + 0.5 - r.cy) / r.hh
+        let d = ((nx * nx + ny * ny).squareRoot() - 1) * minR
+        let cov = _clamp01(0.5 - d)
+        if cov > 0 { _blend(row + px, argb, cov, op) }
+    }
+}
+
+@inline(__always) func _lerpColor(_ a: UInt32, _ b: UInt32, _ t: Float) -> UInt32 {
+    func ch(_ s: UInt32) -> UInt32 {
+        let x = Float((a >> s) & 255), y = Float((b >> s) & 255)
+        return UInt32(x + (y - x) * t + 0.5) << s
+    }
+    return ch(24) | ch(16) | ch(8) | ch(0)
+}
+
+public func mppui_linear_gradient(_ x: Float, _ y: Float, _ w: Float, _ h: Float, _ radius: Float,
+                                  _ from: UInt32, _ to: UInt32, _ angle: Float) {
+    if !(w > 0 && h > 0) { return }
+    let r = _deviceRRect(x, y, w, h, radius), op = _opacity
+    let rad = angle * Float.pi / 180, dx = cos(rad), dy = sin(rad)
+    let extent = max(abs(dx) * r.hw + abs(dy) * r.hh, 1e-6)
+    _forEachPixel(_deviceBox(x, y, w, h)) { row, px, py in
+        let fx = Float(px) + 0.5, fy = Float(py) + 0.5
+        let cov = _clamp01(0.5 - _rrectDistance(fx, fy, r))
+        if cov <= 0 { return }
+        let t = ((fx - r.cx) * dx + (fy - r.cy) * dy) / (2 * extent) + 0.5
+        _blend(row + px, _lerpColor(from, to, _clamp01(t)), cov, op)
+    }
+}
+
+public func mppui_shadow(_ x: Float, _ y: Float, _ w: Float, _ h: Float, _ radius: Float, _ blur: Float, _ argb: UInt32) {
+    let r = _deviceRRect(x, y, w, h, radius), op = _opacity
+    let sigma = max(blur * _g.scale, 0.5)
+    _forEachPixel(_deviceBox(x, y, w, h, pad: sigma * 2 + 1)) { row, px, py in
+        // Smooth falloff approximating a Gaussian-blurred edge.
+        let t = _clamp01(0.5 - _rrectDistance(Float(px) + 0.5, Float(py) + 0.5, r) / (2 * sigma))
+        let cov = t * t * (3 - 2 * t)
+        if cov > 0 { _blend(row + px, argb, cov, op) }
+    }
+}
+
+public func mppui_line(_ x0: Float, _ y0: Float, _ x1: Float, _ y1: Float, _ width: Float, _ argb: UInt32) {
+    let s = _g.scale, op = _opacity
+    let (tx, ty) = _g.translate[_g.translate.count - 1]
+    let ax = (x0 + tx) * s, ay = (y0 + ty) * s, bx = (x1 + tx) * s, by = (y1 + ty) * s
+    let half = width * s / 2
+    var b = _Box(x0: _floor(min(ax, bx) - half - 1), y0: _floor(min(ay, by) - half - 1),
+                 x1: _ceil(max(ax, bx) + half + 1), y1: _ceil(max(ay, by) + half + 1))
+    _clip(&b)
+    let vx = bx - ax, vy = by - ay, len2 = max(vx * vx + vy * vy, 1e-6)
+    _forEachPixel(b) { row, px, py in
+        let wx = Float(px) + 0.5 - ax, wy = Float(py) + 0.5 - ay
+        let t = _clamp01((wx * vx + wy * vy) / len2)
+        let ex = wx - t * vx, ey = wy - t * vy
+        let cov = _clamp01(half + 0.5 - (ex * ex + ey * ey).squareRoot())
+        if cov > 0 { _blend(row + px, argb, cov, op) }
+    }
+}
+
+// (Liquid Glass is in Glass.mpp: Metallic shaders.)
+
+// MARK: - Text
+
+func _fontFor(_ f: Int32) -> _Font {
+    if let system = _backendFont(Int(f)) { return system }        // macOS: the system font (SF)
+    return f == Int32(MPPUI_FONT_BOLD.rawValue) ? _Font.bold : f == Int32(MPPUI_FONT_MONO.rawValue) ? _Font.mono : _Font.sans
+}
+
+public func mppui_text_width(_ text: String, _ size: Float, _ font: Int32) -> Float {
+    let fd = _fontFor(font)
+    let k = size / 32
+    var sum: Float = 0
+    for u in text.unicodeScalars { if let gl = fd.glyph(u.value) { sum += Float(gl.advance) * k } }
+    return sum
+}
+
+public func mppui_line_height(_ size: Float, _ font: Int32) -> Float { Float(_fontFor(font).lineHeight) * size / 32 }
+public func mppui_ascent(_ size: Float, _ font: Int32) -> Float { Float(_fontFor(font).ascent) * size / 32 }
+
+public func mppui_text(_ text: String, _ x: Float, _ baseline: Float, _ size: Float, _ font: Int32, _ argb: UInt32) {
+    let fd = _fontFor(font)
+    let s = _g.scale, op = _opacity
+    let (tx, ty) = _g.translate[_g.translate.count - 1]
+    let k = size * s / 32                                   // atlas pixels -> device pixels
+    if !(k > 0) { return }
+    var penX = (x + tx) * s
+    let base = (baseline + ty) * s
+    fd.pixels.withUnsafeBufferPointer { atlas in
+        for u in text.unicodeScalars {
+            guard let gl = fd.glyph(u.value) else { continue }
+            defer { penX += Float(gl.advance) * k }
+            if gl.width <= 0 || gl.height <= 0 { continue }
+            precondition(gl.offset >= 0 && gl.offset + gl.width * gl.height <= atlas.count, "MppUI: glyph outside its atlas")
+            let gx = penX + Float(gl.left) * k, gy = base - Float(gl.top) * k
+            var b = _Box(x0: _floor(gx), y0: _floor(gy), x1: _ceil(gx + Float(gl.width) * k), y1: _ceil(gy + Float(gl.height) * k))
+            _clip(&b)
+            let src = atlas.baseAddress! + gl.offset
+            let gw = gl.width, gh = gl.height
+            _forEachPixel(b) { row, px, py in
+                // Area-average the atlas texels under this device pixel (good minification).
+                let u0 = (Float(px) - gx) / k, v0 = (Float(py) - gy) / k
+                let u1 = (Float(px) + 1 - gx) / k, v1 = (Float(py) + 1 - gy) / k
+                let iu0 = max(_floor(u0), 0), iv0 = max(_floor(v0), 0)
+                let iu1 = min(_ceil(u1), gw), iv1 = min(_ceil(v1), gh)
+                var sum: Float = 0, area: Float = 0
+                var v = iv0
+                while v < iv1 {
+                    let hv = min(Float(v) + 1, v1) - max(Float(v), v0)
+                    var uu = iu0
+                    while uu < iu1 {
+                        let wgt = (min(Float(uu) + 1, u1) - max(Float(uu), u0)) * hv
+                        sum += Float(src[v * gw + uu]) * wgt
+                        area += wgt
+                        uu &+= 1
+                    }
+                    v &+= 1
+                }
+                let cov = (u1 - u0) * (v1 - v0)
+                if area > 0 && cov > 0 { _blend(row + px, argb, min(sum / 255 / cov, 1), op) }
+            }
+        }
+    }
+}
+
+// MARK: - Icons (a small built-in set, drawn with primitives)
+
+public func mppui_icon(_ name: String, _ x: Float, _ y: Float, _ size: Float, _ argb: UInt32) {
+    let n = name, s = size, cx = x + s / 2, cy = y + s / 2, lw = max(1.5, s / 10)
+    func L(_ a: Float, _ b: Float, _ c: Float, _ d: Float) { mppui_line(x + a * s, y + b * s, x + c * s, y + d * s, lw, argb) }
+    func has(_ part: String) -> Bool { n.contains(part) }
+    func poly(_ pts: [Float], fill: Bool) {
+        var xy: [Float] = []
+        for k in stride(from: 0, to: pts.count, by: 2) { xy.append(x + pts[k] * s); xy.append(y + pts[k + 1] * s) }
+        let sizes: [Int32] = [Int32(pts.count / 2)], closed: [Int32] = [1]
+        if fill { mppui_fill_path(xy, sizes, 1, argb, 0) } else { mppui_stroke_path(xy, sizes, closed, 1, lw, argb) }
+    }
+    /// An open arc (angles in radians, 0 = right, clockwise on screen).
+    func arc(_ ax: Float, _ ay: Float, _ r: Float, _ a0: Float, _ a1: Float) {
+        var xy: [Float] = []
+        let steps = 14
+        for k in 0 ... steps {
+            let a = a0 + (a1 - a0) * Float(k) / Float(steps)
+            xy.append(x + (ax + cos(a) * r) * s); xy.append(y + (ay + sin(a) * r) * s)
+        }
+        let sizes: [Int32] = [Int32(steps + 1)], closed: [Int32] = [0]
+        mppui_stroke_path(xy, sizes, closed, 1, lw, argb)
+    }
+    if n.hasPrefix("plus") { L(0.5, 0.15, 0.5, 0.85); L(0.15, 0.5, 0.85, 0.5) }
+    else if n.hasPrefix("sun") {
+        mppui_stroke_rounded_rect(x + s * 0.32, y + s * 0.32, s * 0.36, s * 0.36, s * 0.18, lw, argb)
+        for k in 0 ..< 8 {
+            let a = Float(k) * Float.pi / 4
+            L(0.5 + cos(a) * 0.3, 0.5 + sin(a) * 0.3, 0.5 + cos(a) * 0.44, 0.5 + sin(a) * 0.44)
+        }
+    }
+    else if n.hasPrefix("moon") { arc(0.5, 0.5, 0.34, Float.pi * 0.35, Float.pi * 1.65); arc(0.62, 0.42, 0.26, Float.pi * 0.55, Float.pi * 1.45) }
+    else if n.hasPrefix("speaker") {
+        poly([0.1, 0.38, 0.26, 0.38, 0.46, 0.2, 0.46, 0.8, 0.26, 0.62, 0.1, 0.62], fill: has("fill"))
+        if has("slash") { L(0.1, 0.15, 0.9, 0.85) }
+        else {
+            let waves = has("wave.3") ? 3 : has("wave.2") ? 2 : has("wave.1") ? 1 : 0
+            for k in 0 ..< waves { arc(0.46, 0.5, 0.16 + 0.13 * Float(k), -Float.pi / 3.2, Float.pi / 3.2) }
+        }
+    }
+    else if n.hasPrefix("wifi") {
+        mppui_fill_ellipse(cx - s * 0.06, y + s * 0.74, s * 0.12, s * 0.12, argb)
+        for k in 0 ..< 3 { arc(0.5, 0.8, 0.2 + 0.18 * Float(k), -Float.pi * 0.75, -Float.pi * 0.25) }
+    }
+    else if n.hasPrefix("magnifyingglass") {
+        mppui_stroke_rounded_rect(x + s * 0.14, y + s * 0.14, s * 0.5, s * 0.5, s * 0.25, lw, argb)
+        L(0.58, 0.58, 0.86, 0.86)
+    }
+    else if n.hasPrefix("person") {
+        mppui_stroke_rounded_rect(x + s * 0.35, y + s * 0.12, s * 0.3, s * 0.3, s * 0.15, lw, argb)
+        arc(0.5, 0.92, 0.36, -Float.pi * 0.95, -Float.pi * 0.05)
+    }
+    else if n.hasPrefix("bolt") { poly([0.58, 0.08, 0.24, 0.55, 0.47, 0.55, 0.4, 0.92, 0.76, 0.42, 0.53, 0.42], fill: has("fill")) }
+    else if n.hasPrefix("minus") { L(0.15, 0.5, 0.85, 0.5) }
+    else if n.hasPrefix("checkmark") {
+        L(0.18, 0.52, 0.42, 0.76); L(0.42, 0.76, 0.84, 0.26)
+        if has("circle") { mppui_stroke_rounded_rect(x, y, s, s, s / 2, lw * 0.8, argb) }
+    }
+    else if n.hasPrefix("xmark") {
+        L(0.22, 0.22, 0.78, 0.78); L(0.78, 0.22, 0.22, 0.78)
+        if has("octagon") || has("circle") { mppui_stroke_rounded_rect(x, y, s, s, s / 3, lw * 0.8, argb) }
+    }
+    else if n == "chevron.up.chevron.down" { L(0.3, 0.38, 0.5, 0.2); L(0.5, 0.2, 0.7, 0.38); L(0.3, 0.62, 0.5, 0.8); L(0.5, 0.8, 0.7, 0.62) }
+    else if n.hasPrefix("chevron.down") { L(0.2, 0.38, 0.5, 0.66); L(0.5, 0.66, 0.8, 0.38) }
+    else if n.hasPrefix("chevron.up") { L(0.2, 0.62, 0.5, 0.34); L(0.5, 0.34, 0.8, 0.62) }
+    else if n.hasPrefix("ellipsis") { for k in 0 ..< 3 { mppui_fill_ellipse(x + s * (0.17 + 0.25 * Float(k)), cy - s * 0.07, s * 0.14, s * 0.14, argb) } }
+    else if n.hasPrefix("line.3.horizontal") { L(0.15, 0.3, 0.85, 0.3); L(0.15, 0.5, 0.85, 0.5); L(0.15, 0.7, 0.85, 0.7) }
+    else if n.hasPrefix("house") { L(0.12, 0.5, 0.5, 0.15); L(0.5, 0.15, 0.88, 0.5); L(0.25, 0.42, 0.25, 0.85); L(0.75, 0.42, 0.75, 0.85); L(0.25, 0.85, 0.75, 0.85) }
+    else if n.hasPrefix("heart") { poly([0.5, 0.85, 0.12, 0.45, 0.14, 0.25, 0.3, 0.15, 0.5, 0.3, 0.7, 0.15, 0.86, 0.25, 0.88, 0.45], fill: has("fill")) }
+    else if n.hasPrefix("play") { poly([0.28, 0.18, 0.82, 0.5, 0.28, 0.82], fill: true) }
+    else if n.hasPrefix("pause") {
+        mppui_fill_rounded_rect(x + s * 0.25, y + s * 0.2, s * 0.16, s * 0.6, 1, argb)
+        mppui_fill_rounded_rect(x + s * 0.59, y + s * 0.2, s * 0.16, s * 0.6, 1, argb)
+    }
+    else if n.hasPrefix("bell") {
+        mppui_stroke_rounded_rect(x + s * 0.25, y + s * 0.18, s * 0.5, s * 0.55, s * 0.22, lw, argb)
+        L(0.15, 0.73, 0.85, 0.73)
+        mppui_fill_ellipse(cx - s * 0.07, y + s * 0.78, s * 0.14, s * 0.12, argb)
+    }
+    else if n.hasPrefix("folder") {
+        mppui_stroke_rounded_rect(x + s * 0.1, y + s * 0.3, s * 0.8, s * 0.52, s * 0.08, lw, argb)
+        L(0.1, 0.3, 0.15, 0.2); L(0.15, 0.2, 0.42, 0.2); L(0.42, 0.2, 0.48, 0.3)
+    }
+    else if n.hasPrefix("doc") {
+        mppui_stroke_rounded_rect(x + s * 0.22, y + s * 0.12, s * 0.56, s * 0.76, s * 0.08, lw, argb)
+        L(0.34, 0.4, 0.66, 0.4); L(0.34, 0.55, 0.66, 0.55); L(0.34, 0.7, 0.56, 0.7)
+    }
+    else if n.hasPrefix("pencil") { L(0.2, 0.8, 0.75, 0.25); L(0.3, 0.85, 0.85, 0.3); L(0.75, 0.25, 0.85, 0.3); L(0.2, 0.8, 0.15, 0.88) }
+    else if n.hasPrefix("info") {
+        mppui_stroke_rounded_rect(x + s * 0.1, y + s * 0.1, s * 0.8, s * 0.8, s * 0.4, lw * 0.8, argb)
+        L(0.5, 0.45, 0.5, 0.72)
+        mppui_fill_ellipse(cx - s * 0.05, y + s * 0.27, s * 0.1, s * 0.1, argb)
+    }
+    else if n.hasPrefix("exclamationmark") {
+        L(0.5, 0.2, 0.5, 0.62)
+        mppui_fill_ellipse(cx - s * 0.06, y + s * 0.74, s * 0.12, s * 0.12, argb)
+        if has("triangle") { L(0.5, 0.05, 0.95, 0.92); L(0.95, 0.92, 0.05, 0.92); L(0.05, 0.92, 0.5, 0.05) }
+    }
+    else if n.hasPrefix("envelope") {
+        mppui_stroke_rounded_rect(x + s * 0.1, y + s * 0.22, s * 0.8, s * 0.56, s * 0.06, lw, argb)
+        L(0.1, 0.25, 0.5, 0.55); L(0.5, 0.55, 0.9, 0.25)
+    }
+    else if n.hasPrefix("calendar") {
+        mppui_stroke_rounded_rect(x + s * 0.12, y + s * 0.18, s * 0.76, s * 0.68, s * 0.08, lw, argb)
+        L(0.12, 0.38, 0.88, 0.38); L(0.32, 0.1, 0.32, 0.24); L(0.68, 0.1, 0.68, 0.24)
+    }
+    else if n.hasPrefix("square.and.arrow.up") {
+        L(0.5, 0.1, 0.5, 0.6); L(0.35, 0.25, 0.5, 0.1); L(0.5, 0.1, 0.65, 0.25); L(0.3, 0.42, 0.2, 0.42)
+        L(0.2, 0.42, 0.2, 0.88); L(0.2, 0.88, 0.8, 0.88); L(0.8, 0.88, 0.8, 0.42); L(0.8, 0.42, 0.7, 0.42)
+    }
+    else if n.hasPrefix("bookmark") { L(0.28, 0.12, 0.72, 0.12); L(0.28, 0.12, 0.28, 0.88); L(0.72, 0.12, 0.72, 0.88); L(0.28, 0.88, 0.5, 0.7); L(0.5, 0.7, 0.72, 0.88) }
+    else if n.hasPrefix("chevron.right") { L(0.38, 0.2, 0.66, 0.5); L(0.66, 0.5, 0.38, 0.8) }
+    else if n.hasPrefix("chevron.left") { L(0.62, 0.2, 0.34, 0.5); L(0.34, 0.5, 0.62, 0.8) }
+    else if n.hasPrefix("arrow.right") { L(0.15, 0.5, 0.85, 0.5); L(0.6, 0.25, 0.85, 0.5); L(0.6, 0.75, 0.85, 0.5) }
+    else if n.hasPrefix("hourglass") { L(0.25, 0.15, 0.75, 0.15); L(0.25, 0.85, 0.75, 0.85); L(0.3, 0.15, 0.7, 0.85); L(0.7, 0.15, 0.3, 0.85) }
+    else if n.hasPrefix("sparkles") || n.hasPrefix("star") {
+        for k in 0 ..< 4 {
+            let a = Float(k) * Float.pi / 4
+            mppui_line(cx - cos(a) * s * 0.4, cy - sin(a) * s * 0.4, cx + cos(a) * s * 0.4, cy + sin(a) * s * 0.4, lw * (k % 2 == 1 ? 0.6 : 1), argb)
+        }
+    }
+    else if n.hasPrefix("circle") {
+        if has("fill") { mppui_fill_ellipse(x + s * 0.1, y + s * 0.1, s * 0.8, s * 0.8, argb) }
+        else { mppui_stroke_rounded_rect(x + s * 0.1, y + s * 0.1, s * 0.8, s * 0.8, s * 0.4, lw, argb) }
+    }
+    else if n.hasPrefix("gear") {
+        mppui_stroke_rounded_rect(x + s * 0.3, y + s * 0.3, s * 0.4, s * 0.4, s * 0.2, lw, argb)
+        for k in 0 ..< 8 {
+            let a = Float(k) * Float.pi / 4
+            L(0.5 + cos(a) * 0.3, 0.5 + sin(a) * 0.3, 0.5 + cos(a) * 0.45, 0.5 + sin(a) * 0.45)
+        }
+    }
+    else if n.hasPrefix("trash") {
+        L(0.2, 0.25, 0.8, 0.25); L(0.4, 0.15, 0.6, 0.15)
+        mppui_stroke_rounded_rect(x + s * 0.28, y + s * 0.3, s * 0.44, s * 0.55, s * 0.06, lw, argb)
+    }
+    else if n.hasPrefix("magnifyingglass") {
+        mppui_stroke_rounded_rect(x + s * 0.15, y + s * 0.15, s * 0.5, s * 0.5, s * 0.25, lw, argb)
+        L(0.58, 0.58, 0.85, 0.85)
+    }
+    else if n.hasPrefix("hand") || n.hasPrefix("person") {
+        mppui_fill_ellipse(x + s * 0.35, y + s * 0.12, s * 0.3, s * 0.3, argb)
+        mppui_fill_rounded_rect(x + s * 0.22, y + s * 0.5, s * 0.56, s * 0.38, s * 0.18, argb)
+    }
+    else {
+        mppui_stroke_rounded_rect(x + s * 0.15, y + s * 0.15, s * 0.7, s * 0.7, s * 0.15, lw, argb)   // unknown: outlined square
+    }
+}
+
+// MARK: - PNG (stored deflate blocks; no external libraries)
+
+let _crcTable: [UInt32] = (0 ..< 256).map { i -> UInt32 in
+    var c = UInt32(i)
+    for _ in 0 ..< 8 { c = c & 1 != 0 ? 0xEDB8_8320 ^ (c >> 1) : c >> 1 }
+    return c
+}
+
+func _crc(_ bytes: ArraySlice<UInt8>, _ start: UInt32 = 0xFFFF_FFFF) -> UInt32 {
+    var c = start
+    for b in bytes { c = _crcTable[Int((c ^ UInt32(b)) & 255)] ^ (c >> 8) }
+    return c
+}
+
+@discardableResult
+public func mppui_save_png(_ path: String) -> Int32 {
+    let w = _g.width, h = _g.height
+    var raw: [UInt8] = []
+    raw.reserveCapacity((w * 3 + 1) * h)
+    for y in 0 ..< h {
+        raw.append(0)
+        let row = _g.pixels + y * w
+        for x in 0 ..< w {
+            let p = row[x]
+            raw.append(UInt8((p >> 16) & 255)); raw.append(UInt8((p >> 8) & 255)); raw.append(UInt8(p & 255))
+        }
+    }
+    var z: [UInt8] = [0x78, 0x01]
+    var a: UInt32 = 1, b: UInt32 = 0
+    for v in raw { a = (a + UInt32(v)) % 65521; b = (b + a) % 65521 }
+    var off = 0
+    while off < raw.count {
+        let len = min(65535, raw.count - off)
+        z.append(off + len == raw.count ? 1 : 0)
+        z += [UInt8(len & 255), UInt8(len >> 8), UInt8(~len & 255), UInt8((~len >> 8) & 255)]
+        z += raw[off ..< off + len]
+        off += len
+    }
+    let adler = b << 16 | a
+    z += [UInt8(adler >> 24), UInt8((adler >> 16) & 255), UInt8((adler >> 8) & 255), UInt8(adler & 255)]
+
+    var file: [UInt8] = [137, 80, 78, 71, 13, 10, 26, 10]
+    func be32(_ v: UInt32) { file += [UInt8(v >> 24), UInt8((v >> 16) & 255), UInt8((v >> 8) & 255), UInt8(v & 255)] }
+    func chunk(_ type: String, _ data: [UInt8]) {
+        be32(UInt32(data.count))
+        let t = Array(type.utf8)
+        file += t
+        file += data
+        be32(_crc(data[...], _crc(t[...])) ^ 0xFFFF_FFFF)
+    }
+    chunk("IHDR", [UInt8(w >> 24), UInt8((w >> 16) & 255), UInt8((w >> 8) & 255), UInt8(w & 255),
+                   UInt8(h >> 24), UInt8((h >> 16) & 255), UInt8((h >> 8) & 255), UInt8(h & 255), 8, 2, 0, 0, 0])
+    chunk("IDAT", z)
+    chunk("IEND", [])
+    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    if fd < 0 { return -1 }
+    defer { close(fd) }
+    var written = 0
+    while written < file.count {
+        let n = file.withUnsafeBytes { write(fd, $0.baseAddress! + written, file.count - written) }
+        if n <= 0 { return -1 }
+        written += n
+    }
+    return 0
+}
+
+// MARK: - Paths
+
+/// Fills polygons (points in user space). Coverage: 4 sub-scanlines per
+/// pixel row, exact horizontal coverage at span ends.
+func _fillPolygons(_ polys: [[(Float, Float)]], _ argb: UInt32, evenOdd: Bool) {
+    let s = _g.scale
+    let (tx, ty) = _g.translate[_g.translate.count - 1]
+    struct Edge { var x0: Float, y0: Float, x1: Float, y1: Float, dir: Int }
+    var edges: [Edge] = []
+    var minY = Float.infinity, maxY = -Float.infinity, minX = Float.infinity, maxX = -Float.infinity
+    for poly in polys where poly.count >= 3 {
+        let n = poly.count
+        for i in 0 ..< n {
+            let ax = (poly[i].0 + tx) * s, ay = (poly[i].1 + ty) * s
+            let bx = (poly[(i + 1) % n].0 + tx) * s, by = (poly[(i + 1) % n].1 + ty) * s
+            minX = min(minX, ax); maxX = max(maxX, ax); minY = min(minY, ay); maxY = max(maxY, ay)
+            if ay == by || !ay.isFinite || !by.isFinite || !ax.isFinite || !bx.isFinite { continue }
+            edges.append(ay < by ? Edge(x0: ax, y0: ay, x1: bx, y1: by, dir: 1) : Edge(x0: bx, y0: by, x1: ax, y1: ay, dir: -1))
+        }
+    }
+    if edges.isEmpty { return }
+    var box = _Box(x0: _floor(minX), y0: _floor(minY), x1: _ceil(maxX), y1: _ceil(maxY))
+    _clip(&box)
+    if box.isEmpty { return }
+    let x0 = box.x0, x1 = box.x1
+    // Proven bounds: span ends a, b are clamped to [x0, x1], so every cover
+    // index (floor(a|b) - x0) is in 0...x1-x0; at most edges.count crossings
+    // per scanline. The buffers are sized for that once, up front.
+    let cover = UnsafeMutablePointer<Float>.allocate(capacity: x1 - x0 + 2)
+    let xs = UnsafeMutablePointer<(Float, Int)>.allocate(capacity: edges.count)
+    defer { cover.deallocate(); xs.deallocate() }
+    let sub = 4, op = _opacity, step: Float = 1 / Float(4)
+    let fx0 = Float(x0), fx1 = Float(x1)
+    for py in box.y0 ..< box.y1 {
+        cover.update(repeating: 0, count: x1 - x0 + 2)
+        var any = false
+        for k in 0 ..< sub {
+            let sy = Float(py) + (Float(k) + 0.5) * step
+            var n = 0
+            for e in edges where sy >= e.y0 && sy < e.y1 {
+                xs[n] = (e.x0 + (sy - e.y0) * (e.x1 - e.x0) / (e.y1 - e.y0), e.dir)
+                n &+= 1
+            }
+            if n < 2 { continue }
+            // Insertion sort: a scanline crosses only a few edges.
+            var i = 1
+            while i < n {
+                let v = xs[i]
+                var j = i &- 1
+                while j >= 0 && (xs[j].0 > v.0 || (xs[j].0 == v.0 && xs[j].1 > v.1)) { xs[j &+ 1] = xs[j]; j &-= 1 }
+                xs[j &+ 1] = v
+                i &+= 1
+            }
+            var wind = 0
+            for i in 0 ..< n - 1 {
+                wind &+= xs[i].1
+                let inside = evenOdd ? i % 2 == 0 : wind != 0
+                if !inside { continue }
+                let a = max(xs[i].0, fx0), b = min(xs[i &+ 1].0, fx1)
+                if a >= b { continue }
+                any = true
+                let ia = _floor(a), ib = _floor(b)
+                if ia == ib { cover[ia &- x0] += (b - a) * step; continue }
+                cover[ia &- x0] += (Float(ia) + 1 - a) * step
+                var c = ia &+ 1
+                while c < ib { cover[c &- x0] += step; c &+= 1 }
+                if ib < x1 { cover[ib &- x0] += (b - Float(ib)) * step }
+            }
+        }
+        if !any { continue }
+        let row = _g.pixels + py * _g.width
+        var px = x0
+        while px < x1 {
+            let cv = cover[px &- x0]
+            if cv > 0 { _blend(row + px, argb, min(cv, 1), op) }
+            px &+= 1
+        }
+    }
+}
+
+func _unpack(_ xy: UnsafePointer<Float>, _ sizes: UnsafePointer<Int32>, _ contours: Int) -> [[(Float, Float)]] {
+    var polys: [[(Float, Float)]] = []
+    var k = 0
+    for c in 0 ..< contours {
+        var p: [(Float, Float)] = []
+        for _ in 0 ..< Int(sizes[c]) { p.append((xy[2 * k], xy[2 * k + 1])); k += 1 }
+        polys.append(p)
+    }
+    return polys
+}
+
+/// `contours` polygons; sizes[i] points each, xy = x0,y0,x1,y1,... in order.
+public func mppui_fill_path(_ xy: UnsafePointer<Float>, _ sizes: UnsafePointer<Int32>, _ contours: Int32, _ argb: UInt32, _ evenOdd: Int32) {
+    _fillPolygons(_unpack(xy, sizes, Int(contours)), argb, evenOdd: evenOdd != 0)
+}
+
+public func mppui_stroke_path(_ xy: UnsafePointer<Float>, _ sizes: UnsafePointer<Int32>, _ closed: UnsafePointer<Int32>,
+                              _ contours: Int32, _ width: Float, _ argb: UInt32) {
+    let polys = _unpack(xy, sizes, Int(contours))
+    var shapes: [[(Float, Float)]] = []
+    let r = width / 2
+    func ccw(_ p: inout [(Float, Float)]) {
+        var a: Float = 0
+        for i in p.indices {
+            let u = p[i], v = p[(i + 1) % p.count]
+            a += u.0 * v.1 - v.0 * u.1
+        }
+        if a < 0 { p.reverse() }
+    }
+    for (c, p) in polys.enumerated() {
+        let n = p.count
+        let segs = closed[c] != 0 ? n : max(n - 1, 0)
+        for i in 0 ..< segs {
+            let a = p[i], b = p[(i + 1) % n]
+            let dx = b.0 - a.0, dy = b.1 - a.1, len = (dx * dx + dy * dy).squareRoot()
+            if len < 1e-6 { continue }
+            let nx = -dy / len * r, ny = dx / len * r
+            var q = [(a.0 + nx, a.1 + ny), (b.0 + nx, b.1 + ny), (b.0 - nx, b.1 - ny), (a.0 - nx, a.1 - ny)]
+            ccw(&q)
+            shapes.append(q)
+        }
+        // Round joins and caps.
+        if r > 0.75 {
+            for pt in p {
+                var circle: [(Float, Float)] = []
+                for k in 0 ..< 16 {
+                    let t = Float(k) * 2 * Float.pi / 16
+                    circle.append((pt.0 + r * cos(t), pt.1 + r * sin(t)))
+                }
+                ccw(&circle)
+                shapes.append(circle)
+            }
+        }
+    }
+    _fillPolygons(shapes, argb, evenOdd: false)
+}

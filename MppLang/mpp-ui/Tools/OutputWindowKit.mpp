@@ -1,0 +1,130 @@
+// Shows a program's output in a window, on MppUI's own engine (every platform).
+//
+// `mpp program.mpp "My Window"` builds program.mpp, then runs this viewer
+// as:  OutputWindowKit "My Window" /path/to/program [args...]
+// stdout and stderr stream into a scrolling, monospaced view that follows
+// the end of the output.
+
+import liquidglass
+import Dispatch
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
+/// Output collected on a reader thread; the UI picks it up while idle.
+final class OutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = ""
+    private var status: Int32? = nil
+    func append(_ s: String) { lock.lock(); pending += s; lock.unlock() }
+    func finish(_ code: Int32) { lock.lock(); status = code; lock.unlock() }
+    func take() -> (String, Int32?) { lock.lock(); defer { pending = ""; lock.unlock() }; return (pending, status) }
+}
+
+final class OutputModel: ObservableObject {
+    @Published var text = ""
+    @Published var exitStatus: Int32? = nil
+    let limit = 2_000_000
+    func append(_ chunk: String) {
+        text += chunk
+        if text.utf8.count > limit { text = String(text.suffix(limit / 2)) }
+    }
+}
+
+let args = CommandLine.arguments
+guard args.count >= 3 else {
+    let usage = "usage: OutputWindowKit <title> <program> [args...]\n"
+    _ = usage.withCString { write(2, $0, strlen($0)) }
+    exit(2)
+}
+let title = args[1]
+let programArgs = Array(args[2...])
+let model = OutputModel()
+let buffer = OutputBuffer()
+
+/// Starts the program with stdout+stderr on a pipe; returns (pid, read end).
+func launch(_ argv: [String]) -> (pid_t, Int32)? {
+    var fds: [Int32] = [-1, -1]
+    guard pipe(&fds) == 0 else { return nil }
+    #if canImport(Darwin)
+    var fa: posix_spawn_file_actions_t? = nil
+    #else
+    var fa = posix_spawn_file_actions_t()
+    #endif
+    posix_spawn_file_actions_init(&fa)
+    defer { posix_spawn_file_actions_destroy(&fa) }
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 1)
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 2)
+    posix_spawn_file_actions_addclose(&fa, fds[0])
+    posix_spawn_file_actions_addclose(&fa, fds[1])
+    let cargs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
+    defer { for p in cargs { free(p) } }
+    var pid: pid_t = 0
+    #if canImport(Darwin)
+    let rc = posix_spawn(&pid, argv[0], &fa, nil, cargs, nil)
+    #else
+    let rc = posix_spawn(&pid, argv[0], &fa, nil, cargs, environ)
+    #endif
+    close(fds[1])
+    guard rc == 0 else { close(fds[0]); return nil }
+    return (pid, fds[0])
+}
+
+if let (pid, fd) = launch(programArgs) {
+    DispatchQueue.global().async {
+        var buf = [UInt8](repeating: 0, count: 65536)
+        while true {
+            let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+            if n <= 0 { break }
+            buffer.append(String(decoding: buf[0 ..< n], as: UTF8.self))
+        }
+        close(fd)
+        var st: Int32 = 0
+        waitpid(pid, &st, 0)
+        buffer.finish((st & 0x7F) == 0 ? (st >> 8) & 0xFF : 128 + (st & 0x7F))
+    }
+} else {
+    model.append("could not start \(programArgs[0])\n")
+    model.exitStatus = 127
+}
+
+// The app loop asks for new output whenever it's idle.
+_mppUIRefresh = {
+    let (chunk, status) = buffer.take()
+    if !chunk.isEmpty { model.append(chunk) }
+    if let status, model.exitStatus != status { model.exitStatus = status; return true }
+    return !chunk.isEmpty
+}
+
+struct OutputView: View {
+    @ObservedObject var model: OutputModel
+
+    var statusText: String {
+        guard let s = model.exitStatus else { return "running…" }
+        return s == 0 ? "finished" : "exited with status \(s)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ScrollView {
+                Text(model.text.isEmpty ? " " : model.text)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
+            }
+            .defaultScrollAnchor(.bottom)
+            .mppSurface(cornerRadius: 16)
+            Bar {
+                Image(systemName: model.exitStatus == nil ? "hourglass" : (model.exitStatus == 0 ? "checkmark.circle" : "xmark.octagon"))
+                Text(statusText)
+                Spacer()
+                Text(programArgs[0].split(separator: "/").last.map(String.init) ?? "").foregroundStyle(.secondary)
+            }
+        }
+        .padding(16)
+    }
+}
+
+app(title, width: 760, height: 520) { OutputView(model: model) }

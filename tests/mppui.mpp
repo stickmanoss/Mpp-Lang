@@ -1,0 +1,50 @@
+// MppUI's own engine, driven headless: state, bindings, controls, overlays.
+// (On macOS `import MppUI` is SwiftUI; this test uses the engine everywhere.)
+import MppUIKit
+#if canImport(Glibc)
+import Glibc
+#else
+import Darwin
+#endif
+
+nonisolated(unsafe) var log: [String] = []
+
+struct TestView: View {
+    @State var count = 0
+    @State var on = false
+    @State var name = ""
+    @State var flavor = "Mint"
+    @State var showAlert = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button("Add") { count += 1 }
+            Toggle("On", isOn: $on)
+            TextField("Name", text: $name)
+            Picker("Flavor", selection: $flavor) {
+                Text("Mint").tag("Mint"); Text("Lemon").tag("Lemon")
+            }
+            .pickerStyle(.segmented)
+            Button("Alert") { showAlert = true }
+            Text("count \(count) on \(on) name \(name) flavor \(flavor)")
+                .onChange(of: count) { _, new in log.append("count=\(new)") }
+                .onChange(of: flavor) { _, new in log.append("flavor=\(new)") }
+                .onChange(of: name) { _, new in if new == "Omar" { log.append("name=Omar") } }
+        }
+        .frame(width: 300, alignment: .leading)
+        .alert("Sure?", isPresented: $showAlert) { Button("OK") { log.append("ok") } }
+    }
+}
+
+let png = "/tmp/mppui-test-\(getpid()).png"
+setenv("MPP_UI_HEADLESS", png, 1)
+if getenv("MPP_UI_SCRIPT") == nil { setenv("MPP_UI_SCRIPT", "click 22 34; click 22 34; click 8 63; click 100 93; type Omar; click 138 126; click 26 158; click 150 129", 1) }
+onAppClose = {
+    if getenv("MPPUI_KEEP_PNG") == nil { unlink(png) }
+    let want = ["count=1", "count=2", "name=Omar", "flavor=Lemon", "ok"]
+    guard log == want else {
+        print("FAIL: log \(log), expected \(want)")
+        exit(1)
+    }
+    print("MppUI: ok")
+}
+app("Test", width: 300, height: 220) { TestView() }

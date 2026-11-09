@@ -1,0 +1,116 @@
+// MppKit — Ranges: range-v3 style algorithms on any Sequence/Collection.
+//
+//   [1, 2, 3, 4, 5].chunks(of: 2)          // [[1, 2], [3, 4], [5]]
+//   [1, 2, 3, 4].windows(of: 3)            // [[1, 2, 3], [2, 3, 4]]
+//   [1, 2, 3].adjacentPairs()              // [(1, 2), (2, 3)]
+//   cartesianProduct([1, 2], ["a", "b"])   // [(1, "a"), (1, "b"), (2, "a"), (2, "b")]
+//   [3, 1, 3, 2].uniqued()                 // [3, 1, 2]
+//   ["a", "b"].interspersed(with: ",")     // ["a", ",", "b"]
+//   [1, 2, 3].sum(), [1, 2, 3].product()
+//   people.sorted(by: \.age), people.min(by: \.age)
+//   (1...).lazy.map { $0 * $0 }.prefix(5)  // Swift's lazy views already cover views::
+
+extension Collection {
+    /// Consecutive slices of `size` elements (the last may be shorter).
+    public func chunks(of size: Int) -> [SubSequence] {
+        precondition(size > 0, "chunks(of:) needs a positive size")
+        var out: [SubSequence] = []
+        var i = startIndex
+        while i != endIndex {
+            let j = index(i, offsetBy: size, limitedBy: endIndex) ?? endIndex
+            out.append(self[i ..< j])
+            i = j
+        }
+        return out
+    }
+
+    /// Every run of `size` consecutive elements (sliding window).
+    public func windows(of size: Int) -> [SubSequence] {
+        precondition(size > 0, "windows(of:) needs a positive size")
+        guard count >= size else { return [] }
+        var out: [SubSequence] = []
+        var i = startIndex
+        var j = index(startIndex, offsetBy: size)
+        while true {
+            out.append(self[i ..< j])
+            if j == endIndex { break }
+            i = index(after: i)
+            j = index(after: j)
+        }
+        return out
+    }
+}
+
+extension Sequence {
+    public func adjacentPairs() -> [(Element, Element)] {
+        var out: [(Element, Element)] = []
+        var it = makeIterator()
+        guard var prev = it.next() else { return out }
+        while let x = it.next() { out.append((prev, x)); prev = x }
+        return out
+    }
+
+    public func interspersed(with separator: Element) -> [Element] {
+        var out: [Element] = []
+        for (k, x) in enumerated() {
+            if k > 0 { out.append(separator) }
+            out.append(x)
+        }
+        return out
+    }
+
+    /// First occurrence of each element, in order.
+    public func uniqued() -> [Element] where Element: Hashable {
+        var seen = MppSet<Element>()
+        return filter { seen.insert($0) }
+    }
+
+    public func sorted<K: Comparable>(by key: (Element) throws -> K) rethrows -> [Element] {
+        try map { (try key($0), $0) }.sorted { $0.0 < $1.0 }.map(\.1)
+    }
+    public func min<K: Comparable>(by key: (Element) throws -> K) rethrows -> Element? {
+        try self.min { try key($0) < key($1) }
+    }
+    public func max<K: Comparable>(by key: (Element) throws -> K) rethrows -> Element? {
+        try self.max { try key($0) < key($1) }
+    }
+
+    /// Groups elements by a key, keeping first-seen key order.
+    public func grouped<K: Hashable>(by key: (Element) throws -> K) rethrows -> [(key: K, values: [Element])] {
+        var index = MppDictionary<K, Int>()
+        var out: [(key: K, values: [Element])] = []
+        for x in self {
+            let k = try key(x)
+            if let i = index[k] { out[i].values.append(x) }
+            else { index[k] = out.count; out.append((k, [x])) }
+        }
+        return out
+    }
+
+    /// Running totals (std::partial_sum / std::inclusive_scan).
+    public func scan<R>(_ initial: R, _ next: (R, Element) throws -> R) rethrows -> [R] {
+        var acc = initial
+        return try map { acc = try next(acc, $0); return acc }
+    }
+}
+
+extension Sequence where Element: AdditiveArithmetic {
+    public func sum() -> Element { reduce(.zero, +) }
+}
+
+extension Sequence where Element: Numeric {
+    public func product() -> Element { reduce(1, *) }
+}
+
+public func cartesianProduct<A: Sequence, B: Collection>(_ a: A, _ b: B) -> [(A.Element, B.Element)] {
+    var out: [(A.Element, B.Element)] = []
+    for x in a { for y in b { out.append((x, y)) } }
+    return out
+}
+
+public func zip3<A: Sequence, B: Sequence, C: Sequence>(_ a: A, _ b: B, _ c: C) -> [(A.Element, B.Element, C.Element)] {
+    var ia = a.makeIterator(), ib = b.makeIterator(), ic = c.makeIterator()
+    var out: [(A.Element, B.Element, C.Element)] = []
+    while let x = ia.next(), let y = ib.next(), let z = ic.next() { out.append((x, y, z)) }
+    return out
+}

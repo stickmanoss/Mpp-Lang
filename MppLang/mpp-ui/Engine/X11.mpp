@@ -1,0 +1,260 @@
+// MppUI engine — X11 window backend (Linux and other X11 systems), in M++.
+//
+// Xlib is loaded at run time (dlopen), so programs build and run headless
+// on machines without X11 installed; a window needs libX11.so and a
+// DISPLAY. The few Xlib layouts used here are those of the LP64 ABI
+// (64-bit Linux/BSD), the only one M++ targets.
+
+#if !canImport(Darwin)
+
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+/// macOS draws with its own font; elsewhere the embedded atlases are used.
+func _backendFont(_ which: Int) -> _Font? { nil }
+
+// Xlib constants (X.h, keysymdef.h).
+let _xKeyPress: Int32 = 2, _xButtonPress: Int32 = 4, _xButtonRelease: Int32 = 5, _xMotionNotify: Int32 = 6
+let _xExpose: Int32 = 12, _xConfigureNotify: Int32 = 22, _xClientMessage: Int32 = 33
+let _xEventMask = 1 << 0 | 1 << 2 | 1 << 3 | 1 << 6 | 1 << 15 | 1 << 17   // key press, buttons, motion, exposure, structure
+let _xZPixmap: Int32 = 2
+
+typealias _XDisplay = OpaquePointer
+typealias _XID = UInt
+
+/// The Xlib functions, looked up by name.
+struct _X11 {
+    var lib: UnsafeMutableRawPointer
+    var openDisplay: @convention(c) (UnsafePointer<CChar>?) -> _XDisplay?
+    var closeDisplay: @convention(c) (_XDisplay) -> Int32
+    var defaultScreen: @convention(c) (_XDisplay) -> Int32
+    var rootWindow: @convention(c) (_XDisplay, Int32) -> _XID
+    var defaultVisual: @convention(c) (_XDisplay, Int32) -> OpaquePointer?
+    var defaultDepth: @convention(c) (_XDisplay, Int32) -> Int32
+    var createSimpleWindow: @convention(c) (_XDisplay, _XID, Int32, Int32, UInt32, UInt32, UInt32, UInt, UInt) -> _XID
+    var storeName: @convention(c) (_XDisplay, _XID, UnsafePointer<CChar>) -> Int32
+    var selectInput: @convention(c) (_XDisplay, _XID, Int) -> Int32
+    var mapWindow: @convention(c) (_XDisplay, _XID) -> Int32
+    var internAtom: @convention(c) (_XDisplay, UnsafePointer<CChar>, Int32) -> _XID
+    var setWMProtocols: @convention(c) (_XDisplay, _XID, UnsafeMutablePointer<_XID>, Int32) -> Int32
+    var pending: @convention(c) (_XDisplay) -> Int32
+    var nextEvent: @convention(c) (_XDisplay, UnsafeMutableRawPointer) -> Int32
+    var createImage: @convention(c) (_XDisplay, OpaquePointer?, UInt32, Int32, Int32, UnsafeMutableRawPointer?, UInt32, UInt32, Int32, Int32) -> UnsafeMutableRawPointer?
+    var destroyImage: @convention(c) (UnsafeMutableRawPointer) -> Int32
+    var putImage: @convention(c) (_XDisplay, _XID, OpaquePointer?, UnsafeMutableRawPointer, Int32, Int32, Int32, Int32, UInt32, UInt32) -> Int32
+    var createGC: @convention(c) (_XDisplay, _XID, UInt, UnsafeMutableRawPointer?) -> OpaquePointer?
+    var freeGC: @convention(c) (_XDisplay, OpaquePointer?) -> Int32
+    var flush: @convention(c) (_XDisplay) -> Int32
+    var lookupString: @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<CChar>, Int32, UnsafeMutablePointer<UInt>, UnsafeMutableRawPointer?) -> Int32
+    var destroyWindow: @convention(c) (_XDisplay, _XID) -> Int32
+    var connectionNumber: @convention(c) (_XDisplay) -> Int32
+
+    static func load() -> _X11? {
+        guard let lib = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL) ?? dlopen("libX11.so", RTLD_NOW | RTLD_LOCAL) else { return nil }
+        var missing = false
+        func sym<F>(_ name: String, _ type: F.Type) -> F {
+            guard let p = dlsym(lib, name) else {
+                missing = true
+                return unsafeBitCast(dlsym(lib, "XFlush"), to: F.self)       // placeholder, never called
+            }
+            return unsafeBitCast(p, to: F.self)
+        }
+        let x = _X11(
+            lib: lib,
+            openDisplay: sym("XOpenDisplay", (@convention(c) (UnsafePointer<CChar>?) -> _XDisplay?).self),
+            closeDisplay: sym("XCloseDisplay", (@convention(c) (_XDisplay) -> Int32).self),
+            defaultScreen: sym("XDefaultScreen", (@convention(c) (_XDisplay) -> Int32).self),
+            rootWindow: sym("XRootWindow", (@convention(c) (_XDisplay, Int32) -> _XID).self),
+            defaultVisual: sym("XDefaultVisual", (@convention(c) (_XDisplay, Int32) -> OpaquePointer?).self),
+            defaultDepth: sym("XDefaultDepth", (@convention(c) (_XDisplay, Int32) -> Int32).self),
+            createSimpleWindow: sym("XCreateSimpleWindow", (@convention(c) (_XDisplay, _XID, Int32, Int32, UInt32, UInt32, UInt32, UInt, UInt) -> _XID).self),
+            storeName: sym("XStoreName", (@convention(c) (_XDisplay, _XID, UnsafePointer<CChar>) -> Int32).self),
+            selectInput: sym("XSelectInput", (@convention(c) (_XDisplay, _XID, Int) -> Int32).self),
+            mapWindow: sym("XMapWindow", (@convention(c) (_XDisplay, _XID) -> Int32).self),
+            internAtom: sym("XInternAtom", (@convention(c) (_XDisplay, UnsafePointer<CChar>, Int32) -> _XID).self),
+            setWMProtocols: sym("XSetWMProtocols", (@convention(c) (_XDisplay, _XID, UnsafeMutablePointer<_XID>, Int32) -> Int32).self),
+            pending: sym("XPending", (@convention(c) (_XDisplay) -> Int32).self),
+            nextEvent: sym("XNextEvent", (@convention(c) (_XDisplay, UnsafeMutableRawPointer) -> Int32).self),
+            createImage: sym("XCreateImage", (@convention(c) (_XDisplay, OpaquePointer?, UInt32, Int32, Int32, UnsafeMutableRawPointer?, UInt32, UInt32, Int32, Int32) -> UnsafeMutableRawPointer?).self),
+            destroyImage: sym("XDestroyImage", (@convention(c) (UnsafeMutableRawPointer) -> Int32).self),
+            putImage: sym("XPutImage", (@convention(c) (_XDisplay, _XID, OpaquePointer?, UnsafeMutableRawPointer, Int32, Int32, Int32, Int32, UInt32, UInt32) -> Int32).self),
+            createGC: sym("XCreateGC", (@convention(c) (_XDisplay, _XID, UInt, UnsafeMutableRawPointer?) -> OpaquePointer?).self),
+            freeGC: sym("XFreeGC", (@convention(c) (_XDisplay, OpaquePointer?) -> Int32).self),
+            flush: sym("XFlush", (@convention(c) (_XDisplay) -> Int32).self),
+            lookupString: sym("XLookupString", (@convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<CChar>, Int32, UnsafeMutablePointer<UInt>, UnsafeMutableRawPointer?) -> Int32).self),
+            destroyWindow: sym("XDestroyWindow", (@convention(c) (_XDisplay, _XID) -> Int32).self),
+            connectionNumber: sym("XConnectionNumber", (@convention(c) (_XDisplay) -> Int32).self))
+        return missing ? nil : x
+    }
+}
+
+/// The open window.
+final class _X11Window {
+    var x: _X11
+    var display: _XDisplay
+    var window: _XID = 0
+    var gc: OpaquePointer? = nil
+    var wmDelete: _XID = 0
+    var image: UnsafeMutableRawPointer? = nil
+    var imageWidth = 0, imageHeight = 0, imagePixels: UnsafeMutablePointer<UInt32>? = nil
+
+    init(_ x: _X11, _ display: _XDisplay) { self.x = x; self.display = display }
+
+    /// XImage.data is at offset 16 (after width, height, xoffset, format).
+    func detachImageData() {
+        if let image { image.storeBytes(of: nil, toByteOffset: 16, as: UnsafeMutableRawPointer?.self) }
+    }
+
+    func makeImage() {
+        if image != nil && imageWidth == _g.width && imageHeight == _g.height && imagePixels == _g.pixels { return }
+        if let old = image { detachImageData(); _ = x.destroyImage(old) }
+        let screen = x.defaultScreen(display)
+        image = x.createImage(display, x.defaultVisual(display, screen), UInt32(x.defaultDepth(display, screen)), _xZPixmap, 0,
+                              UnsafeMutableRawPointer(_g.pixels), UInt32(_g.width), UInt32(_g.height), 32, Int32(_g.width * 4))
+        imageWidth = _g.width
+        imageHeight = _g.height
+        imagePixels = _g.pixels
+    }
+}
+
+nonisolated(unsafe) var _x11: _X11Window? = nil
+
+func _backendOpen(_ title: String, _ width: Int, _ height: Int) -> Int32 {
+    guard let x = _X11.load() else {
+        return _g.fail("libX11 is not installed (set MPP_UI_HEADLESS=out.png to render to a file)")
+    }
+    guard let display = x.openDisplay(nil) else {
+        return _g.fail("cannot open the X display (is DISPLAY set?); set MPP_UI_HEADLESS=out.png to render to a file")
+    }
+    let w = _X11Window(x, display)
+    let screen = x.defaultScreen(display)
+    w.window = x.createSimpleWindow(display, x.rootWindow(display, screen), 0, 0, UInt32(max(width, 1)), UInt32(max(height, 1)), 0, 0, 0xFFFFFF)
+    _ = x.storeName(display, w.window, title)
+    _ = x.selectInput(display, w.window, _xEventMask)
+    w.wmDelete = x.internAtom(display, "WM_DELETE_WINDOW", 0)
+    _ = x.setWMProtocols(display, w.window, &w.wmDelete, 1)
+    w.gc = x.createGC(display, w.window, 0, nil)
+    _ = x.mapWindow(display, w.window)
+    _ = x.flush(display)
+    _x11 = w
+    _g.resize(_int(Float(width) * _g.scale), _int(Float(height) * _g.scale))
+    return 0
+}
+
+func _backendSetTitle(_ title: String) {
+    guard let w = _x11 else { return }
+    _ = w.x.storeName(w.display, w.window, title)
+    _ = w.x.flush(w.display)
+}
+
+func _backendPresent() {
+    guard let w = _x11 else { return }
+    w.makeImage()
+    guard let image = w.image else { return }
+    _ = w.x.putImage(w.display, w.window, w.gc, image, 0, 0, 0, 0, UInt32(_g.width), UInt32(_g.height))
+    _ = w.x.flush(w.display)
+}
+
+func _backendNextEvent(_ e: UnsafeMutablePointer<MppUIEvent>, _ timeoutMs: Int) -> Int32 {
+    guard let w = _x11 else { return 0 }
+    let x = w.x, d = w.display
+    if x.pending(d) == 0 {
+        var p = pollfd(fd: x.connectionNumber(d), events: Int16(POLLIN), revents: 0)
+        if poll(&p, 1, Int32(timeoutMs)) <= 0 { return 0 }
+    }
+    // XEvent is a 192-byte union (24 longs).
+    let ev = UnsafeMutableRawPointer.allocate(byteCount: 192, alignment: 8)
+    defer { ev.deallocate() }
+    let s = _g.scale
+    while x.pending(d) != 0 {
+        _ = x.nextEvent(d, ev)
+        let type = ev.load(as: Int32.self)
+        switch type {
+        case _xExpose:
+            e.pointee = MppUIEvent(MPPUI_EVENT_EXPOSE)
+            return 1
+        case _xConfigureNotify:
+            // XConfigureEvent: width at 56, height at 60.
+            let cw = Int(ev.load(fromByteOffset: 56, as: Int32.self)), ch = Int(ev.load(fromByteOffset: 60, as: Int32.self))
+            let pw = _int(Float(cw) * s), ph = _int(Float(ch) * s)
+            if pw != _g.width || ph != _g.height {
+                _g.resize(pw, ph)
+                e.pointee = MppUIEvent(MPPUI_EVENT_RESIZE)
+                return 1
+            }
+        case _xClientMessage:
+            // XClientMessageEvent: data.l[0] at 56.
+            if UInt(bitPattern: ev.load(fromByteOffset: 56, as: Int.self)) == w.wmDelete {
+                e.pointee = MppUIEvent(MPPUI_EVENT_CLOSE)
+                return 1
+            }
+        case _xButtonPress, _xButtonRelease:
+            // XButtonEvent: x at 64, y at 68, state at 80, button at 84.
+            e.pointee.x = Float(ev.load(fromByteOffset: 64, as: Int32.self)) / s
+            e.pointee.y = Float(ev.load(fromByteOffset: 68, as: Int32.self)) / s
+            let button = ev.load(fromByteOffset: 84, as: UInt32.self)
+            if button == 4 || button == 5 {
+                if type == _xButtonRelease { continue }
+                e.pointee.type = Int32(MPPUI_EVENT_SCROLL.rawValue)
+                e.pointee.dy = button == 4 ? 40 : -40
+                return 1
+            }
+            if button != 1 { continue }
+            e.pointee.type = Int32((type == _xButtonPress ? MPPUI_EVENT_MOUSE_DOWN : MPPUI_EVENT_MOUSE_UP).rawValue)
+            return 1
+        case _xMotionNotify:
+            e.pointee.type = Int32(MPPUI_EVENT_MOUSE_MOVE.rawValue)
+            e.pointee.x = Float(ev.load(fromByteOffset: 64, as: Int32.self)) / s
+            e.pointee.y = Float(ev.load(fromByteOffset: 68, as: Int32.self)) / s
+            return 1
+        case _xKeyPress:
+            var buf = [CChar](repeating: 0, count: 16)
+            var keysym: UInt = 0
+            let n = Int(x.lookupString(ev, &buf, 15, &keysym, nil))
+            let state = ev.load(fromByteOffset: 80, as: UInt32.self)
+            e.pointee.modifiers = (state & 1 != 0 ? 1 : 0) | (state & 4 != 0 ? 2 : 0) | (state & 8 != 0 ? 4 : 0)
+            let key: MppUIKey
+            switch keysym {
+            case 0xFF08: key = MPPUI_KEY_BACKSPACE
+            case 0xFFFF: key = MPPUI_KEY_DELETE
+            case 0xFF0D, 0xFF8D: key = MPPUI_KEY_RETURN
+            case 0xFF09: key = MPPUI_KEY_TAB
+            case 0xFF1B: key = MPPUI_KEY_ESCAPE
+            case 0xFF51: key = MPPUI_KEY_LEFT
+            case 0xFF53: key = MPPUI_KEY_RIGHT
+            case 0xFF52: key = MPPUI_KEY_UP
+            case 0xFF54: key = MPPUI_KEY_DOWN
+            case 0xFF50: key = MPPUI_KEY_HOME
+            case 0xFF57: key = MPPUI_KEY_END
+            default: key = MPPUI_KEY_OTHER
+            }
+            if key != MPPUI_KEY_OTHER {
+                e.pointee.type = Int32(MPPUI_EVENT_KEY.rawValue)
+                e.pointee.key = Int32(key.rawValue)
+                return 1
+            }
+            if n > 0 && UInt8(bitPattern: buf[0]) >= 32 && e.pointee.modifiers & 2 == 0 {
+                e.pointee.type = Int32(MPPUI_EVENT_TEXT.rawValue)
+                e.pointee.setText(buf[0 ..< min(n, 15)].map { UInt8(bitPattern: $0) })
+                return 1
+            }
+        default:
+            break
+        }
+    }
+    return 0
+}
+
+func _backendClose() {
+    guard let w = _x11 else { return }
+    if let image = w.image { w.detachImageData(); _ = w.x.destroyImage(image); w.image = nil }
+    _ = w.x.freeGC(w.display, w.gc)
+    _ = w.x.destroyWindow(w.display, w.window)
+    _ = w.x.closeDisplay(w.display)
+    _x11 = nil
+}
+
+#endif

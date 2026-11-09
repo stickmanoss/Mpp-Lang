@@ -1,0 +1,50 @@
+// Placement construction in M++: `place <destination> Type(args)`.
+
+final class Tracker {
+    let name: String
+    init(_ name: String) { self.name = name; print("  init \(name)") }
+    deinit { print("  deinit \(name)") }
+}
+
+struct Point { var x: Double; var y: Double }
+
+// 1. Into raw memory you own (C++: new (buf) Point(1, 2)).
+let raw = UnsafeMutableRawPointer.allocate(byteCount: 64, alignment: 16)
+let p = place raw Point(x: 1, y: 2)
+p.pointee.x += 10
+print("point:", p.pointee)
+
+// 2. Explicit destruction, then reuse the same bytes for another type.
+print("tracker in the same storage:")
+unplace p
+let t = place raw Tracker("first")
+unplace t                        // runs deinit now (C++: t->~Tracker())
+raw.deallocate()
+
+// 3. Into an arena: thousands of objects, one free.
+let arena = Arena()
+var nodes: [UnsafeMutablePointer<Point>] = []
+for i in 0..<10_000 {
+    nodes.append(place arena Point(x: Double(i), y: Double(i * 2)))
+}
+print("arena holds \(nodes.count) points in \(arena.bytesAllocated) bytes; last =", nodes.last!.pointee)
+
+// 4. Into a pool, with checked release.
+let pool = Pool<Tracker>(capacity: 2)
+print("pool:")
+let a = place pool Tracker("a")
+let b = place pool Tracker("b")
+print("  pool full:", pool.isFull)
+pool.release(a)
+let c = place pool Tracker("c")
+print("  reused slot:", a == c, "-", b.pointee.name, c.pointee.name)
+
+// 5. On the stack.
+Memory.withStackBytes(32) { bytes in
+    let q = place bytes Point(x: 3, y: 4)
+    print("stack point length:", (q.pointee.x * q.pointee.x + q.pointee.y * q.pointee.y).squareRoot())
+}
+
+// 6. `place` is contextual, so it still works as a normal name.
+let place = "Mansfield"
+print("place is still an identifier:", place)

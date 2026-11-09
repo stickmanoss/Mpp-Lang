@@ -1,0 +1,655 @@
+// MppPM (mpp pm) — commands and the target build graph.
+//
+// Package layout (as in SwiftPM):
+//   Package.mpp              manifest (import PackageDescription)
+//   Package.resolved         pinned versions of remote dependencies (commit it)
+//   Sources/<Target>/*.mpp   one directory per target
+//   Tests/<Target>/*.mpp     test targets; functions named test...() are tests
+//   .build/                  checkouts and build output (don't commit)
+
+import MppKit
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+let libUsage = """
+MppPM (mpp pm) — the M++ package manager
+
+usage: mpp pm <command> [options]
+
+  init [--type library|executable|empty] [--name <name>]
+                              create a package in the current directory
+  build [-c debug|release] [--product <p>] [--target <t>] [--build-tests]
+  run [-c debug|release] [<product>] [-- <args>...]
+  test [-c debug|release] [--filter <text>]
+  add-dependency <url|path> [--from <v> | --exact <v> | --up-to-next-minor-from <v>
+                             | --branch <b> | --revision <r>]
+  resolve [--only-use-versions-from-resolved-file]
+  update [<package>...]       move dependencies to the newest allowed versions
+  show-dependencies [--format text|json]
+  dump-package                print the evaluated manifest as JSON
+  clean                       delete build output (keeps checkouts)
+  reset                       delete .build entirely
+
+global options:
+  --package-path <dir>        operate on the package in <dir>
+
+"""
+
+struct Arguments {
+    var values: [String]
+    mutating func flag(_ f: String) -> Bool {
+        guard let i = values.firstIndex(of: f) else { return false }
+        values.remove(at: i)
+        return true
+    }
+    mutating func option(_ name: String, _ alias: String? = nil) throws(DriverError) -> String? {
+        for (i, v) in values.enumerated() {
+            if v == name || v == alias {
+                guard i + 1 < values.count else { throw DriverError("\(name) needs a value") }
+                let value = values[i + 1]
+                values.removeSubrange(i ... i + 1)
+                return value
+            }
+            if v.hasPrefix(name + "=") {
+                values.remove(at: i)
+                return String(v.dropFirst(name.count + 1))
+            }
+        }
+        return nil
+    }
+    mutating func release() throws(DriverError) -> Bool {
+        switch try option("-c", "--configuration") {
+        case nil, "debug"?: return false
+        case "release"?: return true
+        case let c?: throw DriverError("unknown configuration '\(c)' (use debug or release)")
+        }
+    }
+    func done() throws(DriverError) {
+        if let v = values.first { throw DriverError("unexpected argument '\(v)' (see `mpp pm --help`)") }
+    }
+}
+
+// MARK: - Build graph
+
+final class Workspace {
+    struct Node {
+        var name: String
+        var decl: TargetDecl
+        var manifest: Manifest
+        var package: String
+        var dir: String
+        var deps: [String] = []
+    }
+
+    let root: String
+    let graph: Graph
+    let release: Bool
+    let out: String
+    var nodes: [String: Node] = [:]
+    var manifests: [String: Manifest] = [:]
+    var binaries: [String: String] = [:]
+
+    init(root: String, graph: Graph, release: Bool) throws(DriverError) {
+        self.root = root
+        self.graph = graph
+        self.release = release
+        out = Path.join(root, ".build", release ? "release" : "debug")
+        try add(graph.root.name.lowercased(), graph.root)
+        for (id, p) in graph.packages.sorted(by: { $0.key < $1.key }) { try add(id, p.manifest) }
+        for name in nodes.keys.sorted() { try link(name) }
+    }
+
+    var rootIdentity: String { graph.root.name.lowercased() }
+
+    func add(_ id: String, _ m: Manifest) throws(DriverError) {
+        for t in m.targets {
+            if let existing = nodes[t.name] {
+                throw DriverError("multiple targets named '\(t.name)' (in packages '\(existing.package)' and '\(id)'); target names must be unique")
+            }
+            let dir = t.path.map { Path.absolute($0, relativeTo: m.root) }
+                ?? Path.join(m.root, t.kind == .test ? "Tests" : "Sources", t.name)
+            nodes[t.name] = Node(name: t.name, decl: t, manifest: m, package: id, dir: dir)
+        }
+        manifests[id] = m
+    }
+
+    func dependencyPackage(_ from: Manifest, _ package: String) -> Manifest? {
+        let want = package.lowercased()
+        for d in from.dependencies {
+            if let m = manifests[d.identity], d.identity == want || m.name.lowercased() == want { return m }
+        }
+        return nil
+    }
+
+    func link(_ name: String) throws(DriverError) {
+        var n = nodes[name]!
+        let m = n.manifest
+        func addProduct(_ p: ProductDecl) throws(DriverError) {
+            if p.executable {
+                throw DriverError("target '\(n.name)' depends on executable product '\(p.name)'; only library products can be dependencies")
+            }
+            n.deps += p.targets
+        }
+        for d in n.decl.deps {
+            switch d {
+            case .target(let t):
+                guard m.target(t) != nil else { throw DriverError("target '\(n.name)' depends on unknown target '\(t)'") }
+                n.deps.append(t)
+            case .product(let p, let pkg):
+                guard let dm = dependencyPackage(m, pkg) else {
+                    throw DriverError("target '\(n.name)' uses product '\(p)' from package '\(pkg)', which is not a dependency of '\(m.name)'")
+                }
+                guard let prod = dm.product(p) else { throw DriverError("package '\(pkg)' has no product named '\(p)'") }
+                try addProduct(prod)
+            case .byName(let x):
+                if m.target(x) != nil { n.deps.append(x); continue }
+                var found = false
+                for dep in m.dependencies {
+                    if let dm = manifests[dep.identity], let prod = dm.product(x) { try addProduct(prod); found = true; break }
+                }
+                if !found {
+                    throw DriverError("target '\(n.name)' depends on '\(x)', which is neither a target in '\(m.name)' nor a product of its dependencies")
+                }
+            }
+        }
+        for d in n.deps where nodes[d]?.decl.kind != .regular {
+            throw DriverError("target '\(n.name)' depends on '\(d)', which is not a library target")
+        }
+        nodes[name] = n
+    }
+
+    /// Transitive library dependencies, dependents first (static link order).
+    func linkOrder(_ n: Node) -> [String] {
+        var post: [String] = []
+        var seen = Set<String>()
+        func walk(_ x: String) {
+            guard seen.insert(x).inserted else { return }
+            for d in nodes[x]!.deps { walk(d) }
+            post.append(x)
+        }
+        for d in n.deps { walk(d) }
+        return post.reversed()
+    }
+
+    func sources(_ n: Node) -> [String] {
+        guard Files.isDirectory(n.dir) else { return [] }
+        // .mppgnore files from the package root down to the target's folder.
+        var ignore = MppIgnore()
+        var chain: [String] = []
+        var d = Path.dirname(n.dir)
+        while true {
+            chain.append(d)
+            if Files.exists(Path.join(d, "Package.mpp")) || Path.dirname(d) == d { break }
+            d = Path.dirname(d)
+        }
+        for dir in chain.reversed() { ignore.load(dir) }
+        return Files.walk(n.dir, extensions: [".mpp", ".swift"],
+                          excluded: Set(n.decl.exclude.map { Path.absolute($0, relativeTo: n.dir) }), ignore: ignore)
+    }
+
+    func productName(_ n: Node) -> String {
+        if n.package == rootIdentity {
+            for p in graph.root.products where p.executable && p.targets.contains(n.name) { return p.name }
+        }
+        return n.name
+    }
+
+    var executableProducts: [String] {
+        var out = graph.root.products.filter(\.executable).map(\.name)
+        for t in graph.root.targets where t.kind == .executable
+            && !graph.root.products.contains(where: { $0.executable && $0.targets.contains(t.name) }) {
+            out.append(t.name)
+        }
+        return out
+    }
+
+    func executableTarget(forProduct product: String) throws(DriverError) -> String {
+        if let p = graph.root.product(product) {
+            for t in p.targets where graph.root.target(t)?.kind == .executable { return t }
+            throw DriverError("product '\(product)' has no executable target")
+        }
+        if graph.root.target(product)?.kind == .executable { return product }
+        throw DriverError("no executable product named '\(product)'")
+    }
+
+    func rootTargets(tests: Bool) -> [String] {
+        graph.root.targets.filter { ($0.kind == .test) == tests }.map(\.name)
+    }
+
+    func hasRootTarget(_ t: String) -> Bool { nodes[t]?.package == rootIdentity }
+
+    func build(_ wanted: [String]) throws(DriverError) {
+        let rt = try Builder.runtime(release: release)
+        var testStamp: String? = nil
+        var stamps: [String: String] = [:]
+        var active = Set<String>()
+        func visit(_ name: String) throws(DriverError) {
+            if stamps[name] != nil { return }
+            if active.contains(name) { throw DriverError("dependency cycle involving target '\(name)'") }
+            active.insert(name)
+            let n = nodes[name]!
+            for d in n.deps { try visit(d) }
+            var m = ModuleSpec(name: n.name, sources: sources(n))
+            if m.sources.isEmpty { throw DriverError("target '\(n.name)' has no sources in \(Path.display(n.dir, from: root))") }
+            m.displayRoot = Path.cwd
+            m.searchDirs = [rt.dir]
+            m.deps = linkOrder(n).map { ($0, stamps[$0]!) }
+            // Standard modules this target or any target it links uses (for the link line).
+            let reach = m.sources + linkOrder(n).flatMap { sources(nodes[$0]!) }
+            let std = try Builder.stdModules(for: reach, rt, release: release)
+            m.deps += std.deps
+            m.linkFlags = std.linkFlags
+            m.deps.append(("MppCore", rt.coreStamp))
+            switch n.decl.kind {
+            case .regular:
+                m.kind = .library
+                if m.sources.contains(where: { Path.stem($0) == "main" }) {
+                    throw DriverError("library target '\(n.name)' has a main.mpp; make it an .executableTarget")
+                }
+            case .executable:
+                m.kind = .executable
+                m.mainSource = m.sources.first { Path.stem($0) == "main" } ?? (m.sources.count == 1 ? m.sources[0] : nil)
+                if m.mainSource == nil { throw DriverError("executable target '\(n.name)' needs a main.mpp") }
+            case .test:
+                if testStamp == nil { testStamp = try Builder.testSupport(rt, release: release) }
+                m.kind = .executable
+                m.mainSource = "<generated>"
+                m.implicitImports = ["MppTest"]
+                m.deps.append(("MppTest", testStamp!))
+                m.generated = [("main.swift", try testRunner(m.sources))]
+            }
+            let product = try Builder.build(m, into: out, release: release)
+            stamps[name] = product.stamp
+            if n.decl.kind != .regular {
+                let dest = Path.join(out, productName(n))
+                if product.rebuilt || !Files.exists(dest) { try Files.copy(product.path, dest) }
+                binaries[name] = dest
+            }
+            active.remove(name)
+        }
+        for w in wanted { try visit(w) }
+    }
+
+    /// Finds top-level `func testXxx()` declarations and generates main.swift.
+    func testRunner(_ files: [String]) throws(DriverError) -> String {
+        var body = ""
+        var names = Set<String>()
+        for f in files {
+            let src = try Files.read(f)
+            let mask = Frontend.codeMask(Array(src.utf8))
+            var offset = 0
+            for (k, line) in src.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                defer { offset += line.utf8.count + 1 }
+                var words = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+                while let w = words.first, ["public", "internal", "private", "fileprivate", "@MainActor"].contains(w) { words.removeFirst() }
+                guard words.count >= 2, words[0] == "func", words[1].hasPrefix("test") else { continue }
+                let lead = line.utf8.count - line.drop { $0 == " " || $0 == "\t" }.utf8.count
+                guard offset + lead < mask.count, mask[offset + lead] else { continue }
+                let name = String(words[1].prefix { $0.isLetter || $0.isNumber || $0 == "_" })
+                let rest = line.drop { $0 != "(" }
+                guard rest.hasPrefix("()") || rest.hasPrefix("( )") else { continue }
+                if rest.contains("async") { throw DriverError("\(f):\(k + 1): async tests are not supported yet") }
+                guard names.insert(name).inserted else { throw DriverError("\(f):\(k + 1): duplicate test name \(name)") }
+                body += "    (\"\(Path.stem(f)).\(name)\", { \(rest.contains("throws") ? "try " : "")\(name)() }),\n"
+            }
+        }
+        return "// Generated by mpp pm test.\n_mppRunTests([\n\(body)])\n"
+    }
+}
+
+// MARK: - Commands
+
+enum PackageManager {
+    static func packageRoot(_ a: inout Arguments) throws(DriverError) -> String {
+        try findPackageRoot(try a.option("--package-path") ?? Path.cwd)
+    }
+
+    static func finished(_ start: UInt64) {
+        status("Build", format("complete! ({:.2f}s)", Double(nowNanos() - start) / 1e9))
+    }
+
+    static func nowNanos() -> UInt64 {
+        var ts = timespec()
+        clock_gettime(CLOCK_MONOTONIC, &ts)
+        return UInt64(ts.tv_sec) * 1_000_000_000 + UInt64(ts.tv_nsec)
+    }
+
+    static func main(_ argv: [String]) throws(DriverError) -> Int32 {
+        guard let cmd = argv.first, !["-h", "--help", "help"].contains(cmd) else {
+            writeStdout(libUsage)
+            return argv.isEmpty ? 2 : 0
+        }
+        var a = Arguments(values: Array(argv.dropFirst()))
+        switch cmd {
+        case "init": return try initPackage(&a)
+        case "build": return try build(&a)
+        case "run": return try run(&a)
+        case "test": return try test(&a)
+        case "resolve": return try resolveCommand(&a, update: false)
+        case "update": return try resolveCommand(&a, update: true)
+        case "show-dependencies": return try showDependencies(&a)
+        case "dump-package":
+            let root = try packageRoot(&a)
+            try a.done()
+            writeStdout(try ManifestLoader.load(root: root).json.dump(indent: 2) + "\n")
+            return 0
+        case "add-dependency": return try addDependency(&a)
+        case "clean", "reset":
+            let root = try packageRoot(&a)
+            try a.done()
+            if cmd == "reset" { Files.removeTree(Path.join(root, ".build")) }
+            else { Files.removeTree(Path.join(root, ".build/debug")); Files.removeTree(Path.join(root, ".build/release")) }
+            status(cmd == "reset" ? "Reset" : "Cleaned", Path.display(Path.join(root, ".build")))
+            return 0
+        default:
+            throw DriverError("unknown command '\(cmd)' (see `mpp pm --help`)")
+        }
+    }
+
+    static func initPackage(_ a: inout Arguments) throws(DriverError) -> Int32 {
+        let type = try a.option("--type") ?? "library"
+        let dir = Path.absolute(try a.option("--package-path") ?? ".")
+        let name = try a.option("--name") ?? Path.basename(dir)
+        try a.done()
+        guard ["library", "executable", "empty"].contains(type) else {
+            throw DriverError("unknown package type '\(type)' (library, executable or empty)")
+        }
+        if Files.exists(Path.join(dir, "Package.mpp")) { throw DriverError("Package.mpp already exists in \(dir)") }
+        let mod = Toolchain.moduleName(name)
+        var manifest = "// mpp-tools-version: 0.3\nimport PackageDescription\n\nlet package = Package(\n    name: \"\(name)\""
+        switch type {
+        case "library":
+            manifest += ",\n    products: [\n        .library(name: \"\(name)\", targets: [\"\(mod)\"]),\n    ],\n"
+                + "    targets: [\n        .target(name: \"\(mod)\"),\n"
+                + "        .testTarget(name: \"\(mod)Tests\", dependencies: [\"\(mod)\"]),\n    ]\n"
+            try Files.write(Path.join(dir, "Sources", mod, mod + ".mpp"),
+                            "/// The public API of \(name).\npublic func greeting(for name: String) -> String {\n    \"Hello, \\(name)!\"\n}\n")
+            try Files.write(Path.join(dir, "Tests", mod + "Tests", mod + "Tests.mpp"),
+                            "import \(mod)\n\nfunc testGreeting() {\n    expectEqual(greeting(for: \"M++\"), \"Hello, M++!\")\n}\n")
+        case "executable":
+            manifest += ",\n    targets: [\n        .executableTarget(name: \"\(mod)\"),\n    ]\n"
+            try Files.write(Path.join(dir, "Sources", mod, "main.mpp"),
+                            "var out = BufferedWriter.standardOutput()\nout.line(\"Hello from \(name)!\")\n")
+        default:
+            manifest += "\n"
+        }
+        manifest += ")\n"
+        try Files.write(Path.join(dir, "Package.mpp"), manifest)
+        if !Files.exists(Path.join(dir, ".gitignore")) { try Files.write(Path.join(dir, ".gitignore"), ".build/\n.DS_Store\n*.store\n") }
+        if !Files.exists(Path.join(dir, ".mppgnore")) {
+            try Files.write(Path.join(dir, ".mppgnore"), """
+                # Files M++ should not compile as part of a target (gitignore syntax).
+                # Examples:
+                #   Drafts/            a folder anywhere
+                #   *.draft.mpp        a pattern
+                #   !keep.draft.mpp    except this one
+
+                """)
+        }
+        status("Created", "\(type) package '\(name)'")
+        return 0
+    }
+
+    static func build(_ a: inout Arguments) throws(DriverError) -> Int32 {
+        let start = nowNanos()
+        let root = try packageRoot(&a)
+        let release = try a.release()
+        let product = try a.option("--product"), target = try a.option("--target")
+        let tests = a.flag("--build-tests")
+        try a.done()
+        let ws = try Workspace(root: root, graph: try resolve(root), release: release)
+        var wanted: [String]
+        if let product { wanted = [try ws.executableTarget(forProduct: product)] }
+        else if let target {
+            guard ws.hasRootTarget(target) else { throw DriverError("no target named '\(target)'") }
+            wanted = [target]
+        } else {
+            wanted = ws.rootTargets(tests: false) + (tests ? ws.rootTargets(tests: true) : [])
+        }
+        try ws.build(wanted)
+        finished(start)
+        return 0
+    }
+
+    static func run(_ a: inout Arguments) throws(DriverError) -> Int32 {
+        var passthrough: [String] = []
+        if let dd = a.values.firstIndex(of: "--") {
+            passthrough = Array(a.values[(dd + 1)...])
+            a.values.removeSubrange(dd...)
+        }
+        let root = try packageRoot(&a)
+        let release = try a.release()
+        let ws = try Workspace(root: root, graph: try resolve(root), release: release)
+        let products = ws.executableProducts
+        let product: String
+        if let first = a.values.first, !first.hasPrefix("-") {
+            product = first
+            a.values.removeFirst()
+        } else if products.count == 1 {
+            product = products[0]
+        } else if products.isEmpty {
+            throw DriverError("'\(ws.graph.root.name)' has no executable products")
+        } else {
+            throw DriverError("multiple executable products (\(products.joined(separator: ", "))); say which: mpp pm run <product>")
+        }
+        let target = try ws.executableTarget(forProduct: product)
+        let start = nowNanos()
+        try ws.build([target])
+        finished(start)
+        try Process.exec(ws.binaries[target]!, a.values + passthrough)
+    }
+
+    static func test(_ a: inout Arguments) throws(DriverError) -> Int32 {
+        let start = nowNanos()
+        let root = try packageRoot(&a)
+        let release = try a.release()
+        let filter = try a.option("--filter")
+        try a.done()
+        let ws = try Workspace(root: root, graph: try resolve(root), release: release)
+        let tests = ws.rootTargets(tests: true)
+        if tests.isEmpty { throw DriverError("'\(ws.graph.root.name)' has no test targets") }
+        try ws.build(tests)
+        finished(start)
+        var failed = 0
+        for t in tests {
+            if !Env.quiet { writeStdout("── \(t)\n") }
+            let r = try Process.run([ws.binaries[t]!] + (filter.map { ["--filter", $0] } ?? []), capture: false)
+            if r.status != 0 { failed += 1 }
+        }
+        return failed == 0 ? 0 : 1
+    }
+
+    static func resolveCommand(_ a: inout Arguments, update: Bool) throws(DriverError) -> Int32 {
+        let root = try packageRoot(&a)
+        var o = ResolveOptions()
+        o.onlyResolved = a.flag("--only-use-versions-from-resolved-file") || a.flag("--force-resolved-versions")
+        if update {
+            if a.values.isEmpty { o.updateAll = true }
+            o.update = Set(a.values.map { $0.lowercased() })
+            a.values = []
+        }
+        try a.done()
+        let g = try resolve(root, o)
+        for (id, p) in g.packages.sorted(by: { $0.key < $1.key }) where p.remote {
+            status(update ? "Updated" : "Resolved", "\(id) " + (p.version.map { "\($0)" } ?? "\(p.branch) @ \(p.revision.prefix(10))"))
+        }
+        if g.packages.isEmpty { status("Resolved", "no dependencies") }
+        return 0
+    }
+
+    static func showDependencies(_ a: inout Arguments) throws(DriverError) -> Int32 {
+        let root = try packageRoot(&a)
+        let formatName = try a.option("--format") ?? "text"
+        try a.done()
+        let g = try resolve(root)
+        func describe(_ p: ResolvedPackage) -> String {
+            guard p.remote else { return Path.relative(p.root, to: root) }
+            return p.url + "@" + (p.version.map { "\($0)" } ?? (p.branch.isEmpty ? String(p.revision.prefix(10)) : p.branch))
+        }
+        if formatName == "json" {
+            func node(_ m: Manifest, _ id: String) -> JSON {
+                var j: JSON = ["identity": .string(id), "name": .string(m.name)]
+                if let p = g.packages[id] {
+                    j["url"] = .string(p.remote ? p.url : p.root)
+                    if let v = p.version { j["version"] = .string("\(v)") }
+                }
+                j["dependencies"] = .array(m.dependencies.map { node(g.packages[$0.identity]!.manifest, $0.identity) })
+                return j
+            }
+            writeStdout(node(g.root, g.root.name.lowercased()).dump(indent: 2) + "\n")
+            return 0
+        }
+        var out = g.root.name + "\n"
+        func tree(_ m: Manifest, _ prefix: String) {
+            for (i, d) in m.dependencies.enumerated() {
+                let p = g.packages[d.identity]!
+                let last = i + 1 == m.dependencies.count
+                out += "\(prefix)\(last ? "└──" : "├──") \(p.identity)<\(describe(p))>\n"
+                tree(p.manifest, prefix + (last ? "    " : "│   "))
+            }
+        }
+        tree(g.root, "")
+        writeStdout(out)
+        return 0
+    }
+
+    /// Inserts `.package(...)` into the `dependencies:` array of `Package(...)`.
+    static func addDependencyText(_ src: String, _ entry: String) throws(DriverError) -> String {
+        let s = Array(src.utf8)
+        let mask = Frontend.codeMask(s)
+        func code(_ i: Int) -> Bool { i < s.count && mask[i] }
+        func at(_ i: Int, _ w: String) -> Bool {
+            let b = Array(w.utf8)
+            return i + b.count <= s.count && s[i ..< i + b.count].elementsEqual(b)
+        }
+        var open = -1
+        for i in 0 ..< s.count where code(i) && at(i, "Package(") && (i == 0 || !(Lowerer.identChar(s[i - 1]) || s[i - 1] == 46)) {
+            open = i + 7
+            break
+        }
+        guard open >= 0 else { throw DriverError("could not find `Package(` in Package.mpp") }
+        var depth = 0, close = -1, depsLabel = -1, targetsLabel = -1
+        var i = open
+        while i < s.count {
+            defer { i += 1 }
+            guard code(i) else { continue }
+            let c = s[i]
+            if c == 40 || c == 91 || c == 123 { depth += 1 }
+            else if c == 41 || c == 93 || c == 125 { depth -= 1; if depth == 0 { close = i; break } }
+            else if depth == 1 && at(i, "dependencies:") && (i == 0 || !Lowerer.identChar(s[i - 1])) { depsLabel = i }
+            else if depth == 1 && at(i, "targets:") && targetsLabel < 0 { targetsLabel = i }
+        }
+        guard close >= 0 else { throw DriverError("unbalanced `Package(` in Package.mpp") }
+        func str(_ a: Int, _ b: Int) -> String { String(decoding: s[a ..< b], as: UTF8.self) }
+        func indentOf(_ i: Int) -> String {
+            var j = i
+            while j > 0 && s[j - 1] != 10 { j -= 1 }
+            var k = j
+            while k < i && (s[k] == 32 || s[k] == 9) { k += 1 }
+            return str(j, k)
+        }
+        if depsLabel >= 0 {
+            var lb = depsLabel
+            while s[lb] != 91 { lb += 1 }
+            var d = 0, rb = -1
+            for k in lb ..< s.count where code(k) {
+                if s[k] == 91 || s[k] == 40 || s[k] == 123 { d += 1 }
+                else if s[k] == 93 || s[k] == 41 || s[k] == 125 { d -= 1; if d == 0 { rb = k; break } }
+            }
+            let indent = indentOf(depsLabel), item = indent + "    "
+            var inner = str(lb + 1, rb)
+            while let last = inner.last, last == " " || last == "\n" || last == "\t" { inner.removeLast() }
+            let replacement = inner.trimmingSpaces.isEmpty
+                ? "\n\(item)\(entry),\n\(indent)"
+                : inner + (inner.hasSuffix(",") ? "" : ",") + "\n\(item)\(entry),\n\(indent)"
+            return str(0, lb + 1) + replacement + str(rb, s.count)
+        }
+        if targetsLabel >= 0 {
+            var lineStart = targetsLabel
+            while lineStart > 0 && s[lineStart - 1] != 10 { lineStart -= 1 }
+            let indent = str(lineStart, targetsLabel)
+            return str(0, lineStart) + "\(indent)dependencies: [\n\(indent)    \(entry),\n\(indent)],\n" + str(lineStart, s.count)
+        }
+        var end = close
+        while end > open && (s[end - 1] == 32 || s[end - 1] == 10 || s[end - 1] == 9) { end -= 1 }
+        return str(0, end) + ",\n    dependencies: [\n        \(entry),\n    ]\n" + str(close, s.count)
+    }
+
+    static func swiftString(_ s: String) -> String {
+        "\"" + s.replacingAll("\\", with: "\\\\").replacingAll("\"", with: "\\\"") + "\""
+    }
+
+    static func addDependency(_ a: inout Arguments) throws(DriverError) -> Int32 {
+        let root = try packageRoot(&a)
+        let from = try a.option("--from"), exact = try a.option("--exact"), minor = try a.option("--up-to-next-minor-from"),
+            branch = try a.option("--branch"), revision = try a.option("--revision")
+        guard a.values.count == 1 else {
+            throw DriverError("usage: mpp pm add-dependency <url|path> [--from <version> | --exact <version> | --branch <b> | --revision <r>]")
+        }
+        let loc = a.values.removeFirst()
+        let isURL = loc.contains("://") || loc.hasPrefix("git@")
+        let isPath = !isURL && Files.isFile(Path.join(Path.absolute(loc), "Package.mpp"))
+        var entry: String
+        if isPath {
+            entry = ".package(path: \(swiftString(Path.relative(Path.absolute(loc), to: root))))"
+        } else {
+            let given = [from, exact, minor, branch, revision].compactMap { $0 }.count
+            if given > 1 { throw DriverError("give only one of --from, --exact, --up-to-next-minor-from, --branch, --revision") }
+            var fromVersion = from
+            if given == 0 {
+                let r = try Process.run(["git", "ls-remote", "--tags", "--refs", loc])
+                guard r.status == 0 else { throw DriverError("could not list tags of \(loc):\n\(r.output.trimmingNewlines)") }
+                var best: Version? = nil
+                for line in r.output.split(separator: "\n") {
+                    guard let rr = line.range(ofText: "refs/tags/") else { continue }
+                    if let v = Version(String(line[rr.upperBound...]).trimmingSpaces), v.prerelease.isEmpty, best.map({ $0 < v }) ?? true { best = v }
+                }
+                guard let best else { throw DriverError("\(loc) has no version tags; use --branch or --revision") }
+                fromVersion = "\(best)"
+            }
+            func check(_ v: String) throws(DriverError) -> String {
+                guard Version(v) != nil else { throw DriverError("invalid version '\(v)'") }
+                return v
+            }
+            let url = swiftString(loc)
+            if let v = fromVersion { entry = ".package(url: \(url), from: \(swiftString(try check(v))))" }
+            else if let v = exact { entry = ".package(url: \(url), exact: \(swiftString(try check(v))))" }
+            else if let v = minor { entry = ".package(url: \(url), upToNextMinor: \(swiftString(try check(v))))" }
+            else if let b = branch { entry = ".package(url: \(url), branch: \(swiftString(b)))" }
+            else { entry = ".package(url: \(url), revision: \(swiftString(revision!)))" }
+        }
+        try a.done()
+        let file = Path.join(root, "Package.mpp")
+        let old = try Files.read(file)
+        let id = identity(for: isPath ? Path.absolute(loc) : loc, isPath: isPath)
+        if try ManifestLoader.load(root: root).dependencies.contains(where: { $0.identity == id }) {
+            throw DriverError("'\(id)' is already a dependency")
+        }
+        try Files.write(file, try addDependencyText(old, entry))
+        let graph: Graph
+        do { graph = try resolve(root) } catch { try Files.write(file, old); throw error }
+        status("Added", entry)
+        let dep = isPath ? try ManifestLoader.load(root: Path.absolute(loc)) : graph.packages[id]!.manifest
+        if let lib = dep.products.first(where: { !$0.executable }) {
+            writeStderr("             add it to a target's dependencies, e.g. .product(name: \"\(lib.name)\", package: \"\(id)\")\n")
+        }
+        return 0
+    }
+}
+
+func writeStdout(_ s: String) {
+    var t = s
+    t.withUTF8 { p in
+        var off = 0
+        while off < p.count {
+            let n = write(1, p.baseAddress! + off, p.count - off)
+            if n <= 0 { break }
+            off += n
+        }
+    }
+}

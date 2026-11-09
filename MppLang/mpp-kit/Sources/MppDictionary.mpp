@@ -1,0 +1,540 @@
+// MppKit — MppDictionary: M++'s hash map (a faster FlatHashMap).
+//
+//   var m: MppDictionary<String, Int> = ["apples": 3]
+//   m["pears"] = 2
+//   m["apples", default: 0] += 1
+//   for (k, v) in m { ... }
+//   let found = m.values(forKeys: queries)     // many lookups in one call
+//
+// The same API as Swift's Dictionary, built as a Swiss table:
+//   * One control byte per slot (7 hash bits, or empty/deleted). A probe
+//     compares 8 control bytes at once with SWAR bit tricks, so a lookup
+//     usually reads one control word and one key.
+//   * Each key sits next to its value, so a lookup that misses the cache
+//     waits for two memory loads (control word, then slot), not three.
+//   * Integer keys are hashed with one 128-bit multiply, strings 8 bytes at
+//     a time (wyhash-style). Swift's Dictionary runs SipHash on every key,
+//     which costs more than the whole probe. Other key types use Swift's
+//     own hashing. Every table has its own random seed.
+//   * Lookups don't depend on each other, so in a loop the CPU overlaps
+//     the cache misses of several lookups at once.
+// Value semantics with copy-on-write, like Dictionary.
+
+@usableFromInline let _mppEmpty: UInt8 = 0b1000_0000
+@usableFromInline let _mppDeleted: UInt8 = 0b1111_1110
+@usableFromInline let _mppLSBs: UInt64 = 0x0101_0101_0101_0101
+@usableFromInline let _mppMSBs: UInt64 = 0x8080_8080_8080_8080
+
+// MARK: - Hashing
+
+/// Fast seeded 64-bit hash. Constant-folds to one code path per key type.
+@inlinable @inline(__always)
+func _mppHash<K: Hashable>(_ key: K, _ seed: UInt64) -> UInt64 {
+    @inline(__always) func mix(_ x: UInt64) -> UInt64 {
+        // 128-bit multiply, then fold: excellent avalanche for one mul.
+        let (hi, lo) = (x ^ seed).multipliedFullWidth(by: 0x9E37_79B9_7F4A_7C15)
+        return hi ^ lo
+    }
+    if K.self == Int.self { return mix(UInt64(bitPattern: Int64(unsafeBitCast(key, to: Int.self)))) }
+    if K.self == UInt.self { return mix(UInt64(unsafeBitCast(key, to: UInt.self))) }
+    if K.self == Int64.self { return mix(UInt64(bitPattern: unsafeBitCast(key, to: Int64.self))) }
+    if K.self == UInt64.self { return mix(unsafeBitCast(key, to: UInt64.self)) }
+    if K.self == Int32.self { return mix(UInt64(UInt32(bitPattern: unsafeBitCast(key, to: Int32.self)))) }
+    if K.self == UInt32.self { return mix(UInt64(unsafeBitCast(key, to: UInt32.self))) }
+    if K.self == String.self {
+        var s = unsafeBitCast(key, to: String.self)
+        return s.withUTF8 { _mppHashBytes($0, seed) }
+    }
+    return UInt64(bitPattern: Int64(key._rawHashValue(seed: Int(truncatingIfNeeded: seed))))
+}
+
+/// wyhash-style byte hash: 8 bytes per multiply.
+@inlinable
+func _mppHashBytes(_ b: UnsafeBufferPointer<UInt8>, _ seed: UInt64) -> UInt64 {
+    @inline(__always) func mum(_ a: UInt64, _ b: UInt64) -> UInt64 {
+        let (hi, lo) = a.multipliedFullWidth(by: b)
+        return hi ^ lo
+    }
+    let n = b.count
+    var h = seed ^ 0xA076_1D64_78BD_642F ^ UInt64(n)
+    guard let p = b.baseAddress, n > 0 else { return mum(h, 0xE703_7ED1_A0B4_28DB) }
+    let raw = UnsafeRawPointer(p)
+    var i = 0
+    while i &+ 16 <= n {
+        let a = UInt64(littleEndian: raw.loadUnaligned(fromByteOffset: i, as: UInt64.self))
+        let c = UInt64(littleEndian: raw.loadUnaligned(fromByteOffset: i &+ 8, as: UInt64.self))
+        h = mum(a ^ 0xE703_7ED1_A0B4_28DB, c ^ h)
+        i &+= 16
+    }
+    var tail: UInt64 = 0, tail2: UInt64 = 0
+    let left = n &- i
+    if left >= 8 {
+        tail = UInt64(littleEndian: raw.loadUnaligned(fromByteOffset: i, as: UInt64.self))
+        // last 8 bytes (overlapping is fine)
+        tail2 = UInt64(littleEndian: raw.loadUnaligned(fromByteOffset: n &- 8, as: UInt64.self))
+    } else if left > 0 {
+        var k = 0
+        while k < left { tail |= UInt64(p[i &+ k]) &<< (UInt64(k) &* 8); k &+= 1 }
+    }
+    return mum(mum(tail ^ 0xE703_7ED1_A0B4_28DB, tail2 ^ h), 0x8EBC_6AF0_9C88_C6E3 ^ UInt64(n))
+}
+
+// MARK: - Storage
+
+@usableFromInline
+final class _MppTable<Key: Hashable, Value> {
+    // Everything is `let` or raw memory: class `var`s would pay a dynamic
+    // exclusivity check on every probe.
+    @usableFromInline let capacity: Int                       // power of two, >= 8
+    @usableFromInline let mask: Int
+    @usableFromInline let ctrl: UnsafeMutablePointer<UInt8>   // capacity + 8 (the first group mirrored at the end)
+    @usableFromInline let slots: UnsafeMutablePointer<(key: Key, value: Value)>   // key and value share a cache line
+    @usableFromInline let counters: UnsafeMutablePointer<Int> // [count, growthLeft]
+    @usableFromInline let seed: UInt64
+
+    @inlinable var count: Int {
+        @inline(__always) get { counters[0] }
+        @inline(__always) set { counters[0] = newValue }
+    }
+    @inlinable var growthLeft: Int {
+        @inline(__always) get { counters[1] }
+        @inline(__always) set { counters[1] = newValue }
+    }
+
+    /// `seed`: copies and regrowths keep the seed, so a key's hash stays valid.
+    @usableFromInline
+    init(capacity requested: Int, seed: UInt64? = nil) {
+        var cap = 8
+        while cap - cap / 8 < requested { cap <<= 1 }
+        capacity = cap
+        mask = cap - 1
+        ctrl = .allocate(capacity: cap + 8)
+        ctrl.initialize(repeating: _mppEmpty, count: cap + 8)
+        slots = .allocate(capacity: cap)
+        counters = .allocate(capacity: 2)
+        counters[0] = 0
+        counters[1] = cap - cap / 8
+        if let seed { self.seed = seed } else {
+            var g = SystemRandomNumberGenerator()
+            self.seed = g.next()
+        }
+    }
+
+    deinit {
+        if !(_isPOD(Key.self) && _isPOD(Value.self)) {
+            for i in 0 ..< capacity where ctrl[i] & 0x80 == 0 {
+                (slots + i).deinitialize(count: 1)
+            }
+        }
+        ctrl.deallocate(); slots.deallocate(); counters.deallocate()
+    }
+
+    @inlinable @inline(__always)
+    func group(_ pos: Int) -> UInt64 {
+        UInt64(littleEndian: UnsafeRawPointer(ctrl + pos).loadUnaligned(as: UInt64.self))
+    }
+    @inlinable @inline(__always)
+    static func match(_ g: UInt64, _ h2: UInt8) -> UInt64 {
+        let x = g ^ (_mppLSBs &* UInt64(h2))
+        return (x &- _mppLSBs) & ~x & _mppMSBs
+    }
+    @inlinable @inline(__always)
+    static func matchEmpty(_ g: UInt64) -> UInt64 { g & ~(g &<< 6) & _mppMSBs }
+    @inlinable @inline(__always)
+    static func matchFree(_ g: UInt64) -> UInt64 { g & ~(g &<< 7) & _mppMSBs }
+
+    @inlinable @inline(__always)
+    func setCtrl(_ i: Int, _ v: UInt8) {
+        ctrl[i] = v
+        if i < 8 { ctrl[capacity &+ i] = v }
+    }
+
+    @inlinable @inline(__always)
+    func hash(_ key: Key) -> UInt64 { _mppHash(key, seed) }
+
+    /// Slot holding `key`, or -1.
+    @inlinable @inline(__always)
+    func find(_ key: Key) -> Int { find(key, hash: hash(key)) }
+
+    @inlinable @inline(__always)
+    func find(_ key: Key, hash h: UInt64) -> Int {
+        let h2 = UInt8(truncatingIfNeeded: h &>> 57)
+        var pos = Int(truncatingIfNeeded: h) & mask
+        var step = 0
+        while true {
+            let g = group(pos)
+            var m = _MppTable.match(g, h2)
+            while m != 0 {
+                let i = (pos &+ m.trailingZeroBitCount &>> 3) & mask
+                if slots[i].key == key { return i }
+                m &= m &- 1
+            }
+            if _MppTable.matchEmpty(g) != 0 { return -1 }
+            step &+= 8
+            pos = (pos &+ step) & mask
+        }
+    }
+
+    @inlinable
+    func findFree(_ h: UInt64) -> Int {
+        var pos = Int(truncatingIfNeeded: h) & mask
+        var step = 0
+        while true {
+            let m = _MppTable.matchFree(group(pos))
+            if m != 0 { return (pos &+ m.trailingZeroBitCount &>> 3) & mask }
+            step &+= 8
+            pos = (pos &+ step) & mask
+        }
+    }
+
+    /// Inserts a key known to be absent (capacity already reserved).
+    @inlinable
+    func insertNew(_ key: Key, _ value: Value, hash h: UInt64) -> Int {
+        let i = findFree(h)
+        if ctrl[i] == _mppEmpty { growthLeft &-= 1 }
+        setCtrl(i, UInt8(truncatingIfNeeded: h &>> 57))
+        (slots + i).initialize(to: (key, value))
+        count &+= 1
+        return i
+    }
+
+    @usableFromInline
+    func copy(minimumCapacity: Int) -> _MppTable {
+        let t = _MppTable(capacity: Swift.max(minimumCapacity, count), seed: seed)
+        for i in 0 ..< capacity where ctrl[i] & 0x80 == 0 {
+            _ = t.insertNew(slots[i].key, slots[i].value, hash: t.hash(slots[i].key))
+        }
+        return t
+    }
+
+    @inlinable
+    func erase(at i: Int) -> Value {
+        let v = (slots + i).move().value
+        // If the groups around i still hold an empty slot, no probe sequence
+        // can run past i, so it can become empty instead of a tombstone.
+        let before = (i &- 8) & mask
+        let emptyAfter = _MppTable.matchEmpty(group(i))
+        let emptyBefore = _MppTable.matchEmpty(group(before))
+        let neverFull = emptyBefore != 0 && emptyAfter != 0 &&
+            (emptyAfter.trailingZeroBitCount &>> 3) + (emptyBefore.leadingZeroBitCount &>> 3) < 8
+        setCtrl(i, neverFull ? _mppEmpty : _mppDeleted)
+        if neverFull { growthLeft &+= 1 }
+        count &-= 1
+        return v
+    }
+}
+
+// MARK: - MppDictionary
+
+public struct MppDictionary<Key: Hashable, Value>: Sequence, ExpressibleByDictionaryLiteral, CustomStringConvertible {
+    @usableFromInline var table: _MppTable<Key, Value>
+
+    public init() { table = _MppTable(capacity: 0) }
+    public init(minimumCapacity: Int) { table = _MppTable(capacity: minimumCapacity) }
+    public init(dictionaryLiteral elements: (Key, Value)...) {
+        table = _MppTable(capacity: elements.count)
+        for (k, v) in elements { self[k] = v }
+    }
+    public init<S: Sequence>(uniqueKeysWithValues pairs: S) where S.Element == (Key, Value) {
+        table = _MppTable(capacity: pairs.underestimatedCount)
+        for (k, v) in pairs {
+            precondition(table.find(k) < 0, "MppDictionary: duplicate key \(k)")
+            self[k] = v
+        }
+    }
+    public init<S: Sequence>(_ pairs: S, uniquingKeysWith combine: (Value, Value) throws -> Value) rethrows where S.Element == (Key, Value) {
+        table = _MppTable(capacity: pairs.underestimatedCount)
+        for (k, v) in pairs {
+            if let old = self[k] { self[k] = try combine(old, v) } else { self[k] = v }
+        }
+    }
+    public init(_ d: [Key: Value]) {
+        table = _MppTable(capacity: d.count)
+        for (k, v) in d { self[k] = v }
+    }
+    /// Groups a sequence by a key, like Dictionary(grouping:by:).
+    public init<S: Sequence>(grouping values: S, by keyForValue: (S.Element) throws -> Key) rethrows where Value == [S.Element] {
+        self.init()
+        for v in values { self[try keyForValue(v), default: []].append(v) }
+    }
+
+    @inlinable public var count: Int { table.count }
+    @inlinable public var isEmpty: Bool { table.count == 0 }
+    @inlinable public var capacity: Int { table.capacity - table.capacity / 8 }
+
+    @inlinable @inline(__always)
+    mutating func makeUnique() {
+        if !isKnownUniquelyReferenced(&table) { table = table.copy(minimumCapacity: table.count) }
+    }
+
+    /// Makes room for one more element (grows or cleans out tombstones).
+    @inlinable @inline(__always)
+    mutating func reserveOne() {
+        if table.growthLeft == 0 { grow() }
+    }
+
+    @usableFromInline
+    mutating func grow() {
+        // Many tombstones: rehash at the same size. Otherwise double.
+        let live = table.count
+        let target = live * 2 >= table.capacity - table.capacity / 8 ? live * 2 + 1 : live + 1
+        table = table.copy(minimumCapacity: target)
+    }
+
+    public mutating func reserveCapacity(_ n: Int) {
+        if n > capacity || !isKnownUniquelyReferenced(&table) { table = table.copy(minimumCapacity: Swift.max(n, count)) }
+    }
+
+    // MARK: Lookup
+
+    @inlinable public func contains(_ key: Key) -> Bool { table.find(key) >= 0 }
+    @inlinable public func index(forKey key: Key) -> Int? { let i = table.find(key); return i >= 0 ? i : nil }
+
+    @inlinable
+    public subscript(key: Key) -> Value? {
+        @inline(__always) get {
+            let i = table.find(key)
+            return i >= 0 ? table.slots[i].value : nil
+        }
+        set {
+            if let v = newValue { updateValue(v, forKey: key) } else { removeValue(forKey: key) }
+        }
+    }
+
+    @inlinable
+    public subscript(key: Key, default defaultValue: @autoclosure () -> Value) -> Value {
+        @inline(__always) get {
+            let i = table.find(key)
+            return i >= 0 ? table.slots[i].value : defaultValue()
+        }
+        _modify {
+            makeUnique()
+            let h = table.hash(key)
+            var i = table.find(key, hash: h)
+            if i < 0 {
+                if table.growthLeft == 0 { grow() }
+                i = table.insertNew(key, defaultValue(), hash: h)
+            }
+            yield &table.slots[i].value
+        }
+    }
+
+    /// Inserts or replaces; returns the old value.
+    @inlinable @discardableResult
+    public mutating func updateValue(_ value: Value, forKey key: Key) -> Value? {
+        makeUnique()
+        let h = table.hash(key)
+        let i = table.find(key, hash: h)
+        if i >= 0 {
+            let old = table.slots[i].value
+            table.slots[i].value = value
+            return old
+        }
+        if table.growthLeft == 0 { grow() }
+        _ = table.insertNew(key, value, hash: h)
+        return nil
+    }
+
+    /// FlatHashMap-style insert: keeps an existing value.
+    @inlinable @discardableResult
+    public mutating func insert(_ key: Key, _ value: Value) -> (inserted: Bool, value: Value) {
+        let h = table.hash(key)
+        let i = table.find(key, hash: h)
+        if i >= 0 { return (false, table.slots[i].value) }
+        makeUnique()
+        if table.growthLeft == 0 { grow() }
+        _ = table.insertNew(key, value, hash: h)
+        return (true, value)
+    }
+
+    @inlinable @discardableResult
+    public mutating func removeValue(forKey key: Key) -> Value? {
+        let i = table.find(key)
+        guard i >= 0 else { return nil }
+        if isKnownUniquelyReferenced(&table) { return table.erase(at: i) }
+        makeUnique()
+        return table.erase(at: table.find(key))
+    }
+
+    public mutating func removeAll(keepingCapacity keep: Bool = false) {
+        table = _MppTable(capacity: keep ? capacity : 0)
+    }
+
+    public mutating func merge<S: Sequence>(_ other: S, uniquingKeysWith combine: (Value, Value) throws -> Value) rethrows
+        where S.Element == (Key, Value) {
+        for (k, v) in other {
+            if let old = self[k] { self[k] = try combine(old, v) } else { self[k] = v }
+        }
+    }
+    public mutating func merge(_ other: MppDictionary, uniquingKeysWith combine: (Value, Value) throws -> Value) rethrows {
+        for (k, v) in other {
+            if let old = self[k] { self[k] = try combine(old, v) } else { self[k] = v }
+        }
+    }
+
+    // MARK: Batched lookups
+
+    /// Looks up many keys at once (hashes a block, then loads all of its
+    /// control words before finishing the probes).
+    @inlinable
+    public func values(forKeys queries: some Collection<Key>) -> [Value?] {
+        var out = [Value?](repeating: nil, count: queries.count)
+        out.withUnsafeMutableBufferPointer { o in
+            batch(queries) { slot, i in o[i] = slot >= 0 ? table.slots[slot].value : nil }
+        }
+        return out
+    }
+
+    /// For each key: is it present?
+    @inlinable
+    public func contains(keys queries: some Collection<Key>) -> [Bool] {
+        var out = [Bool](repeating: false, count: queries.count)
+        out.withUnsafeMutableBufferPointer { o in batch(queries) { slot, i in o[i] = slot >= 0 } }
+        return out
+    }
+
+    /// Calls `body(slot, position)` for every query (slot -1: absent).
+    @inlinable
+    func batch(_ queries: some Collection<Key>, _ body: (Int, Int) -> Void) {
+        if let done: Void = queries.withContiguousStorageIfAvailable({ batch($0, body) }) { return done }
+        let array = Array(queries)
+        array.withUnsafeBufferPointer { batch($0, body) }
+    }
+
+    @inlinable
+    func batch(_ q: UnsafeBufferPointer<Key>, _ body: (Int, Int) -> Void) {
+        let t = table
+        let block = 32
+        var hs = (0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64,
+                  0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64,
+                  0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64,
+                  0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64, 0 as UInt64)
+        withUnsafeMutableBytes(of: &hs) { raw in
+            let h = raw.baseAddress!.assumingMemoryBound(to: UInt64.self)
+            var start = 0
+            while start < q.count {
+                let n = Swift.min(block, q.count &- start)
+                // 1) hash the block and load each key's first control group.
+                //    The loads are independent, so their cache misses overlap.
+                var touch: UInt64 = 0
+                for j in 0 ..< n {
+                    let x = t.hash(q[start &+ j])
+                    h[j] = x
+                    touch &+= t.group(Int(truncatingIfNeeded: x) & t.mask)
+                }
+                // 2) load the candidate key slots, again all at once.
+                for j in 0 ..< n {
+                    let x = h[j]
+                    let pos = Int(truncatingIfNeeded: x) & t.mask
+                    let m = _MppTable<Key, Value>.match(t.group(pos), UInt8(truncatingIfNeeded: x &>> 57))
+                    if m != 0 {
+                        let slot = (pos &+ m.trailingZeroBitCount &>> 3) & t.mask
+                        touch &+= UInt64(UnsafeRawPointer(t.slots + slot).load(as: UInt8.self))
+                    }
+                }
+                _blackHoleTouch(touch)
+                // 3) finish every probe; the lines are in cache now.
+                for j in 0 ..< n { body(t.find(q[start &+ j], hash: h[j]), start &+ j) }
+                start &+= n
+            }
+        }
+    }
+
+    // MARK: Collection-like API
+
+    public struct Iterator: IteratorProtocol {
+        @usableFromInline let table: _MppTable<Key, Value>
+        @usableFromInline var i = 0
+        @inlinable init(table: _MppTable<Key, Value>) { self.table = table }
+        @inlinable
+        public mutating func next() -> (key: Key, value: Value)? {
+            while i < table.capacity {
+                defer { i &+= 1 }
+                if table.ctrl[i] & 0x80 == 0 { return table.slots[i] }
+            }
+            return nil
+        }
+    }
+    @inlinable public func makeIterator() -> Iterator { Iterator(table: table) }
+    @inlinable public var underestimatedCount: Int { count }
+
+    public var keys: [Key] { map(\.key) }
+    public var values: [Value] { map(\.value) }
+
+    public func mapValues<T>(_ transform: (Value) throws -> T) rethrows -> MppDictionary<Key, T> {
+        var d = MppDictionary<Key, T>(minimumCapacity: count)
+        for (k, v) in self { d[k] = try transform(v) }
+        return d
+    }
+    public func compactMapValues<T>(_ transform: (Value) throws -> T?) rethrows -> MppDictionary<Key, T> {
+        var d = MppDictionary<Key, T>(minimumCapacity: count)
+        for (k, v) in self { if let t = try transform(v) { d[k] = t } }
+        return d
+    }
+    public func filter(_ isIncluded: ((key: Key, value: Value)) throws -> Bool) rethrows -> MppDictionary {
+        var d = MppDictionary()
+        for e in self where try isIncluded(e) { d[e.key] = e.value }
+        return d
+    }
+
+    /// A Swift Dictionary with the same contents.
+    public var dictionary: [Key: Value] {
+        var d = [Key: Value](minimumCapacity: count)
+        for (k, v) in self { d[k] = v }
+        return d
+    }
+
+    public var description: String {
+        if isEmpty { return "[:]" }
+        return "[" + map { "\($0.key): \($0.value)" }.joined(separator: ", ") + "]"
+    }
+}
+
+/// Keeps the batch loads from being optimized away (costs one predictable branch).
+@inlinable @inline(__always)
+func _blackHoleTouch(_ x: UInt64) {
+    if x == 0x5A5A_5A5A_5A5A_5A5A { _mppTouchSink &+= 1 }
+}
+nonisolated(unsafe) public var _mppTouchSink = 0
+
+extension MppDictionary: Equatable where Value: Equatable {
+    public static func == (a: MppDictionary, b: MppDictionary) -> Bool {
+        guard a.count == b.count else { return false }
+        for (k, v) in a { guard let w = b[k], w == v else { return false } }
+        return true
+    }
+}
+
+extension MppDictionary: @unchecked Sendable where Key: Sendable, Value: Sendable {}
+
+// MARK: - MppSet
+
+public struct MppSet<Element: Hashable>: Sequence, ExpressibleByArrayLiteral, CustomStringConvertible {
+    @usableFromInline var map = MppDictionary<Element, Void>()
+    public init() {}
+    public init(minimumCapacity: Int) { map = MppDictionary(minimumCapacity: minimumCapacity) }
+    public init(arrayLiteral elements: Element...) { for e in elements { insert(e) } }
+    public init<S: Sequence>(_ s: S) where S.Element == Element { for e in s { insert(e) } }
+    @inlinable public var count: Int { map.count }
+    @inlinable public var isEmpty: Bool { map.isEmpty }
+    @inlinable public func contains(_ e: Element) -> Bool { map.contains(e) }
+    @inlinable public func contains(elements: some Collection<Element>) -> [Bool] { map.contains(keys: elements) }
+    @inlinable @discardableResult
+    public mutating func insert(_ e: Element) -> Bool { map.insert(e, ()).inserted }
+    @inlinable @discardableResult
+    public mutating func remove(_ e: Element) -> Bool { map.removeValue(forKey: e) != nil }
+    public mutating func reserveCapacity(_ n: Int) { map.reserveCapacity(n) }
+    public func makeIterator() -> LazyMapSequence<MppDictionary<Element, Void>, Element>.Iterator {
+        map.lazy.map(\.key).makeIterator()
+    }
+    public func union<S: Sequence>(_ other: S) -> MppSet where S.Element == Element { var s = self; for e in other { s.insert(e) }; return s }
+    public func intersection(_ other: MppSet) -> MppSet { MppSet(filter { other.contains($0) }) }
+    public func subtracting(_ other: MppSet) -> MppSet { MppSet(filter { !other.contains($0) }) }
+    public var description: String { "[" + map { "\($0)" }.joined(separator: ", ") + "]" }
+}
+
+extension MppSet: @unchecked Sendable where Element: Sendable {}
+
+/// The original names still work.
+public typealias FlatHashMap<Key: Hashable, Value> = MppDictionary<Key, Value>
+public typealias FlatHashSet<Element: Hashable> = MppSet<Element>

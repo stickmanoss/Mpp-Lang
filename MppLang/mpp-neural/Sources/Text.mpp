@@ -1,0 +1,195 @@
+// neural — Text: swift-transformers-style tokenization and generation.
+//
+//   var tokenizer = BPETokenizer()
+//   tokenizer.train(on: corpus, vocabularySize: 512)
+//   let ids = tokenizer.encode("hello world")
+//   tokenizer.decode(ids) == "hello world"
+//
+//   let next = sample(logits, .topP(0.9, temperature: 0.8), using: &rng)
+//   let tokens = generate(prompt: ids, maxTokens: 50, sampling: .greedy) { context in
+//       model(context)          // logits for the next token
+//   }
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+/// Byte-level byte-pair encoding (GPT-2 style): any text round-trips exactly.
+public struct BPETokenizer: Sendable, Codable {
+    /// Learned merges in priority order; token 256 + i is merges[i].
+    public private(set) var merges: [Pair] = []
+    public struct Pair: Hashable, Sendable, Codable {
+        public let a: Int, b: Int
+        public init(_ a: Int, _ b: Int) { self.a = a; self.b = b }
+    }
+    var ranks: [Pair: Int] = [:]
+
+    public init() {}
+
+    public var vocabularySize: Int { 256 + merges.count }
+
+    /// Splits text into words that keep their leading space ("hello", " world").
+    static func pretokenize(_ text: String) -> [[Int]] {
+        var words: [[Int]] = []
+        var current: [Int] = []
+        for b in text.utf8 {
+            if (b == 32 || b == 10) && !current.isEmpty { words.append(current); current = [] }
+            current.append(Int(b))
+        }
+        if !current.isEmpty { words.append(current) }
+        return words
+    }
+
+    /// Learns merges until the vocabulary reaches `vocabularySize`.
+    public mutating func train(on text: String, vocabularySize: Int) {
+        var wordCounts: [[Int]: Int] = [:]
+        for w in Self.pretokenize(text) { wordCounts[w, default: 0] += 1 }
+        var words = Array(wordCounts.keys).map { ($0, wordCounts[$0]!) }
+        merges = []
+        ranks = [:]
+        while 256 + merges.count < vocabularySize {
+            var counts: [Pair: Int] = [:]
+            for (w, c) in words where w.count > 1 { for i in 0 ..< w.count - 1 { counts[Pair(w[i], w[i + 1]), default: 0] += c } }
+            // Most frequent pair; ties broken by the smaller pair so training is deterministic.
+            guard let best = counts.max(by: { $0.value != $1.value ? $0.value < $1.value : ($0.key.a, $0.key.b) > ($1.key.a, $1.key.b) }),
+                  best.value > 1 else { break }
+            let id = 256 + merges.count
+            ranks[best.key] = merges.count
+            merges.append(best.key)
+            words = words.map { (Self.merge($0.0, best.key, id), $0.1) }
+        }
+    }
+
+    static func merge(_ w: [Int], _ p: Pair, _ id: Int) -> [Int] {
+        var out: [Int] = []
+        out.reserveCapacity(w.count)
+        var i = 0
+        while i < w.count {
+            if i + 1 < w.count && w[i] == p.a && w[i + 1] == p.b { out.append(id); i += 2 }
+            else { out.append(w[i]); i += 1 }
+        }
+        return out
+    }
+
+    public func encode(_ text: String) -> [Int] {
+        var out: [Int] = []
+        for var w in Self.pretokenize(text) {
+            while w.count > 1 {
+                var best: (rank: Int, pair: Pair)? = nil
+                for i in 0 ..< w.count - 1 {
+                    let p = Pair(w[i], w[i + 1])
+                    if let r = ranks[p], best == nil || r < best!.rank { best = (r, p) }
+                }
+                guard let b = best else { break }
+                w = Self.merge(w, b.pair, 256 + b.rank)
+            }
+            out += w
+        }
+        return out
+    }
+
+    func bytes(_ id: Int) -> [UInt8] {
+        id < 256 ? [UInt8(id)] : bytes(merges[id - 256].a) + bytes(merges[id - 256].b)
+    }
+
+    public func decode(_ ids: [Int]) -> String {
+        String(decoding: ids.flatMap { bytes($0) }, as: UTF8.self)
+    }
+
+    /// The text of one token (for display).
+    public func token(_ id: Int) -> String { String(decoding: bytes(id), as: UTF8.self) }
+
+    public func save(_ path: String) throws {
+        let json: JSON = ["type": "byte-level-bpe", "merges": .array(merges.map { [JSON($0.a), JSON($0.b)] })]
+        try FS.write(path, json.dump(indent: 1))
+    }
+
+    public static func load(_ path: String) throws -> BPETokenizer {
+        let json = try JSON.parse(try FS.read(path))
+        var t = BPETokenizer()
+        for (i, m) in (json["merges"].array ?? []).enumerated() {
+            guard let a = m[0].int, let b = m[1].int else { throw DataFrameError(description: "\(path): bad merge \(i)") }
+            t.ranks[Pair(a, b)] = i
+            t.merges.append(Pair(a, b))
+        }
+        return t
+    }
+
+    enum CodingKeys: String, CodingKey { case merges }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        merges = try c.decode([Pair].self, forKey: .merges)
+        for (i, p) in merges.enumerated() { ranks[p] = i }
+    }
+}
+
+/// Character-level tokenizer (handy for small experiments).
+public struct CharTokenizer: Sendable {
+    public let alphabet: [Character]
+    let index: [Character: Int]
+    public init(_ text: String) {
+        alphabet = Array(Set(text)).sorted()
+        index = Dictionary(uniqueKeysWithValues: alphabet.enumerated().map { ($1, $0) })
+    }
+    public var vocabularySize: Int { alphabet.count }
+    public func encode(_ s: String) -> [Int] { s.compactMap { index[$0] } }
+    public func decode(_ ids: [Int]) -> String { String(ids.map { alphabet[$0] }) }
+}
+
+// MARK: - Sampling (swift-transformers GenerationConfig)
+
+public enum Sampling: Sendable {
+    case greedy
+    case temperature(Float)
+    case topK(Int, temperature: Float)
+    case topP(Float, temperature: Float)
+}
+
+/// Picks a token id from a logits vector (the last row if 2-D).
+public func sample<G: RandomNumberGenerator>(_ logits: Tensor, _ strategy: Sampling, using rng: inout G) -> Int {
+    let v = logits.shape.last ?? logits.count
+    let row = Array(logits.data[(logits.count - v)...])
+    func softmax(_ x: [Float], _ t: Float) -> [Double] {
+        let m = x.max() ?? 0
+        let e = x.map { Double(expf(($0 - m) / Swift.max(t, 1e-6))) }
+        let s = e.reduce(0, +)
+        return e.map { $0 / s }
+    }
+    switch strategy {
+    case .greedy:
+        return row.indices.max { row[$0] < row[$1] } ?? 0
+    case .temperature(let t):
+        return rng.weightedIndex(softmax(row, t))
+    case .topK(let k, let t):
+        let top = row.indices.sorted { row[$0] > row[$1] }.prefix(Swift.max(1, k))
+        let p = softmax(top.map { row[$0] }, t)
+        return Array(top)[rng.weightedIndex(p)]
+    case .topP(let pMax, let t):
+        let order = row.indices.sorted { row[$0] > row[$1] }
+        let probs = softmax(order.map { row[$0] }, t)
+        var kept = 0
+        var total = 0.0
+        while kept < order.count && (total < Double(pMax) || kept == 0) { total += probs[kept]; kept += 1 }
+        return order[rng.weightedIndex(Array(probs[..<kept]))]
+    }
+}
+
+/// Autoregressive generation: `nextLogits(context)` returns logits whose last row predicts the next token.
+public func generate(prompt: [Int], maxTokens: Int, sampling: Sampling = .greedy, seed: UInt64 = 0,
+                     contextLength: Int? = nil, stopAt stop: Int? = nil,
+                     _ nextLogits: ([Int]) -> Tensor) -> [Int] {
+    var rng = PCG32(seed: seed)
+    var tokens = prompt
+    for _ in 0 ..< maxTokens {
+        let context = contextLength.map { Array(tokens.suffix($0)) } ?? tokens
+        let logits = withNoGrad { nextLogits(context) }
+        let t = sample(logits, sampling, using: &rng)
+        tokens.append(t)
+        if t == stop { break }
+    }
+    return tokens
+}

@@ -1,0 +1,265 @@
+// Sorting, rewritten in M++ to beat the standard library's `sort()`.
+//
+//   var xs: [Int] = ...
+//   xs.mppSort()                 // any Comparable: pattern-defeating quicksort
+//   xs.mppSort(by: >)            // with a predicate
+//   xs.radixSort()               // integers and floating point: LSD radix, O(n)
+//
+// mppSort is not stable (like C++'s std::sort); use the standard library's
+// stable `sort()` when equal elements must keep their order. radixSort is
+// stable. Both run on the array's storage directly: every index below stays
+// inside 0..<count by construction (partition bounds), checked once up front.
+
+extension MutableCollection where Self: RandomAccessCollection, Index == Int, Element: Comparable {
+    /// Sorts in place, ascending (unstable; pdqsort).
+    @inlinable public mutating func mppSort() { mppSort(by: <) }
+}
+
+extension MutableCollection where Self: RandomAccessCollection, Index == Int {
+    /// Sorts in place by `areInIncreasingOrder` (unstable; pdqsort).
+    @inlinable public mutating func mppSort(by areInIncreasingOrder: (Element, Element) -> Bool) {
+        let n = count
+        if n < 2 { return }
+        let start = startIndex
+        let done: Void? = withContiguousMutableStorageIfAvailable { buf in
+            _pdqsort(buf.baseAddress!, 0, n, areInIncreasingOrder, badAllowed: n.bitWidth - n.leadingZeroBitCount, leftmost: true)
+        }
+        if done == nil {
+            var copy = Array(self)
+            copy.mppSort(by: areInIncreasingOrder)
+            for (i, v) in copy.enumerated() { self[start + i] = v }
+        }
+    }
+}
+
+// MARK: - pdqsort (Orson Peters' pattern-defeating quicksort)
+
+@inlinable @inline(__always)
+func _insertionSort<T>(_ a: UnsafeMutablePointer<T>, _ lo: Int, _ hi: Int, _ less: (T, T) -> Bool) {
+    var i = lo &+ 1
+    while i < hi {
+        let x = (a + i).move()
+        var j = i
+        while j > lo && less(x, a[j &- 1]) { (a + j).moveInitialize(from: a + (j &- 1), count: 1); j &-= 1 }
+        (a + j).initialize(to: x)
+        i &+= 1
+    }
+}
+
+/// Insertion sort that gives up after a few moves (detects nearly-sorted runs).
+@inlinable @inline(__always)
+func _partialInsertionSort<T>(_ a: UnsafeMutablePointer<T>, _ lo: Int, _ hi: Int, _ less: (T, T) -> Bool) -> Bool {
+    var moves = 0
+    var i = lo &+ 1
+    while i < hi {
+        if less(a[i], a[i &- 1]) {
+            let x = (a + i).move()
+            var j = i
+            repeat { (a + j).moveInitialize(from: a + (j &- 1), count: 1); j &-= 1 } while j > lo && less(x, a[j &- 1])
+            (a + j).initialize(to: x)
+            moves &+= i &- j
+            if moves > 8 { return false }
+        }
+        i &+= 1
+    }
+    return true
+}
+
+@inlinable @inline(__always)
+func _swap<T>(_ a: UnsafeMutablePointer<T>, _ i: Int, _ j: Int) {
+    if i != j { let t = a[i]; a[i] = a[j]; a[j] = t }
+}
+
+@inlinable @inline(__always)
+func _sort3<T>(_ a: UnsafeMutablePointer<T>, _ i: Int, _ j: Int, _ k: Int, _ less: (T, T) -> Bool) {
+    if less(a[j], a[i]) { _swap(a, i, j) }
+    if less(a[k], a[j]) { _swap(a, j, k); if less(a[j], a[i]) { _swap(a, i, j) } }
+}
+
+@inlinable
+func _heapSort<T>(_ a: UnsafeMutablePointer<T>, _ lo: Int, _ hi: Int, _ less: (T, T) -> Bool) {
+    let n = hi - lo
+    func sift(_ start: Int, _ end: Int) {
+        var root = start
+        while true {
+            var child = 2 * root + 1
+            if child >= end { return }
+            if child + 1 < end && less(a[lo + child], a[lo + child + 1]) { child += 1 }
+            if !less(a[lo + root], a[lo + child]) { return }
+            _swap(a, lo + root, lo + child)
+            root = child
+        }
+    }
+    var s = n / 2 - 1
+    while s >= 0 { sift(s, n); s -= 1 }
+    var e = n - 1
+    while e > 0 { _swap(a, lo, lo + e); sift(0, e); e -= 1 }
+}
+
+/// Partitions [lo, hi) around a[lo]; returns the pivot's final index and
+/// whether the range was already partitioned.
+@inlinable @inline(__always)
+func _partitionRight<T>(_ a: UnsafeMutablePointer<T>, _ lo: Int, _ hi: Int, _ less: (T, T) -> Bool) -> (Int, Bool) {
+    let pivot = a[lo]                 // a copy: a[lo] stays valid until the final swap
+    var first = lo &+ 1, last = hi
+    while less(a[first], pivot) { first &+= 1 }
+    if first &- 1 == lo { while first < last { last &-= 1; if less(a[last], pivot) { break } } }
+    else { repeat { last &-= 1 } while !less(a[last], pivot) }
+    let already = first >= last
+    while first < last {
+        _swap(a, first, last)
+        repeat { first &+= 1 } while less(a[first], pivot)
+        repeat { last &-= 1 } while !less(a[last], pivot)
+    }
+    let p = first &- 1
+    _swap(a, lo, p)
+    return (p, already)
+}
+
+/// Elements equal to a[lo] go left; returns the pivot's final index.
+@inlinable @inline(__always)
+func _partitionLeft<T>(_ a: UnsafeMutablePointer<T>, _ lo: Int, _ hi: Int, _ less: (T, T) -> Bool) -> Int {
+    let pivot = a[lo]
+    var first = lo, last = hi
+    repeat { last &-= 1 } while less(pivot, a[last])
+    if last &+ 1 == hi { while first < last { first &+= 1; if less(pivot, a[first]) { break } } }
+    else { repeat { first &+= 1 } while !less(pivot, a[first]) }
+    while first < last {
+        _swap(a, first, last)
+        repeat { last &-= 1 } while less(pivot, a[last])
+        repeat { first &+= 1 } while !less(pivot, a[first])
+    }
+    _swap(a, lo, last)
+    return last
+}
+
+@inlinable
+func _pdqsort<T>(_ a: UnsafeMutablePointer<T>, _ lo0: Int, _ hi: Int, _ less: (T, T) -> Bool, badAllowed bad0: Int, leftmost left0: Bool) {
+    var lo = lo0, bad = bad0, leftmost = left0
+    while true {
+        let size = hi &- lo
+        if size < 24 {
+            _insertionSort(a, lo, hi, less)
+            return
+        }
+        // Pivot: median of 3 (ninther for large ranges), moved to a[lo].
+        let mid = lo &+ size / 2
+        if size > 128 {
+            _sort3(a, lo, mid, hi &- 1, less)
+            _sort3(a, lo &+ 1, mid &- 1, hi &- 2, less)
+            _sort3(a, lo &+ 2, mid &+ 1, hi &- 3, less)
+            _sort3(a, mid &- 1, mid, mid &+ 1, less)
+            _swap(a, lo, mid)
+        } else {
+            _sort3(a, mid, lo, hi &- 1, less)
+        }
+        // Many equal elements: put those equal to the pivot left, skip them.
+        if !leftmost && !less(a[lo &- 1], a[lo]) {
+            lo = _partitionLeft(a, lo, hi, less) &+ 1
+            continue
+        }
+        let (p, already) = _partitionRight(a, lo, hi, less)
+        let leftSize = p &- lo, rightSize = hi &- (p &+ 1)
+        if leftSize < size / 8 || rightSize < size / 8 {
+            bad &-= 1
+            if bad == 0 { _heapSort(a, lo, hi, less); return }
+            // Break patterns by swapping a few elements.
+            if leftSize >= 24 { _swap(a, lo, lo &+ leftSize / 4); _swap(a, p &- 1, p &- leftSize / 4) }
+            if rightSize >= 24 { _swap(a, p &+ 1, p &+ 1 &+ rightSize / 4); _swap(a, hi &- 1, hi &- rightSize / 4) }
+        } else if already && _partialInsertionSort(a, lo, p, less) && _partialInsertionSort(a, p &+ 1, hi, less) {
+            return
+        }
+        // Recurse into the smaller side, loop on the larger.
+        if leftSize < rightSize {
+            _pdqsort(a, lo, p, less, badAllowed: bad, leftmost: leftmost)
+            lo = p &+ 1
+            leftmost = false
+        } else {
+            _pdqsort(a, p &+ 1, hi, less, badAllowed: bad, leftmost: false)
+            return _pdqsort(a, lo, p, less, badAllowed: bad, leftmost: leftmost)
+        }
+    }
+}
+
+// MARK: - Radix sort (integers and floating point)
+
+/// Types radix-sortable through an order-preserving, reversible unsigned key.
+public protocol RadixSortable {
+    associatedtype RadixKey: FixedWidthInteger & UnsignedInteger
+    var radixKey: RadixKey { get }
+    init(radixKey: RadixKey)
+}
+extension UInt: RadixSortable { @inlinable public var radixKey: UInt { self }; @inlinable public init(radixKey k: UInt) { self = k } }
+extension UInt64: RadixSortable { @inlinable public var radixKey: UInt64 { self }; @inlinable public init(radixKey k: UInt64) { self = k } }
+extension UInt32: RadixSortable { @inlinable public var radixKey: UInt32 { self }; @inlinable public init(radixKey k: UInt32) { self = k } }
+extension UInt16: RadixSortable { @inlinable public var radixKey: UInt16 { self }; @inlinable public init(radixKey k: UInt16) { self = k } }
+extension UInt8: RadixSortable { @inlinable public var radixKey: UInt8 { self }; @inlinable public init(radixKey k: UInt8) { self = k } }
+extension Int: RadixSortable {
+    @inlinable public var radixKey: UInt { UInt(bitPattern: self) ^ (1 << (UInt.bitWidth - 1)) }
+    @inlinable public init(radixKey k: UInt) { self = Int(bitPattern: k ^ (1 << (UInt.bitWidth - 1))) }
+}
+extension Int64: RadixSortable {
+    @inlinable public var radixKey: UInt64 { UInt64(bitPattern: self) ^ (1 << 63) }
+    @inlinable public init(radixKey k: UInt64) { self = Int64(bitPattern: k ^ (1 << 63)) }
+}
+extension Int32: RadixSortable {
+    @inlinable public var radixKey: UInt32 { UInt32(bitPattern: self) ^ (1 << 31) }
+    @inlinable public init(radixKey k: UInt32) { self = Int32(bitPattern: k ^ (1 << 31)) }
+}
+extension Int16: RadixSortable {
+    @inlinable public var radixKey: UInt16 { UInt16(bitPattern: self) ^ (1 << 15) }
+    @inlinable public init(radixKey k: UInt16) { self = Int16(bitPattern: k ^ (1 << 15)) }
+}
+extension Double: RadixSortable {
+    /// Negative numbers: flip all bits; positive: flip the sign (IEEE total order, NaNs last).
+    @inlinable public var radixKey: UInt64 { let b = bitPattern; return b >> 63 == 1 ? ~b : b | (1 << 63) }
+    @inlinable public init(radixKey k: UInt64) { self = Double(bitPattern: k >> 63 == 1 ? k & ~(1 << 63) : ~k) }
+}
+extension Float: RadixSortable {
+    @inlinable public var radixKey: UInt32 { let b = bitPattern; return b >> 31 == 1 ? ~b : b | (1 << 31) }
+    @inlinable public init(radixKey k: UInt32) { self = Float(bitPattern: k >> 31 == 1 ? k & ~(1 << 31) : ~k) }
+}
+
+extension Array where Element: RadixSortable {
+    /// Sorts ascending in O(n · passes): the elements become order-preserving
+    /// unsigned keys, the keys are sorted with 11-bit LSD radix passes (6 for
+    /// 64-bit values, 3 for 32-bit), and turned back. Passes whose digit is the
+    /// same for every element are skipped.
+    @inlinable public mutating func radixSort() {
+        let n = count
+        if n < 256 { mppSort { $0.radixKey < $1.radixKey }; return }
+        typealias K = Element.RadixKey
+        let bits = K.bitWidth, digitBits = bits <= 8 ? 8 : 11
+        let passes = (bits + digitBits - 1) / digitBits, buckets = 1 << digitBits, mask = K(buckets - 1)
+        let keys = UnsafeMutablePointer<K>.allocate(capacity: n), temp = UnsafeMutablePointer<K>.allocate(capacity: n)
+        let counts = UnsafeMutablePointer<Int>.allocate(capacity: buckets * passes)
+        defer { keys.deallocate(); temp.deallocate(); counts.deallocate() }
+        counts.initialize(repeating: 0, count: buckets * passes)
+        withUnsafeBufferPointer { src in
+            for i in 0 ..< n {
+                let k = src[i].radixKey
+                keys[i] = k
+                var v = k
+                for p in 0 ..< passes { counts[p &* buckets &+ Int(truncatingIfNeeded: v & mask)] &+= 1; v = digitBits >= bits ? 0 : v >> digitBits }
+            }
+        }
+        var src = keys, dst = temp
+        for p in 0 ..< passes {
+            let h = counts + p * buckets
+            var trivial = false
+            for d in 0 ..< buckets where h[d] == n { trivial = true; break }
+            if trivial { continue }
+            var sum = 0
+            for d in 0 ..< buckets { let c = h[d]; h[d] = sum; sum &+= c }       // counts -> start offsets
+            let shift = K(p * digitBits)
+            for i in 0 ..< n {
+                let k = src[i]
+                let d = Int(truncatingIfNeeded: (k >> shift) & mask)
+                dst[h[d]] = k
+                h[d] &+= 1
+            }
+            swap(&src, &dst)
+        }
+        withUnsafeMutableBufferPointer { out in for i in 0 ..< n { out[i] = Element(radixKey: src[i]) } }
+    }
+}

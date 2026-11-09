@@ -1,0 +1,367 @@
+// MppKit — TokenFile: memory-mapped token storage that opens in microseconds.
+//
+//   // Write (parallel, atomic):
+//   let w = try TokenWriter(creating: "corpus.mtok", width: .u16, capacity: 1_000_000_000)
+//   w.append(contentsOf: ids)                     // or w.fill(count:) { range, buffer in ... } on all cores
+//   try w.finish()                                // checksums, header, atomic rename
+//
+//   // Read: open is O(1): header check + mmap, no data is read.
+//   let tokens = try TokenFile("corpus.mtok")     // a few microseconds, any size
+//   tokens[123_456_789]                           // the OS pages data in on first touch
+//   tokens.window(at: i, length: 2048)            // training context
+//   try tokens.verify()                           // optional full integrity check, all cores
+//
+// File layout (little-endian):
+//   0     header, 64 bytes: magic "MPPTOK\0\1", version, width, count,
+//         vocabulary, flags, data offset, checksum-table offset, CRC32
+//   4096  token data, `width` bytes per token
+//   ...   optional checksum table: one 64-bit hash per 1Mi-token block
+//
+// Safety:
+//   * the header carries a CRC32, and the file size is checked against it;
+//   * every access is bounds-checked;
+//   * readers map the file read-only;
+//   * writers build a temporary file and rename it into place, so readers
+//     never see a half-written file;
+//   * block checksums detect silent corruption.
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+public enum TokenWidth: Int, Sendable {
+    case u8 = 1, u16 = 2, u32 = 4
+    public var maxToken: Int { self == .u8 ? 0xFF : self == .u16 ? 0xFFFF : Int(UInt32.max) }
+}
+
+public struct TokenFileError: Error, CustomStringConvertible, Sendable {
+    public let description: String
+    init(_ path: String, _ what: String) { description = "\(path): \(what)" }
+}
+
+enum _TokenFormat {
+    static let magic: UInt64 = 0x0100_4B4F_5450_504D   // "MPPTOK\0\1" little-endian
+    static let version: UInt32 = 1
+    static let headerSize = 64
+    static let dataOffset = 4096
+    static let blockTokens = 1 << 20
+    static let flagChecksums: UInt32 = 1
+}
+
+// MARK: - Hashing (bit-mixing, no tables needed for the 64-bit hash)
+
+/// CRC-32 (IEEE), table-driven.
+public enum CRC32 {
+    static let table: [UInt32] = (0 ..< 256).map { i -> UInt32 in
+        var c = UInt32(i)
+        for _ in 0 ..< 8 { c = c & 1 != 0 ? 0xEDB8_8320 ^ (c >> 1) : c >> 1 }
+        return c
+    }
+    public static func checksum(_ bytes: UnsafeRawBufferPointer) -> UInt32 {
+        var c: UInt32 = 0xFFFF_FFFF
+        for b in bytes { c = table[Int((c ^ UInt32(b)) & 0xFF)] ^ (c >> 8) }
+        return c ^ 0xFFFF_FFFF
+    }
+}
+
+/// Fast 64-bit hash of a byte range: 8 bytes per step, multiply-xor mixing.
+@inlinable
+public func hash64(_ p: UnsafeRawPointer, _ count: Int, seed: UInt64 = 0x9E37_79B9_7F4A_7C15) -> UInt64 {
+    var h = seed ^ (UInt64(count) &* 0xFF51_AFD7_ED55_8CCD)
+    var i = 0
+    while i + 8 <= count {
+        var k = UInt64(littleEndian: p.loadUnaligned(fromByteOffset: i, as: UInt64.self))
+        k &*= 0x87C3_7B91_1142_53D5
+        k = (k << 31) | (k >> 33)
+        h ^= k &* 0x4CF5_AD43_2745_937F
+        h = ((h << 27) | (h >> 37)) &* 5 &+ 0x52DC_E729
+        i += 8
+    }
+    while i < count { h = (h ^ UInt64(p.load(fromByteOffset: i, as: UInt8.self))) &* 0x0000_0100_0000_01B3; i += 1 }
+    h ^= h >> 33; h &*= 0xFF51_AFD7_ED55_8CCD; h ^= h >> 33; h &*= 0xC4CE_B9FE_1A85_EC53; h ^= h >> 33
+    return h
+}
+
+// MARK: - Reader
+
+public final class TokenFile: @unchecked Sendable, RandomAccessCollection {
+    public let path: String
+    public let count: Int
+    public let width: TokenWidth
+    public let vocabulary: Int
+    public let hasChecksums: Bool
+    let mapping: UnsafeMutableRawPointer
+    let mappedLength: Int
+    @usableFromInline let data: UnsafeRawPointer
+    let checksumOffset: Int
+
+    /// Opens and validates the header; maps the file without reading its data.
+    public init(_ path: String) throws(TokenFileError) {
+        self.path = path
+        let fd = open(path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { throw TokenFileError(path, String(cString: strerror(errno))) }
+        defer { close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { throw TokenFileError(path, "cannot stat") }
+        let size = Int(st.st_size)
+        guard size >= _TokenFormat.headerSize else { throw TokenFileError(path, "too small to be a token file") }
+        var header = [UInt8](repeating: 0, count: _TokenFormat.headerSize)
+        let got = header.withUnsafeMutableBytes { pread(fd, $0.baseAddress, _TokenFormat.headerSize, 0) }
+        guard got == _TokenFormat.headerSize else { throw TokenFileError(path, "cannot read header") }
+        var r = ByteReader(header, endian: .little)
+        let magic = (try? r.read(UInt64.self)) ?? 0
+        let version = (try? r.read(UInt32.self)) ?? 0
+        let w = (try? r.read(UInt32.self)) ?? 0
+        let n = (try? r.read(UInt64.self)) ?? 0
+        let vocab = (try? r.read(UInt32.self)) ?? 0
+        let flags = (try? r.read(UInt32.self)) ?? 0
+        let dataOffset = Int((try? r.read(UInt64.self)) ?? 0)
+        let sumOffset = Int((try? r.read(UInt64.self)) ?? 0)
+        let storedCRC = UInt32(header[60]) | UInt32(header[61]) << 8 | UInt32(header[62]) << 16 | UInt32(header[63]) << 24
+        guard magic == _TokenFormat.magic else { throw TokenFileError(path, "not an M++ token file") }
+        guard version == _TokenFormat.version else { throw TokenFileError(path, "unsupported version \(version)") }
+        let crc = header.withUnsafeBytes { CRC32.checksum(UnsafeRawBufferPointer(rebasing: $0[0 ..< 60])) }
+        guard crc == storedCRC else { throw TokenFileError(path, "header checksum mismatch (corrupt file)") }
+        guard let tw = TokenWidth(rawValue: Int(w)) else { throw TokenFileError(path, "bad token width \(w)") }
+        let (dataBytes, o1) = Int(n).multipliedReportingOverflow(by: tw.rawValue)
+        guard !o1, dataOffset == _TokenFormat.dataOffset, dataOffset + dataBytes <= size else {
+            throw TokenFileError(path, "truncated: header says \(n) tokens but the file holds less")
+        }
+        let blocks = (Int(n) + _TokenFormat.blockTokens - 1) / _TokenFormat.blockTokens
+        if flags & _TokenFormat.flagChecksums != 0 {
+            guard sumOffset >= dataOffset + dataBytes, sumOffset + blocks * 8 <= size else {
+                throw TokenFileError(path, "checksum table out of range")
+            }
+        }
+        guard let m = mmap(nil, size, PROT_READ, MAP_SHARED, fd, 0), m != UnsafeMutableRawPointer(bitPattern: -1) else {
+            throw TokenFileError(path, "mmap failed: \(String(cString: strerror(errno)))")
+        }
+        mapping = m
+        mappedLength = size
+        data = UnsafeRawPointer(m + dataOffset)
+        count = Int(n)
+        width = tw
+        vocabulary = Int(vocab)
+        hasChecksums = flags & _TokenFormat.flagChecksums != 0
+        checksumOffset = sumOffset
+    }
+
+    deinit { munmap(mapping, mappedLength) }
+
+    public var startIndex: Int { 0 }
+    public var endIndex: Int { count }
+
+    /// Token at `i` (bounds-checked).
+    @inlinable
+    public subscript(i: Int) -> Int {
+        precondition(i >= 0 && i < count, "TokenFile: index \(i) out of range 0..<\(count)")
+        return _load(i)
+    }
+
+    @usableFromInline
+    func _load(_ i: Int) -> Int {
+        switch width {
+        case .u8: return Int(data.load(fromByteOffset: i, as: UInt8.self))
+        case .u16: return Int(UInt16(littleEndian: data.loadUnaligned(fromByteOffset: i * 2, as: UInt16.self)))
+        case .u32: return Int(UInt32(littleEndian: data.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self)))
+        }
+    }
+
+    /// `length` tokens starting at `start`, copied out (e.g. a training context).
+    public func window(at start: Int, length: Int) -> [Int32] {
+        precondition(start >= 0 && length >= 0 && start + length <= count,
+                     "TokenFile.window: \(start)..<\(start + length) out of range 0..<\(count)")
+        return (start ..< start + length).map { Int32(truncatingIfNeeded: _load($0)) }
+    }
+
+    /// Zero-copy view of the raw tokens (the width must match `T`), valid only inside `body`.
+    public func withTokens<T: FixedWidthInteger & UnsignedInteger, R>(_ type: T.Type,
+                                                                       _ body: (UnsafeBufferPointer<T>) throws -> R) rethrows -> R {
+        precondition(MemoryLayout<T>.size == width.rawValue, "TokenFile.withTokens: file stores \(width.rawValue)-byte tokens")
+        return try body(UnsafeBufferPointer(start: data.assumingMemoryBound(to: T.self), count: count))
+    }
+
+    /// Hints the OS to start loading `range` now (madvise WILLNEED).
+    public func prefetch(_ range: Range<Int>) {
+        let pageMask = Int(getpagesize()) - 1
+        let start = (Int(bitPattern: data) + range.lowerBound * width.rawValue) & ~pageMask
+        let end = Int(bitPattern: data) + range.upperBound * width.rawValue
+        _ = madvise(UnsafeMutableRawPointer(bitPattern: start), end - start, MADV_WILLNEED)
+    }
+
+    /// Recomputes every block checksum in parallel. Throws on the first bad block.
+    public func verify() throws(TokenFileError) {
+        guard hasChecksums else { throw TokenFileError(path, "file has no checksums") }
+        let blocks = (count + _TokenFormat.blockTokens - 1) / _TokenFormat.blockTokens
+        let table = UnsafeRawPointer(mapping + checksumOffset)
+        let base = UnsafeSendable(data), tbl = UnsafeSendable(table)
+        let w = width.rawValue, n = count
+        let bad = Parallel.map(0 ..< blocks, grain: 1) { b -> Bool in
+            let start = b * _TokenFormat.blockTokens
+            let len = (Swift.min(start + _TokenFormat.blockTokens, n) - start) * w
+            let expect = UInt64(littleEndian: tbl.value.loadUnaligned(fromByteOffset: b * 8, as: UInt64.self))
+            return hash64(base.value + start * w, len) != expect
+        }
+        if let b = bad.firstIndex(of: true) { throw TokenFileError(path, "block \(b) is corrupt (tokens \(b * _TokenFormat.blockTokens)...)") }
+    }
+}
+
+// MARK: - Writer
+
+public final class TokenWriter {
+    public let path: String
+    public let width: TokenWidth
+    public let capacity: Int
+    public private(set) var count = 0
+    let vocabulary: Int
+    let tempPath: String
+    var fd: Int32
+    var mapping: UnsafeMutableRawPointer?
+    let mappedLength: Int
+    var finished = false
+
+    /// Creates a sparse file sized for `capacity` tokens and maps it. Space
+    /// is reserved logically and costs nothing until tokens are written.
+    public init(creating path: String, width: TokenWidth, capacity: Int, vocabulary: Int = 0) throws(TokenFileError) {
+        precondition(capacity >= 0, "TokenWriter: negative capacity")
+        self.path = path
+        self.width = width
+        self.capacity = capacity
+        self.vocabulary = vocabulary
+        tempPath = path + ".partial-\(getpid())"
+        fd = open(tempPath, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0o644)
+        guard fd >= 0 else { throw TokenFileError(path, String(cString: strerror(errno))) }
+        mappedLength = _TokenFormat.dataOffset + capacity * width.rawValue
+        guard ftruncate(fd, off_t(mappedLength)) == 0 else {
+            close(fd); unlink(tempPath)
+            throw TokenFileError(path, "cannot reserve \(mappedLength) bytes: \(String(cString: strerror(errno)))")
+        }
+        guard let m = mmap(nil, mappedLength, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0),
+              m != UnsafeMutableRawPointer(bitPattern: -1) else {
+            close(fd); unlink(tempPath)
+            throw TokenFileError(path, "mmap failed: \(String(cString: strerror(errno)))")
+        }
+        mapping = m
+    }
+
+    deinit {
+        if !finished {           // abandoned: remove the partial file
+            if let m = mapping { munmap(m, mappedLength) }
+            close(fd)
+            unlink(tempPath)
+        }
+    }
+
+    var base: UnsafeMutableRawPointer { mapping! + _TokenFormat.dataOffset }
+
+    @inline(__always) func store(_ i: Int, _ t: Int) {
+        precondition(t >= 0 && t <= width.maxToken, "TokenWriter: token \(t) does not fit \(width.rawValue) bytes")
+        switch width {
+        case .u8: base.storeBytes(of: UInt8(t), toByteOffset: i, as: UInt8.self)
+        case .u16: base.storeBytes(of: UInt16(t).littleEndian, toByteOffset: i * 2, as: UInt16.self)
+        case .u32: base.storeBytes(of: UInt32(t).littleEndian, toByteOffset: i * 4, as: UInt32.self)
+        }
+    }
+
+    public func append(_ token: Int) {
+        precondition(!finished && count < capacity, "TokenWriter: capacity \(capacity) exceeded")
+        store(count, token)
+        count += 1
+    }
+
+    public func append<S: Sequence>(contentsOf tokens: S) where S.Element: BinaryInteger {
+        for t in tokens { append(Int(t)) }
+    }
+
+    #if compiler(>=6.2)
+    /// Fills tokens count..<count+n in parallel; `body(range, buffer)` writes
+    /// raw tokens of this writer's width into `buffer` for its range.
+    public func fill<T: FixedWidthInteger & UnsignedInteger & SendableMetatype>(count n: Int, as type: T.Type,
+                                                             _ body: @Sendable (Range<Int>, UnsafeMutableBufferPointer<T>) -> Void) {
+        precondition(MemoryLayout<T>.size == width.rawValue, "TokenWriter.fill: writer stores \(width.rawValue)-byte tokens")
+        precondition(!finished && count + n <= capacity, "TokenWriter: capacity \(capacity) exceeded")
+        let start = count
+        let p = UnsafeSendable(base.assumingMemoryBound(to: T.self))
+        Parallel.forChunks(start ..< start + n, grain: Swift.max(1 << 16, n / (Parallel.threadCount * 4))) { r in
+            body(r, UnsafeMutableBufferPointer(start: p.value + r.lowerBound, count: r.count))
+        }
+        count += n
+    }
+    #else
+    /// Fills tokens count..<count+n in parallel; `body(range, buffer)` writes
+    /// raw tokens of this writer's width into `buffer` for its range.
+    public func fill<T: FixedWidthInteger & UnsignedInteger>(count n: Int, as type: T.Type,
+                                                             _ body: @Sendable (Range<Int>, UnsafeMutableBufferPointer<T>) -> Void) {
+        precondition(MemoryLayout<T>.size == width.rawValue, "TokenWriter.fill: writer stores \(width.rawValue)-byte tokens")
+        precondition(!finished && count + n <= capacity, "TokenWriter: capacity \(capacity) exceeded")
+        let start = count
+        let p = UnsafeSendable(base.assumingMemoryBound(to: T.self))
+        Parallel.forChunks(start ..< start + n, grain: Swift.max(1 << 16, n / (Parallel.threadCount * 4))) { r in
+            body(r, UnsafeMutableBufferPointer(start: p.value + r.lowerBound, count: r.count))
+        }
+        count += n
+    }
+    #endif
+
+    /// Writes checksums and the header, then atomically renames into place.
+    /// `durable: true` also waits for the data to reach the disk (fsync).
+    @discardableResult
+    public func finish(checksums: Bool = true, durable: Bool = false) throws(TokenFileError) -> TokenFile {
+        precondition(!finished, "TokenWriter.finish called twice")
+        let dataBytes = count * width.rawValue
+        let blocks = (count + _TokenFormat.blockTokens - 1) / _TokenFormat.blockTokens
+        var sums: [UInt64] = []
+        if checksums {
+            let b = UnsafeSendable(UnsafeRawPointer(base)), w = width.rawValue, n = count
+            sums = Parallel.map(0 ..< blocks, grain: 1) { k in
+                let s = k * _TokenFormat.blockTokens
+                return hash64(b.value + s * w, (Swift.min(s + _TokenFormat.blockTokens, n) - s) * w)
+            }
+        }
+        let sumOffset = checksums ? (_TokenFormat.dataOffset + dataBytes + 7) & ~7 : 0
+        var h = ByteWriter(endian: .little, reserving: 64)
+        h.write(_TokenFormat.magic)
+        h.write(_TokenFormat.version)
+        h.write(UInt32(width.rawValue))
+        h.write(UInt64(count))
+        h.write(UInt32(vocabulary))
+        h.write(checksums ? _TokenFormat.flagChecksums : 0)
+        h.write(UInt64(_TokenFormat.dataOffset))
+        h.write(UInt64(sumOffset))
+        var header = h.bytes
+        header += [UInt8](repeating: 0, count: 60 - header.count)
+        let crc = header.withUnsafeBytes { CRC32.checksum($0) }
+        header += [UInt8(crc & 0xFF), UInt8(crc >> 8 & 0xFF), UInt8(crc >> 16 & 0xFF), UInt8(crc >> 24)]
+
+        munmap(mapping!, mappedLength)
+        mapping = nil
+        let finalSize = checksums ? sumOffset + blocks * 8 : _TokenFormat.dataOffset + dataBytes
+        func fail(_ what: String) -> TokenFileError {
+            let e = TokenFileError(path, "\(what): \(String(cString: strerror(errno)))")
+            close(fd); unlink(tempPath); finished = true
+            return e
+        }
+        guard ftruncate(fd, off_t(finalSize)) == 0 else { throw fail("cannot size file") }
+        if checksums {
+            var table = ByteWriter(endian: .little, reserving: blocks * 8)
+            for s in sums { table.write(s) }
+            let written = table.bytes.withUnsafeBytes { pwrite(fd, $0.baseAddress, $0.count, off_t(sumOffset)) }
+            guard written == blocks * 8 else { throw fail("cannot write checksums") }
+        }
+        let wroteHeader = header.withUnsafeBytes { pwrite(fd, $0.baseAddress, 64, 0) }
+        guard wroteHeader == 64 else { throw fail("cannot write header") }
+        if durable && fsync(fd) != 0 { throw fail("fsync failed") }
+        close(fd)
+        guard rename(tempPath, path) == 0 else {
+            let e = TokenFileError(path, "rename failed: \(String(cString: strerror(errno)))")
+            unlink(tempPath); finished = true
+            throw e
+        }
+        finished = true
+        return try TokenFile(path)
+    }
+}

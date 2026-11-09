@@ -1,0 +1,146 @@
+// Metallic — shader math with Metal's names.
+//
+//   let c = float4(color.rgb * 0.5, 1)
+//   let n = normalize(float3(-grad, 1))
+//   let t = smoothstep(0, 1, length(p.xy))
+//
+// Vectors are Swift SIMD types, so arithmetic is element-wise and compiles
+// to vector instructions. `half` types compute at float precision on the CPU.
+
+public typealias float = Float
+public typealias float2 = SIMD2<Float>
+public typealias float3 = SIMD3<Float>
+public typealias float4 = SIMD4<Float>
+public typealias half = Float
+public typealias half2 = SIMD2<Float>
+public typealias half3 = SIMD3<Float>
+public typealias half4 = SIMD4<Float>
+public typealias int2 = SIMD2<Int32>
+public typealias int3 = SIMD3<Int32>
+public typealias int4 = SIMD4<Int32>
+public typealias uint = UInt32
+public typealias uint2 = SIMD2<UInt32>
+public typealias uint3 = SIMD3<UInt32>
+public typealias uint4 = SIMD4<UInt32>
+
+// MARK: - Constructors (float4(rgb, 1), float2(0.5), ...)
+
+extension SIMD2 where Scalar == Float {
+    @inlinable @inline(__always) public init(_ s: Float) { self.init(s, s) }
+    @inlinable @inline(__always) public init(_ v: SIMD2<UInt32>) { self.init(Float(v.x), Float(v.y)) }
+    @inlinable @inline(__always) public init(_ v: SIMD2<Int32>) { self.init(Float(v.x), Float(v.y)) }
+}
+extension SIMD3 where Scalar == Float {
+    @inlinable @inline(__always) public init(_ s: Float) { self.init(s, s, s) }
+    @inlinable @inline(__always) public init(_ xy: SIMD2<Float>, _ z: Float) { self.init(xy.x, xy.y, z) }
+    @inlinable @inline(__always) public init(_ x: Float, _ yz: SIMD2<Float>) { self.init(x, yz.x, yz.y) }
+}
+extension SIMD4 where Scalar == Float {
+    @inlinable @inline(__always) public init(_ s: Float) { self.init(s, s, s, s) }
+    @inlinable @inline(__always) public init(_ xyz: SIMD3<Float>, _ w: Float) { self.init(xyz.x, xyz.y, xyz.z, w) }
+    @inlinable @inline(__always) public init(_ xy: SIMD2<Float>, _ z: Float, _ w: Float) { self.init(xy.x, xy.y, z, w) }
+    @inlinable @inline(__always) public init(_ xy: SIMD2<Float>, _ zw: SIMD2<Float>) { self.init(xy.x, xy.y, zw.x, zw.y) }
+}
+
+// MARK: - Swizzles
+
+extension SIMD2 {
+    @inlinable public var yx: SIMD2<Scalar> { SIMD2(y, x) }
+    @inlinable public var r: Scalar { x }
+    @inlinable public var g: Scalar { y }
+}
+extension SIMD3 {
+    @inlinable public var xy: SIMD2<Scalar> { get { SIMD2(x, y) } set { x = newValue.x; y = newValue.y } }
+    @inlinable public var yz: SIMD2<Scalar> { SIMD2(y, z) }
+    @inlinable public var xz: SIMD2<Scalar> { SIMD2(x, z) }
+    @inlinable public var zyx: SIMD3<Scalar> { SIMD3(z, y, x) }
+    @inlinable public var r: Scalar { get { x } set { x = newValue } }
+    @inlinable public var g: Scalar { get { y } set { y = newValue } }
+    @inlinable public var b: Scalar { get { z } set { z = newValue } }
+    @inlinable public var rg: SIMD2<Scalar> { SIMD2(x, y) }
+    @inlinable public var bgr: SIMD3<Scalar> { SIMD3(z, y, x) }
+}
+extension SIMD4 {
+    @inlinable public var xy: SIMD2<Scalar> { get { SIMD2(x, y) } set { x = newValue.x; y = newValue.y } }
+    @inlinable public var zw: SIMD2<Scalar> { get { SIMD2(z, w) } set { z = newValue.x; w = newValue.y } }
+    @inlinable public var xyz: SIMD3<Scalar> { get { SIMD3(x, y, z) } set { x = newValue.x; y = newValue.y; z = newValue.z } }
+    @inlinable public var rgb: SIMD3<Scalar> { get { SIMD3(x, y, z) } set { x = newValue.x; y = newValue.y; z = newValue.z } }
+    @inlinable public var r: Scalar { get { x } set { x = newValue } }
+    @inlinable public var g: Scalar { get { y } set { y = newValue } }
+    @inlinable public var b: Scalar { get { z } set { z = newValue } }
+    @inlinable public var a: Scalar { get { w } set { w = newValue } }
+    @inlinable public var rg: SIMD2<Scalar> { SIMD2(x, y) }
+    @inlinable public var bgra: SIMD4<Scalar> { SIMD4(z, y, x, w) }
+}
+
+// MARK: - Scalar functions
+
+// sin, cos, pow, exp, ... for shaders: the platform's math, re-exported.
+#if canImport(Darwin)
+@_exported import Darwin
+#elseif canImport(Glibc)
+@_exported import Glibc
+#elseif canImport(Musl)
+@_exported import Musl
+#endif
+
+@inlinable @inline(__always) public func saturate(_ x: Float) -> Float { x < 0 ? 0 : (x > 1 ? 1 : x) }
+@inlinable @inline(__always) public func clamp(_ x: Float, _ lo: Float, _ hi: Float) -> Float { x < lo ? lo : (x > hi ? hi : x) }
+@inlinable @inline(__always) public func mix(_ a: Float, _ b: Float, _ t: Float) -> Float { a + (b - a) * t }
+@inlinable @inline(__always) public func step(_ edge: Float, _ x: Float) -> Float { x < edge ? 0 : 1 }
+@inlinable @inline(__always) public func smoothstep(_ e0: Float, _ e1: Float, _ x: Float) -> Float {
+    let t = saturate((x - e0) / (e1 - e0))
+    return t * t * (3 - 2 * t)
+}
+@inlinable @inline(__always) public func fract(_ x: Float) -> Float { x - x.rounded(.down) }
+@inlinable @inline(__always) public func sign(_ x: Float) -> Float { x > 0 ? 1 : (x < 0 ? -1 : 0) }
+@inlinable @inline(__always) public func rsqrt(_ x: Float) -> Float { 1 / x.squareRoot() }
+@inlinable @inline(__always) public func fmod(_ x: Float, _ y: Float) -> Float { x.truncatingRemainder(dividingBy: y) }
+@inlinable @inline(__always) public func radians(_ degrees: Float) -> Float { degrees * .pi / 180 }
+
+// MARK: - Vector functions (any SIMD vector of Float)
+
+@inlinable @inline(__always) public func dot<V: SIMD>(_ a: V, _ b: V) -> Float where V.Scalar == Float { (a * b).sum() }
+@inlinable @inline(__always) public func length<V: SIMD>(_ v: V) -> Float where V.Scalar == Float { (v * v).sum().squareRoot() }
+@inlinable @inline(__always) public func length_squared<V: SIMD>(_ v: V) -> Float where V.Scalar == Float { (v * v).sum() }
+@inlinable @inline(__always) public func distance<V: SIMD>(_ a: V, _ b: V) -> Float where V.Scalar == Float { length(a - b) }
+@inlinable @inline(__always) public func normalize<V: SIMD>(_ v: V) -> V where V.Scalar == Float {
+    let l = length(v)
+    return l > 0 ? v / l : v
+}
+@inlinable @inline(__always) public func mix<V: SIMD>(_ a: V, _ b: V, _ t: Float) -> V where V.Scalar == Float { a + (b - a) * t }
+@inlinable @inline(__always) public func mix<V: SIMD>(_ a: V, _ b: V, _ t: V) -> V where V.Scalar == Float { a + (b - a) * t }
+@inlinable @inline(__always) public func clamp<V: SIMD>(_ v: V, _ lo: Float, _ hi: Float) -> V where V.Scalar == Float {
+    v.clamped(lowerBound: V(repeating: lo), upperBound: V(repeating: hi))
+}
+@inlinable @inline(__always) public func clamp<V: SIMD>(_ v: V, _ lo: V, _ hi: V) -> V where V.Scalar == Float {
+    v.clamped(lowerBound: lo, upperBound: hi)
+}
+@inlinable @inline(__always) public func saturate<V: SIMD>(_ v: V) -> V where V.Scalar == Float { clamp(v, 0, 1) }
+@inlinable @inline(__always) public func abs<V: SIMD>(_ v: V) -> V where V.Scalar == Float { v.replacing(with: -v, where: v .< 0) }
+@inlinable @inline(__always) public func min<V: SIMD>(_ a: V, _ b: V) -> V where V.Scalar == Float { pointwiseMin(a, b) }
+@inlinable @inline(__always) public func max<V: SIMD>(_ a: V, _ b: V) -> V where V.Scalar == Float { pointwiseMax(a, b) }
+@inlinable @inline(__always) public func max<V: SIMD>(_ a: V, _ b: Float) -> V where V.Scalar == Float { pointwiseMax(a, V(repeating: b)) }
+@inlinable @inline(__always) public func min<V: SIMD>(_ a: V, _ b: Float) -> V where V.Scalar == Float { pointwiseMin(a, V(repeating: b)) }
+@inlinable @inline(__always) public func floor<V: SIMD>(_ v: V) -> V where V.Scalar == Float { v.rounded(.down) }
+@inlinable @inline(__always) public func ceil<V: SIMD>(_ v: V) -> V where V.Scalar == Float { v.rounded(.up) }
+@inlinable @inline(__always) public func fract<V: SIMD>(_ v: V) -> V where V.Scalar == Float { v - v.rounded(.down) }
+@inlinable @inline(__always) public func sqrt<V: SIMD>(_ v: V) -> V where V.Scalar == Float { var r = v; for i in r.indices { r[i] = r[i].squareRoot() }; return r }
+@inlinable @inline(__always) public func smoothstep<V: SIMD>(_ e0: Float, _ e1: Float, _ v: V) -> V where V.Scalar == Float {
+    var r = v
+    for i in r.indices { r[i] = smoothstep(e0, e1, v[i]) }
+    return r
+}
+@inlinable @inline(__always) public func step<V: SIMD>(_ edge: Float, _ v: V) -> V where V.Scalar == Float {
+    V.zero.replacing(with: 1, where: v .>= edge)
+}
+@inlinable @inline(__always) public func cross(_ a: float3, _ b: float3) -> float3 {
+    float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
+}
+@inlinable @inline(__always) public func reflect(_ i: float3, _ n: float3) -> float3 { i - 2 * dot(n, i) * n }
+@inlinable @inline(__always) public func refract(_ i: float3, _ n: float3, _ eta: Float) -> float3 {
+    let d = dot(n, i)
+    let k = 1 - eta * eta * (1 - d * d)
+    return k < 0 ? float3(0) : eta * i - (eta * d + k.squareRoot()) * n
+}
+@inlinable @inline(__always) public func select<V: SIMD>(_ a: V, _ b: V, _ c: Bool) -> V where V.Scalar == Float { c ? b : a }

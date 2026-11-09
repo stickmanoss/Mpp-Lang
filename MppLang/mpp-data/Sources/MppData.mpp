@@ -1,0 +1,552 @@
+// MppData — SwiftData for M++: persist your classes with almost no code.
+//
+//   import MppData
+//
+//   @Model final class Trip {
+//       @Attribute(.unique) var name: String
+//       var days: Int
+//       @Relationship(deleteRule: .cascade) var stops: [Stop] = []
+//       init(name: String, days: Int) { self.name = name; self.days = days }
+//   }
+//   @Model final class Stop {
+//       var city: String
+//       init(city: String) { self.city = city }
+//   }
+//
+//   let container = try ModelContainer(for: Trip.self, Stop.self)
+//   let context = container.mainContext
+//   let trip = Trip(name: "Japan", days: 10)
+//   trip.stops = [Stop(city: "Kyoto"), Stop(city: "Tokyo")]
+//   context.insert(trip)
+//   try context.save()
+//
+//   let long = try context.fetch(FetchDescriptor<Trip>(
+//       predicate: #Predicate { $0.days > 7 },
+//       sortBy: [SortDescriptor(\.name)]))
+//
+// `@Model` and `#Predicate` are expanded by the M++ front end (Swift does it
+// with macros). Stored properties can be numbers, Bool, String, optionals,
+// arrays and string-keyed dictionaries of those, any `RawRepresentable` enum
+// you mark `ModelValue`, and relationships to other @Model classes (one, an
+// optional one, or an array). The store is one JSON file, written atomically
+// on every save.
+
+import MppKit
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
+// MARK: - Values
+
+/// A type that can be stored in a @Model property.
+public protocol ModelValue {
+    func _mppEncode() -> JSON
+    static func _mppDecode(_ j: JSON) -> Self?
+    static var _mppZero: Self { get }
+}
+
+extension Int: ModelValue {
+    public func _mppEncode() -> JSON { .int(Int64(self)) }
+    public static func _mppDecode(_ j: JSON) -> Int? { j.int }
+    public static var _mppZero: Int { 0 }
+}
+extension Int64: ModelValue {
+    public func _mppEncode() -> JSON { .int(self) }
+    public static func _mppDecode(_ j: JSON) -> Int64? { j.int.map(Int64.init) }
+    public static var _mppZero: Int64 { 0 }
+}
+extension Int32: ModelValue {
+    public func _mppEncode() -> JSON { .int(Int64(self)) }
+    public static func _mppDecode(_ j: JSON) -> Int32? { j.int.flatMap { Int32(exactly: $0) } }
+    public static var _mppZero: Int32 { 0 }
+}
+extension UInt8: ModelValue {
+    public func _mppEncode() -> JSON { .int(Int64(self)) }
+    public static func _mppDecode(_ j: JSON) -> UInt8? { j.int.flatMap { UInt8(exactly: $0) } }
+    public static var _mppZero: UInt8 { 0 }
+}
+extension Double: ModelValue {
+    public func _mppEncode() -> JSON { .double(self) }
+    public static func _mppDecode(_ j: JSON) -> Double? { j.double }
+    public static var _mppZero: Double { 0 }
+}
+extension Float: ModelValue {
+    public func _mppEncode() -> JSON { .double(Double(self)) }
+    public static func _mppDecode(_ j: JSON) -> Float? { j.double.map(Float.init) }
+    public static var _mppZero: Float { 0 }
+}
+extension Bool: ModelValue {
+    public func _mppEncode() -> JSON { .bool(self) }
+    public static func _mppDecode(_ j: JSON) -> Bool? { j.bool }
+    public static var _mppZero: Bool { false }
+}
+extension String: ModelValue {
+    public func _mppEncode() -> JSON { .string(self) }
+    public static func _mppDecode(_ j: JSON) -> String? { j.string }
+    public static var _mppZero: String { "" }
+}
+extension Optional: ModelValue where Wrapped: ModelValue {
+    public func _mppEncode() -> JSON { self.map { $0._mppEncode() } ?? .null }
+    public static func _mppDecode(_ j: JSON) -> Wrapped?? { j == .null ? .some(nil) : Wrapped._mppDecode(j).map { .some($0) } }
+    public static var _mppZero: Wrapped? { nil }
+}
+extension Array: ModelValue where Element: ModelValue {
+    public func _mppEncode() -> JSON { .array(map { $0._mppEncode() }) }
+    public static func _mppDecode(_ j: JSON) -> [Element]? {
+        guard let a = j.array else { return nil }
+        var out: [Element] = []
+        for x in a { guard let e = Element._mppDecode(x) else { return nil }; out.append(e) }
+        return out
+    }
+    public static var _mppZero: [Element] { [] }
+}
+extension Dictionary: ModelValue where Key == String, Value: ModelValue {
+    public func _mppEncode() -> JSON {
+        var o = JSON.Object()
+        for k in keys.sorted() { o[k] = self[k]!._mppEncode() }
+        return .object(o)
+    }
+    public static func _mppDecode(_ j: JSON) -> [String: Value]? {
+        guard let o = j.object else { return nil }
+        var out: [String: Value] = [:]
+        for (k, v) in o { guard let x = Value._mppDecode(v) else { return nil }; out[k] = x }
+        return out
+    }
+    public static var _mppZero: [String: Value] { [:] }
+}
+/// Enums: `enum Kind: String, ModelValue { case a, b }` — nothing else to write.
+extension ModelValue where Self: RawRepresentable & CaseIterable, RawValue: ModelValue {
+    public func _mppEncode() -> JSON { rawValue._mppEncode() }
+    public static func _mppDecode(_ j: JSON) -> Self? { RawValue._mppDecode(j).flatMap(Self.init(rawValue:)) }
+    public static var _mppZero: Self { allCases.first! }
+}
+
+// MARK: - Models
+
+/// A model's identity: its entity and a number unique within it.
+public struct PersistentIdentifier: Hashable, Sendable, Comparable, CustomStringConvertible {
+    public let entityName: String
+    public let id: Int64          // 0 until the model is first saved
+    public var description: String { "\(entityName)#\(id)" }
+    public static func < (a: PersistentIdentifier, b: PersistentIdentifier) -> Bool {
+        (a.entityName, a.id) < (b.entityName, b.id)
+    }
+}
+
+/// Per-instance bookkeeping (generated into every @Model class).
+public final class _MppModelState {
+    var id: Int64 = 0
+    weak var context: ModelContext?
+    var lastSaved: JSON.Object?
+    public init() {}
+}
+
+/// What `@Model` makes a class conform to.
+public protocol PersistentModel: AnyObject {
+    var _mppState: _MppModelState { get }
+    static var _mppEntity: String { get }
+    static var _mppUnique: [String] { get }
+    init(_mppRecord r: _MppRecord)
+    func _mppEncode(_ r: inout _MppRecord)
+    func _mppReload(_ r: _MppRecord)
+    func _mppCascade() -> [any PersistentModel]
+}
+
+extension PersistentModel {
+    public var persistentModelID: PersistentIdentifier { PersistentIdentifier(entityName: Self._mppEntity, id: _mppState.id) }
+    /// The context this model was inserted into or fetched from.
+    public var modelContext: ModelContext? { _mppState.context }
+    public var isDeleted: Bool { _mppState.context?.deletedIDs.contains(ObjectIdentifier(self)) ?? false }
+}
+
+/// A model's stored form; the generated code reads and writes it.
+public struct _MppRecord {
+    public var fields = JSON.Object()
+    let context: ModelContext?
+
+    init(_ fields: JSON.Object, context: ModelContext?) { self.fields = fields; self.context = context }
+
+    public func get<T: ModelValue>(_ key: String) -> T {
+        guard let j = fields[key], let v = T._mppDecode(j) else { return T._mppZero }
+        return v
+    }
+    public mutating func set<T: ModelValue>(_ key: String, _ v: T) { fields[key] = v._mppEncode() }
+
+    public func model<T: PersistentModel>(_ key: String) -> T? {
+        guard let ref = fields[key]?.string, let ctx = context else { return nil }
+        return ctx.resolve(ref) as? T
+    }
+    public func requiredModel<T: PersistentModel>(_ key: String) -> T {
+        guard let m: T = model(key) else { preconditionFailure("MppData: \(T._mppEntity) relationship '\(key)' is missing") }
+        return m
+    }
+    public func models<T: PersistentModel>(_ key: String) -> [T] {
+        guard let refs = fields[key]?.array, let ctx = context else { return [] }
+        return refs.compactMap { $0.string.flatMap { ctx.resolve($0) as? T } }
+    }
+    public mutating func setModel<T: PersistentModel>(_ key: String, _ m: T?) {
+        guard let m else { fields[key] = .null; return }
+        context?.adopt(m)
+        fields[key] = .string(context?.reference(m) ?? "")
+    }
+    public mutating func setModels<T: PersistentModel>(_ key: String, _ ms: [T]) {
+        fields[key] = .array(ms.map { m in context?.adopt(m); return JSON.string(context?.reference(m) ?? "") })
+    }
+}
+
+// MARK: - Fetching
+
+/// A test applied to each model (what `#Predicate { ... }` becomes).
+public struct Predicate<T> {
+    let test: (T) throws -> Bool
+    public init(_ test: @escaping (T) throws -> Bool) { self.test = test }
+    public func evaluate(_ value: T) throws -> Bool { try test(value) }
+    public static var `true`: Predicate<T> { Predicate { _ in true } }
+}
+
+public enum SortOrder: Sendable { case forward, reverse }
+
+public struct SortDescriptor<T> {
+    let compare: (T, T) -> Bool     // strictly "comes before" in forward order
+    let equal: (T, T) -> Bool
+    public var order: SortOrder
+    public init<V: Comparable>(_ keyPath: KeyPath<T, V>, order: SortOrder = .forward) {
+        compare = { $0[keyPath: keyPath] < $1[keyPath: keyPath] }
+        equal = { $0[keyPath: keyPath] == $1[keyPath: keyPath] }
+        self.order = order
+    }
+    public init<V: Comparable>(_ keyPath: KeyPath<T, V?>, order: SortOrder = .forward) {
+        compare = { a, b in
+            switch (a[keyPath: keyPath], b[keyPath: keyPath]) {
+            case let (x?, y?): return x < y
+            case (nil, _?): return true           // nil first
+            default: return false
+            }
+        }
+        equal = { $0[keyPath: keyPath] == $1[keyPath: keyPath] }
+        self.order = order
+    }
+}
+
+public struct FetchDescriptor<T: PersistentModel> {
+    public var predicate: Predicate<T>?
+    public var sortBy: [SortDescriptor<T>]
+    public var fetchLimit: Int?
+    public var fetchOffset: Int?
+    public var includePendingChanges = true
+    public init(predicate: Predicate<T>? = nil, sortBy: [SortDescriptor<T>] = []) {
+        self.predicate = predicate
+        self.sortBy = sortBy
+    }
+}
+
+// MARK: - Container
+
+public struct ModelConfiguration: Sendable {
+    public var name: String
+    public var path: String?
+    public var isStoredInMemoryOnly: Bool
+    /// `path`: the store file; default `<app data>/MppData/<name>.store`.
+    public init(_ name: String = "default", path: String? = nil, isStoredInMemoryOnly: Bool = false) {
+        self.name = name
+        self.path = path
+        self.isStoredInMemoryOnly = isStoredInMemoryOnly
+    }
+    public init(isStoredInMemoryOnly: Bool) { self.init("default", isStoredInMemoryOnly: isStoredInMemoryOnly) }
+
+    var resolvedPath: String? {
+        if isStoredInMemoryOnly { return nil }
+        if let path { return path }
+        let home = getenv("HOME").map { String(cString: $0) } ?? "."
+        #if canImport(Darwin)
+        let dir = home + "/Library/Application Support/MppData"
+        #else
+        let dir = (getenv("XDG_DATA_HOME").map { String(cString: $0) } ?? home + "/.local/share") + "/MppData"
+        #endif
+        return dir + "/" + name + ".store"
+    }
+}
+
+public struct MppDataError: Error, CustomStringConvertible {
+    public let description: String
+    init(_ d: String) { description = d }
+}
+
+/// The store: every entity's records, in memory, backed by one file.
+public final class ModelContainer {
+    public let configuration: ModelConfiguration
+    var types: [String: any PersistentModel.Type] = [:]
+    var records: [String: [Int64: JSON.Object]] = [:]
+    var nextID: [String: Int64] = [:]
+    public private(set) lazy var mainContext = ModelContext(self)
+
+    public convenience init(for types: any PersistentModel.Type..., configurations: ModelConfiguration...) throws {
+        try self.init(for: types, configuration: configurations.first ?? ModelConfiguration())
+    }
+
+    public init(for types: [any PersistentModel.Type], configuration: ModelConfiguration = ModelConfiguration()) throws {
+        self.configuration = configuration
+        for t in types { self.types[t._mppEntity] = t }
+        try load()
+    }
+
+    func load() throws {
+        guard let path = configuration.resolvedPath, FS.exists(path) else { return }
+        let text: String
+        do { text = try FS.read(path) } catch { throw MppDataError("can't read the store \(path): \(error)") }
+        let root: JSON
+        do { root = try JSON.parse(text) } catch { throw MppDataError("the store \(path) is damaged: \(error)") }
+        guard let entities = root.object?["entities"]?.object else { return }
+        for (entity, value) in entities {
+            guard let rows = value.object else { continue }
+            var table: [Int64: JSON.Object] = [:]
+            for (id, fields) in rows { if let i = Int64(id), let f = fields.object { table[i] = f } }
+            records[entity] = table
+            nextID[entity] = (table.keys.max() ?? 0) + 1
+        }
+    }
+
+    func persist() throws {
+        guard let path = configuration.resolvedPath else { return }
+        var entities = JSON.Object()
+        for entity in records.keys.sorted() {
+            var rows = JSON.Object()
+            for id in records[entity]!.keys.sorted() { rows[String(id)] = .object(records[entity]![id]!) }
+            entities[entity] = .object(rows)
+        }
+        var root = JSON.Object()
+        root["format"] = "MppData 1"
+        root["entities"] = .object(entities)
+        let dir = String(path[..<(path.lastIndex(of: "/") ?? path.startIndex)])
+        if !dir.isEmpty { _ = makeDirectories(dir) }
+        do { try FS.write(path, JSON.object(root).dump()) } catch { throw MppDataError("can't write the store \(path): \(error)") }
+    }
+
+    /// Removes every record (and the store file's contents on the next save).
+    public func deleteAllData() throws {
+        records = [:]
+        nextID = [:]
+        mainContext.reset()
+        try persist()
+    }
+}
+
+@discardableResult
+func makeDirectories(_ path: String) -> Bool {
+    var p = ""
+    for part in path.split(separator: "/", omittingEmptySubsequences: false) {
+        p += (p.isEmpty && path.hasPrefix("/") ? "" : (p.isEmpty ? "" : "/")) + part
+        if p.isEmpty { p = "/"; continue }
+        if !FS.exists(p) { _ = mkdir(p, 0o755) }
+    }
+    return FS.exists(path)
+}
+
+// MARK: - Context
+
+/// Tracks inserted, changed and deleted models; `save()` writes them.
+public final class ModelContext {
+    public let container: ModelContainer
+    var registered: [ObjectIdentifier: any PersistentModel] = [:]      // every live model this context knows
+    var byID: [String: any PersistentModel] = [:]                       // "Entity#id" -> model
+    var inserted: [ObjectIdentifier] = []
+    var deletedIDs: Set<ObjectIdentifier> = []
+    var deleted: [any PersistentModel] = []
+    public var autosaveEnabled = false
+
+    public init(_ container: ModelContainer) { self.container = container }
+
+    // Insert / delete
+
+    public func insert<T: PersistentModel>(_ model: T) { adopt(model) }
+
+    func adopt(_ m: any PersistentModel) {
+        let oid = ObjectIdentifier(m)
+        if registered[oid] != nil { return }
+        registered[oid] = m
+        m._mppState.context = self
+        if m._mppState.id == 0 { inserted.append(oid) } else { byID[ref(type(of: m)._mppEntity, m._mppState.id)] = m }
+        if container.types[type(of: m)._mppEntity] == nil { container.types[type(of: m)._mppEntity] = type(of: m) }
+    }
+
+    public func delete<T: PersistentModel>(_ model: T) { remove(model) }
+
+    func remove(_ m: any PersistentModel) {
+        let oid = ObjectIdentifier(m)
+        guard !deletedIDs.contains(oid) else { return }
+        deletedIDs.insert(oid)
+        deleted.append(m)
+        for child in m._mppCascade() { remove(child) }
+    }
+
+    /// Deletes every model of a type that matches.
+    public func delete<T: PersistentModel>(model: T.Type, where predicate: Predicate<T>? = nil) throws {
+        for m in try fetch(FetchDescriptor<T>(predicate: predicate)) { remove(m) }
+    }
+
+    public var hasChanges: Bool {
+        if !inserted.isEmpty || !deleted.isEmpty { return true }
+        for m in registered.values where m._mppState.id != 0 {
+            var r = _MppRecord(JSON.Object(), context: self)
+            m._mppEncode(&r)
+            if r.fields != m._mppState.lastSaved { return true }
+        }
+        return false
+    }
+
+    // Save
+
+    /// Writes every insert, change and delete to the store.
+    public func save() throws {
+        // Give new models (and models they reach) identities, honoring @Attribute(.unique).
+        var i = 0
+        while i < inserted.count {
+            let oid = inserted[i]
+            i += 1
+            guard let m = registered[oid], m._mppState.id == 0, !deletedIDs.contains(oid) else { continue }
+            let entity = type(of: m)._mppEntity
+            var id: Int64 = 0
+            let unique = type(of: m)._mppUnique
+            if !unique.isEmpty {
+                var r = _MppRecord(JSON.Object(), context: self)
+                m._mppEncode(&r)
+                for (existing, fields) in container.records[entity] ?? [:]
+                    where unique.contains(where: { fields[$0] != nil && fields[$0] == r.fields[$0] }) {
+                    // Same unique value: the insert updates the existing model (an upsert, like SwiftData).
+                    id = existing
+                    if let old = byID[ref(entity, existing)], old !== m { registered[ObjectIdentifier(old)] = nil }
+                    break
+                }
+            }
+            if id == 0 {
+                id = container.nextID[entity] ?? 1
+                container.nextID[entity] = id + 1
+            }
+            m._mppState.id = id
+            byID[ref(entity, id)] = m
+        }
+        // Encoding may adopt related models that weren't inserted explicitly.
+        var changed = true
+        while changed {
+            changed = false
+            for m in Array(registered.values) where m._mppState.id == 0 && !deletedIDs.contains(ObjectIdentifier(m)) {
+                let entity = type(of: m)._mppEntity
+                let id = container.nextID[entity] ?? 1
+                container.nextID[entity] = id + 1
+                m._mppState.id = id
+                byID[ref(entity, id)] = m
+                changed = true
+            }
+            for m in Array(registered.values) where !deletedIDs.contains(ObjectIdentifier(m)) {
+                let before = registered.count
+                var r = _MppRecord(JSON.Object(), context: self)
+                m._mppEncode(&r)
+                if registered.count != before { changed = true }
+            }
+        }
+        for m in deleted where m._mppState.id != 0 {
+            let entity = type(of: m)._mppEntity
+            container.records[entity]?[m._mppState.id] = nil
+            byID[ref(entity, m._mppState.id)] = nil
+            registered[ObjectIdentifier(m)] = nil
+        }
+        for m in registered.values where !deletedIDs.contains(ObjectIdentifier(m)) {
+            var r = _MppRecord(JSON.Object(), context: self)
+            m._mppEncode(&r)
+            container.records[type(of: m)._mppEntity, default: [:]][m._mppState.id] = r.fields
+            m._mppState.lastSaved = r.fields
+        }
+        inserted = []
+        deleted = []
+        deletedIDs = []
+        try container.persist()
+    }
+
+    /// Throws away unsaved changes: inserts are dropped, deletes undone,
+    /// and changed models get their saved values back.
+    public func rollback() {
+        for oid in inserted { registered[oid]?._mppState.context = nil; registered[oid] = nil }
+        inserted = []
+        deleted = []
+        deletedIDs = []
+        for m in registered.values {
+            if let saved = container.records[type(of: m)._mppEntity]?[m._mppState.id] {
+                m._mppReload(_MppRecord(saved, context: self))
+            }
+        }
+    }
+
+    func reset() {
+        registered = [:]; byID = [:]; inserted = []; deleted = []; deletedIDs = []
+    }
+
+    // Fetch
+
+    public func fetch<T: PersistentModel>(_ d: FetchDescriptor<T>) throws -> [T] {
+        let entity = T._mppEntity
+        if container.types[entity] == nil { container.types[entity] = T.self }
+        var out: [T] = []
+        for id in (container.records[entity] ?? [:]).keys.sorted() {
+            guard let m = resolve(ref(entity, id)) as? T, !deletedIDs.contains(ObjectIdentifier(m)) else { continue }
+            out.append(m)
+        }
+        if d.includePendingChanges {
+            for oid in inserted where !deletedIDs.contains(oid) {
+                if let m = registered[oid] as? T, m._mppState.id == 0 { out.append(m) }
+            }
+        }
+        if let p = d.predicate { out = try out.filter { try p.evaluate($0) } }
+        if !d.sortBy.isEmpty {
+            out.sort { a, b in
+                for s in d.sortBy where !s.equal(a, b) {
+                    return s.order == .forward ? s.compare(a, b) : s.compare(b, a)
+                }
+                return false
+            }
+        }
+        if let off = d.fetchOffset { out = Array(out.dropFirst(off)) }
+        if let lim = d.fetchLimit { out = Array(out.prefix(lim)) }
+        return out
+    }
+
+    public func fetchCount<T: PersistentModel>(_ d: FetchDescriptor<T>) throws -> Int { try fetch(d).count }
+
+    /// All models of a type, in insertion order.
+    public func fetch<T: PersistentModel>(_ type: T.Type) throws -> [T] { try fetch(FetchDescriptor<T>()) }
+
+    public func model(for id: PersistentIdentifier) -> (any PersistentModel)? { resolve(ref(id.entityName, id.id)) }
+
+    // Identity map
+
+    func ref(_ entity: String, _ id: Int64) -> String { entity + "#" + String(id) }
+    func reference(_ m: any PersistentModel) -> String {
+        if m._mppState.id == 0 {          // reached through a relationship before it had an identity
+            let entity = type(of: m)._mppEntity
+            let id = container.nextID[entity] ?? 1
+            container.nextID[entity] = id + 1
+            m._mppState.id = id
+            byID[ref(entity, id)] = m
+        }
+        return ref(type(of: m)._mppEntity, m._mppState.id)
+    }
+
+    /// The one live instance for a stored record ("Entity#id").
+    func resolve(_ reference: String) -> (any PersistentModel)? {
+        if let m = byID[reference] { return m }
+        guard let hash = reference.lastIndex(of: "#"), let id = Int64(reference[reference.index(after: hash)...]) else { return nil }
+        let entity = String(reference[..<hash])
+        guard let t = container.types[entity], let fields = container.records[entity]?[id] else { return nil }
+        let m = t.init(_mppRecord: _MppRecord(fields, context: self))
+        m._mppState.id = id
+        m._mppState.context = self
+        m._mppState.lastSaved = fields
+        registered[ObjectIdentifier(m)] = m
+        byID[reference] = m
+        m._mppReload(_MppRecord(fields, context: self))      // relationships, now that m is registered
+        return m
+    }
+}

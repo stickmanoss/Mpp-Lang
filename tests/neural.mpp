@@ -1,0 +1,174 @@
+// Tests for neural (machine learning). Exits non-zero on failure.
+import neural
+
+nonisolated(unsafe) var failures = 0
+func check(_ ok: Bool, _ what: String, line: Int = #line) {
+    if !ok { failures += 1; print("FAIL line \(line): \(what)") }
+}
+
+// Numerical gradient check: compares autodiff with central differences.
+func gradCheck(_ name: String, _ shape: [Int], seed: UInt64 = 1, _ f: (Tensor) -> Tensor) {
+    var rng = PCG32(seed: seed)
+    let x = Tensor.randn(shape, using: &rng, requiresGrad: true)
+    f(x).sum().backward()
+    let analytic = x.grad!.data
+    var worst: Float = 0
+    for i in 0 ..< x.count {
+        let orig = x.data[i]
+        let h: Float = 1e-2
+        x.data[i] = orig + h
+        let up = withNoGrad { f(x).sum().item }
+        x.data[i] = orig - h
+        let down = withNoGrad { f(x).sum().item }
+        x.data[i] = orig
+        let numeric = (up - down) / (2 * h)
+        worst = max(worst, abs(numeric - analytic[i]) / max(1, abs(numeric)))
+    }
+    check(worst < 2e-2, "\(name) gradient error \(worst)")
+}
+
+var r = PCG32(seed: 9)
+let w = Tensor.randn([4, 3], using: &r)
+let w3 = Tensor.randn([2, 4, 3], using: &r)
+gradCheck("add/mul broadcast", [2, 4]) { ($0 * $0 + Tensor([1, 2, 3, 4])) * 0.5 }
+gradCheck("div", [3, 3]) { $0 / ($0.square() + 1) }
+gradCheck("exp/log/sqrt", [5]) { ($0.exp() + 1).log() + ($0.square() + 1).sqrt() }
+gradCheck("tanh/sigmoid", [6]) { $0.tanh() * $0.sigmoid() }
+gradCheck("gelu/silu", [6]) { $0.gelu() + $0.silu() }
+gradCheck("matmul", [2, 4]) { matmul($0, w) }
+gradCheck("batched matmul", [2, 3, 4]) { matmul($0, w3) }
+gradCheck("transpose", [2, 3, 4]) { $0.transposed([2, 0, 1]) * Tensor.arange(24).reshaped([4, 2, 3]) }
+gradCheck("sum/mean axis", [3, 4]) { $0.sum(axis: 0) * Tensor([1, 2, 3, 4]) + $0.mean(axis: 1, keepDims: true) }
+gradCheck("max", [3, 4]) { $0.max(axis: 1) }
+gradCheck("softmax", [2, 5]) { $0.softmax() * Tensor([1, 2, 3, 4, 5]) }
+gradCheck("logSoftmax", [2, 5]) { $0.logSoftmax() * Tensor([1, -2, 3, 0, 5]) }
+gradCheck("pick", [3, 4]) { $0.logSoftmax().pick([0, 3, 1]) }
+gradCheck("rows/narrow/concat", [4, 3]) { concatenate([$0.rows([2, 0, 2]), $0.narrow(0, 1, 2)], axis: 0).square() }
+gradCheck("im2col", [1, 2, 4, 4]) { $0.im2col(kernel: (3, 3), stride: 1, padding: 1).0.square() }
+gradCheck("variance", [3, 5]) { $0.variance(axis: -1) }
+
+// Autodiff basics and MLX-style grad transform
+let x0 = Tensor([[1, 2], [3, 4]], requiresGrad: true)
+(x0 * x0 + 1).sum().backward()
+check(x0.grad!.data == [2, 4, 6, 8], "x^2 grad")
+check(grad { ($0 * $0 * $0).sum() }(Tensor([2])).data == [12], "grad transform")
+check(withNoGrad { (x0 * 2).requiresGrad } == false, "no grad")
+
+// MLP on XOR with Adam + valueAndGrad
+Init.seed(1)
+let xor = Tensor([[0, 0], [0, 1], [1, 0], [1, 1]]), xorY = [0, 1, 1, 0]
+let mlp = Sequential(Linear(2, 16), Tanh(), Linear(16, 2))
+let opt = Adam(learningRate: 0.05)
+let stepXor = valueAndGrad(mlp) { m, x, y in crossEntropy(m(x), y) }
+var lossXor: Float = 0
+for _ in 0 ..< 300 { lossXor = stepXor(mlp, xor, xorY); opt.update(mlp) }
+check(lossXor < 0.05 && mlp(xor).argmax() == xorY, "xor mlp loss \(lossXor)")
+check(mlp.parameterCount == 2 * 16 + 16 + 16 * 2 + 2, "parameter count \(mlp.parameterCount)")
+
+// Tiny CNN: tell horizontal from vertical bars in 6x6 images
+func bars(_ n: Int, _ rng: inout PCG32) -> (Tensor, [Int]) {
+    var data = [Float](), labels = [Int]()
+    for _ in 0 ..< n {
+        let vertical = rng.bernoulli(0.5), pos = Int(rng.next32() % 6)
+        for i in 0 ..< 6 { for j in 0 ..< 6 { data.append(((vertical ? j : i) == pos ? 1 : 0) + Float(rng.unit()) * 0.2) } }
+        labels.append(vertical ? 1 : 0)
+    }
+    return (Tensor(data: data, shape: [n, 1, 6, 6]), labels)
+}
+Init.seed(2)
+var br = PCG32(seed: 3)
+let (imgs, imgLabels) = bars(64, &br)
+let cnn = Sequential(Conv2d(1, 4, kernel: 3, padding: 1), ReLU(), MaxPool2d(2), Flatten(), Linear(4 * 3 * 3, 2))
+let cnnOpt = Adam(learningRate: 0.02)
+let cnnStep = valueAndGrad(cnn) { m, x, y in crossEntropy(m(x), y) }
+for _ in 0 ..< 40 { _ = cnnStep(cnn, imgs, imgLabels); cnnOpt.update(cnn) }
+let (testImgs, testLabels) = bars(64, &br)
+let cnnAcc = Double(zip(cnn(testImgs).argmax(), testLabels).filter { $0 == $1 }.count) / 64
+check(cnnAcc > 0.95, "cnn accuracy \(cnnAcc)")
+
+// Layers: shapes and modes
+let ln = LayerNorm(4)
+let lnOut = ln(Tensor([[1, 2, 3, 4], [2, 2, 2, 6]]))
+check(abs(lnOut.mean(axis: -1).data[0]) < 1e-5 && abs(lnOut.variance(axis: -1).data[0] - 1) < 1e-3, "layer norm")
+let bn = BatchNorm(3)
+_ = bn(Tensor.randn([16, 3], using: &r))
+bn.eval()
+check(bn(Tensor.zeros([2, 3])).shape == [2, 3] && bn.runningMean.data != [0, 0, 0], "batch norm running stats")
+let drop = Dropout(0.5)
+check(drop(Tensor.ones([1000])).data.filter { $0 == 0 }.count > 300, "dropout train")
+drop.eval()
+check(drop(Tensor.ones([10])).data == [Float](repeating: 1, count: 10), "dropout eval")
+let lstm = LSTM(3, 5)
+check(lstm(Tensor.randn([7, 2, 3], using: &r)).shape == [7, 2, 5], "lstm shape")
+gradCheck("lstm", [4, 3]) { lstm($0) }
+let block = TransformerBlock(8, heads: 2)
+check(block(Tensor.randn([5, 8], using: &r)).shape == [5, 8], "transformer shape")
+gradCheck("attention", [3, 8]) { block($0) }
+let emb = Embedding(10, 4)
+check(emb([1, 2, 1]).shape == [3, 4], "embedding")
+
+// Learning-rate schedules
+check(abs(Schedule.cosineDecay(1, steps: 10)(5) - 0.5) < 1e-6 && Schedule.warmup(4, then: .constant(1))(1) == 0.5, "schedules")
+
+// safetensors round trip
+try mlp.save("/tmp/neural-test.safetensors", metadata: ["task": "xor"])
+Init.seed(99)
+let restored = Sequential(Linear(2, 16), Tanh(), Linear(16, 2))
+let meta = try restored.load("/tmp/neural-test.safetensors")
+check(restored(xor).data == mlp(xor).data && meta["task"] == "xor" && meta["model"] == "Sequential", "safetensors")
+check(halfToFloat(0x3C00) == 1 && halfToFloat(0xC000) == -2 && halfToFloat(0x0001) > 0, "half floats")
+
+// DataFrame + Create ML-style classifier and regressor
+var csv = "x1,x2,color,label\n"
+var dr = PCG32(seed: 5)
+for _ in 0 ..< 300 {
+    let a = dr.unit() * 4 - 2, b = dr.unit() * 4 - 2
+    let color = dr.bernoulli(0.5) ? "red" : "blue"
+    let label = a * a + b * b < 1.5 ? "inner" : (color == "red" ? "outer-red" : "outer-blue")
+    csv += format("{:.4f},{:.4f},{},{}\n", a, b, color, label)
+}
+let df = try DataFrame(csv: csv)
+check(df.rowCount == 300 && df.columnNames == ["x1", "x2", "color", "label"], "csv parse")
+check(try DataFrame(csv: "a,b\n\"x, \"\"y\"\"\",2\n").strings("a") == ["x, \"y\""], "csv quotes")
+let (train, test) = df.randomSplit(0.8, seed: 1)
+let clf = try MLClassifier(trainingData: train, targetColumn: "label",
+                           parameters: TrainingParameters(hiddenLayers: [32], epochs: 60, learningRate: 0.02))
+let evalMetrics = try clf.evaluation(on: test)
+check(clf.trainingMetrics.accuracy > 0.95 && evalMetrics.accuracy > 0.9, "classifier \(clf.trainingMetrics.accuracy) / \(evalMetrics.accuracy)")
+check(evalMetrics.classes == ["inner", "outer-blue", "outer-red"], "classes")
+var housesCSV = "size,rooms,price\n"
+for _ in 0 ..< 200 {
+    let size = 50 + dr.unit() * 150, rooms = Double(1 + Int(dr.next32() % 5))
+    housesCSV += format("{:.1f},{},{:.1f}\n", size, Int(rooms), 1000 * size + 5000 * rooms + dr.normal() * 2000)
+}
+let reg = try MLRegressor(trainingData: try DataFrame(csv: housesCSV), targetColumn: "price",
+                          parameters: TrainingParameters(hiddenLayers: [16], epochs: 80, learningRate: 0.01))
+check(reg.trainingMetrics.r2 > 0.98, "regressor \(reg.trainingMetrics)")
+
+// Tokenizers and generation
+let corpus = String(repeating: "the cat sat on the mat. the dog sat on the log. ", count: 20)
+var bpe = BPETokenizer()
+bpe.train(on: corpus, vocabularySize: 300)
+let ids = bpe.encode("the cat sat on the log. ünïcødé ✓")
+check(bpe.decode(ids) == "the cat sat on the log. ünïcødé ✓", "bpe round trip")
+check(ids.count < "the cat sat on the log.".utf8.count, "bpe compresses: \(ids.count)")
+try bpe.save("/tmp/neural-bpe.json")
+check(try BPETokenizer.load("/tmp/neural-bpe.json").encode(corpus) == bpe.encode(corpus), "bpe save/load")
+
+// A bigram language model learns to continue "abcd"
+let chars = CharTokenizer("abcd")
+let seqIds = chars.encode(String(repeating: "abcd", count: 30))
+Init.seed(4)
+let lm = Sequential(Embedding(4, 8), Linear(8, 4))
+let lmOpt = Adam(learningRate: 0.1)
+let lmStep = valueAndGrad(lm) { m, x, y in crossEntropy(m(x), y) }
+let inputs = Tensor(data: seqIds.dropLast().map(Float.init), shape: [seqIds.count - 1])
+for _ in 0 ..< 60 { _ = lmStep(lm, inputs, Array(seqIds.dropFirst())); lmOpt.update(lm) }
+let generated = generate(prompt: chars.encode("a"), maxTokens: 7) { ctx in lm(Tensor(data: [Float(ctx.last!)], shape: [1])) }
+check(chars.decode(generated) == "abcdabcd", "generation: \(chars.decode(generated))")
+var sr = PCG32(seed: 1)
+let logits = Tensor([0, 10, 0, 0])
+check(sample(logits, .topK(1, temperature: 1), using: &sr) == 1 && sample(logits, .topP(0.5, temperature: 1), using: &sr) == 1, "sampling")
+
+precondition(failures == 0, "neural: \(failures) failure(s)")
+print("neural: ok")

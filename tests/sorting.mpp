@@ -1,0 +1,33 @@
+// M++ sorting vs the standard library (part of `make test`).
+import MppKit
+
+var rng = PCG32(seed: 42)
+func randomInts(_ n: Int, _ range: Int, _ g: inout PCG32) -> [Int] { (0 ..< n).map { _ in Int(g.next() % UInt64(range)) - range / 2 } }
+
+let cases: [(String, [Int])] = [
+    ("random", randomInts(20_000, 1_000_000, &rng)), ("few distinct", randomInts(20_000, 5, &rng)), ("sorted", Array(0 ..< 5000)),
+    ("reversed", Array((0 ..< 5000).reversed())), ("all equal", Array(repeating: 7, count: 3000)), ("tiny", [3, 1, 2]),
+    ("empty", []), ("organ pipe", Array(0 ..< 2000) + Array((0 ..< 2000).reversed())),
+]
+for (name, xs) in cases {
+    var a = xs, b = xs, c = xs
+    a.mppSort()
+    b.radixSort()
+    c.mppSort(by: >)
+    precondition(a == xs.sorted(), "mppSort: \(name)")
+    precondition(b == xs.sorted(), "radixSort: \(name)")
+    precondition(c == xs.sorted(by: >), "mppSort(by: >): \(name)")
+}
+var words = (0 ..< 5000).map { _ in String(rng.next() % 100_000, radix: 36) }
+let expected = words.sorted()
+words.mppSort()
+precondition(words == expected, "strings")
+var doubles: [Double] = (0 ..< 10_000).map { _ in Double(Int(rng.next() % 2_000_001) - 1_000_000) / 7 } + [-0.0, 0.0, .infinity, -.infinity]
+let sortedDoubles = doubles.sorted()
+doubles.radixSort()
+precondition(doubles == sortedDoubles, "doubles")
+var bytes: [UInt8] = (0 ..< 1000).map { _ in UInt8(truncatingIfNeeded: rng.next()) }
+let sortedBytes = bytes.sorted()
+bytes.radixSort()
+precondition(bytes == sortedBytes, "bytes")
+print("Sorting: all tests passed")

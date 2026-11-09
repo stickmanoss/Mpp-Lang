@@ -1,0 +1,110 @@
+// MppData: @Model, saving, fetching, relationships, unique upserts, rollback.
+import MppData
+#if canImport(Glibc)
+import Glibc
+#else
+import Darwin
+#endif
+
+nonisolated(unsafe) var failures = 0
+func check(_ ok: Bool, _ what: String, line: Int = #line) {
+    if !ok { failures += 1; print("FAIL line \(line): \(what)") }
+}
+
+enum Kind: String, CaseIterable, ModelValue { case city, beach, mountain }
+
+@Model final class Trip {
+    @Attribute(.unique) var name: String
+    var days: Int
+    var budget: Double?
+    var tags: [String] = []
+    @Relationship(deleteRule: .cascade) var stops: [Stop] = []
+    var guide: Person?
+    @Transient var scratch = 0
+    var summary: String { "\(name) (\(days) days)" }
+
+    init(name: String, days: Int, budget: Double? = nil) {
+        self.name = name
+        self.days = days
+        self.budget = budget
+    }
+}
+
+@Model final class Stop {
+    var city: String
+    var kind: Kind = Kind.city
+    init(city: String, kind: Kind = .city) { self.city = city; self.kind = kind }
+}
+
+@Model final class Person {
+    var name: String
+    init(name: String) { self.name = name }
+}
+
+let path = "/tmp/mppdata-test-\(getpid()).store"
+do {
+    let container = try ModelContainer(for: Trip.self, Stop.self, Person.self, configurations: ModelConfiguration(path: path))
+    let ctx = container.mainContext
+    let japan = Trip(name: "Japan", days: 10, budget: 4000)
+    japan.tags = ["food", "temples"]
+    japan.stops = [Stop(city: "Kyoto"), Stop(city: "Okinawa", kind: .beach)]
+    japan.guide = Person(name: "Aiko")
+    ctx.insert(japan)
+    ctx.insert(Trip(name: "Alps", days: 5))
+    ctx.insert(Trip(name: "Cairo", days: 7))
+    check(ctx.hasChanges, "changes pending")
+    check(try ctx.fetch(Trip.self).count == 3, "pending inserts are fetched")
+    try ctx.save()
+    check(!ctx.hasChanges && japan.persistentModelID.id > 0, "saved")
+
+    let long = try ctx.fetch(FetchDescriptor<Trip>(predicate: #Predicate { $0.days > 6 }, sortBy: [SortDescriptor(\.name)]))
+    check(long.map(\.name) == ["Cairo", "Japan"], "predicate + sort")
+    check(long[1] === japan, "identity map: same instance")
+    check(try ctx.fetchCount(FetchDescriptor<Stop>()) == 2, "related models saved")
+    let byDays = try ctx.fetch(FetchDescriptor<Trip>(sortBy: [SortDescriptor(\.days, order: .reverse)]))
+    check(byDays.map(\.days) == [10, 7, 5], "reverse sort")
+
+    japan.days = 12
+    check(ctx.hasChanges, "change tracked")
+    ctx.rollback()
+    check(japan.days == 10, "rollback")
+    japan.days = 11
+    try ctx.save()
+
+    // Unique attribute: inserting the same name updates the existing trip.
+    ctx.insert(Trip(name: "Alps", days: 9))
+    try ctx.save()
+    let alps = try ctx.fetch(FetchDescriptor<Trip>(predicate: #Predicate<Trip> { trip in trip.name == "Alps" }))
+    check(alps.count == 1 && alps[0].days == 9, "unique upsert")
+}
+do {
+    // A fresh container reads everything back from disk.
+    let container = try ModelContainer(for: Trip.self, Stop.self, Person.self, configurations: ModelConfiguration(path: path))
+    let ctx = container.mainContext
+    let trips = try ctx.fetch(FetchDescriptor<Trip>(sortBy: [SortDescriptor(\.name)]))
+    check(trips.map(\.name) == ["Alps", "Cairo", "Japan"], "reloaded")
+    let japan = trips[2]
+    check(japan.days == 11 && japan.budget == 4000 && japan.tags == ["food", "temples"], "values reloaded")
+    check(japan.stops.map(\.city) == ["Kyoto", "Okinawa"] && japan.stops[1].kind == .beach, "to-many + enum reloaded")
+    check(japan.guide?.name == "Aiko", "to-one reloaded")
+    check(trips[0].budget == nil && trips[0].guide == nil, "optionals reloaded")
+    // Cascade: deleting the trip deletes its stops, not its guide.
+    ctx.delete(japan)
+    try ctx.save()
+    let stopsLeft = try ctx.fetchCount(FetchDescriptor<Stop>()), peopleLeft = try ctx.fetchCount(FetchDescriptor<Person>())
+    check(stopsLeft == 0 && peopleLeft == 1, "cascade delete")
+    try ctx.delete(model: Trip.self, where: #Predicate { $0.days < 8 })
+    try ctx.save()
+    check(try ctx.fetch(Trip.self).map(\.name) == ["Alps"], "delete(model:where:)")
+    let limited = try ctx.fetch({ var d = FetchDescriptor<Person>(); d.fetchLimit = 1; return d }())
+    check(limited.count == 1, "fetchLimit")
+}
+do {
+    let mem = try ModelContainer(for: [Person.self], configuration: ModelConfiguration(isStoredInMemoryOnly: true))
+    mem.mainContext.insert(Person(name: "Temp"))
+    try mem.mainContext.save()
+    check(try mem.mainContext.fetch(Person.self).count == 1, "in-memory store")
+}
+unlink(path)
+precondition(failures == 0, "MppData: \(failures) failure(s)")
+print("MppData: ok")

@@ -1,0 +1,293 @@
+// MppUI (portable engine) — custom drawing: Path, Angle, Canvas, and
+// GeometryReader.
+//
+//   struct Triangle: Shape {
+//       func path(in r: CGRect) -> Path {
+//           Path { p in
+//               p.move(to: CGPoint(x: r.midX, y: r.minY))
+//               p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
+//               p.addLine(to: CGPoint(x: r.minX, y: r.maxY))
+//               p.closeSubpath()
+//           }
+//       }
+//   }
+//   Triangle().fill(.orange).frame(width: 80, height: 70)
+//
+//   Canvas { context, size in
+//       context.fill(Path(ellipseIn: CGRect(origin: .zero, size: size)), with: .color(.blue))
+//   }
+
+import MppUIEngine
+
+public struct Angle: Sendable, Equatable, Comparable {
+    public var radians: Double
+    public var degrees: Double { radians * 180 / .pi }
+    public init(radians: Double) { self.radians = radians }
+    public init(degrees: Double) { radians = degrees * .pi / 180 }
+    public static func radians(_ r: Double) -> Angle { Angle(radians: r) }
+    public static func degrees(_ d: Double) -> Angle { Angle(degrees: d) }
+    public static let zero = Angle(radians: 0)
+    public static func < (a: Angle, b: Angle) -> Bool { a.radians < b.radians }
+    public static func + (a: Angle, b: Angle) -> Angle { Angle(radians: a.radians + b.radians) }
+    public static func - (a: Angle, b: Angle) -> Angle { Angle(radians: a.radians - b.radians) }
+}
+
+/// A 2D path: lines, curves and arcs (flattened to polygons when drawn).
+public struct Path: Sendable {
+    var contours: [[CGPoint]] = []
+    var closed: [Bool] = []
+
+    public init() {}
+    public init(_ build: (inout Path) -> Void) { build(&self) }
+    public init(_ rect: CGRect) { addRect(rect) }
+    public init(roundedRect rect: CGRect, cornerRadius r: CGFloat, style: RoundedCornerStyle = .continuous) {
+        addRoundedRect(in: rect, cornerSize: CGSize(width: r, height: r))
+    }
+    public init(ellipseIn rect: CGRect) { addEllipse(in: rect) }
+    init(kind: ShapeKind, in r: CGRect) {
+        switch kind {
+        case .rectangle, .custom: addRect(r)
+        case .rounded(let radius): addRoundedRect(in: r, cornerSize: CGSize(width: radius, height: radius))
+        case .capsule:
+            let rad = Swift.min(r.width, r.height) / 2
+            addRoundedRect(in: r, cornerSize: CGSize(width: rad, height: rad))
+        case .ellipse: addEllipse(in: r)
+        }
+    }
+
+    public var isEmpty: Bool { contours.allSatisfy(\.isEmpty) }
+    public var currentPoint: CGPoint? { contours.last?.last }
+
+    public mutating func move(to p: CGPoint) { contours.append([p]); closed.append(false) }
+    public mutating func addLine(to p: CGPoint) {
+        if contours.isEmpty || closed.last == true { move(to: currentPoint ?? .zero) }
+        contours[contours.count - 1].append(p)
+    }
+    public mutating func addLines(_ points: [CGPoint]) {
+        guard let first = points.first else { return }
+        move(to: first)
+        for p in points.dropFirst() { addLine(to: p) }
+    }
+    public mutating func addQuadCurve(to end: CGPoint, control c: CGPoint) {
+        let s = currentPoint ?? .zero
+        let n = segments(s, end, c, c)
+        for i in 1 ... n {
+            let t = CGFloat(i) / CGFloat(n), u = 1 - t
+            addLine(to: CGPoint(x: u * u * s.x + 2 * u * t * c.x + t * t * end.x, y: u * u * s.y + 2 * u * t * c.y + t * t * end.y))
+        }
+    }
+    public mutating func addCurve(to end: CGPoint, control1 c1: CGPoint, control2 c2: CGPoint) {
+        let s = currentPoint ?? .zero
+        let n = segments(s, end, c1, c2)
+        for i in 1 ... n {
+            let t = CGFloat(i) / CGFloat(n), u = 1 - t
+            let a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t
+            addLine(to: CGPoint(x: a * s.x + b * c1.x + c * c2.x + d * end.x, y: a * s.y + b * c1.y + c * c2.y + d * end.y))
+        }
+    }
+    func segments(_ a: CGPoint, _ b: CGPoint, _ c1: CGPoint, _ c2: CGPoint) -> Int {
+        let len = hypot(c1.x - a.x, c1.y - a.y) + hypot(c2.x - c1.x, c2.y - c1.y) + hypot(b.x - c2.x, b.y - c2.y)
+        return Swift.max(4, Swift.min(64, Int(len / 3)))
+    }
+    public mutating func closeSubpath() { if !closed.isEmpty { closed[closed.count - 1] = true } }
+
+    public mutating func addRect(_ r: CGRect) {
+        addLines([CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY), CGPoint(x: r.maxX, y: r.maxY), CGPoint(x: r.minX, y: r.maxY)])
+        closeSubpath()
+    }
+    public mutating func addRects(_ rs: [CGRect]) { rs.forEach { addRect($0) } }
+    public mutating func addRoundedRect(in r: CGRect, cornerSize: CGSize, style: RoundedCornerStyle = .continuous) {
+        let rad = Swift.min(cornerSize.width, r.width / 2, r.height / 2)
+        if rad <= 0 { addRect(r); return }
+        move(to: CGPoint(x: r.minX + rad, y: r.minY))
+        arc(CGPoint(x: r.maxX - rad, y: r.minY + rad), rad, -.pi / 2, 0)
+        arc(CGPoint(x: r.maxX - rad, y: r.maxY - rad), rad, 0, .pi / 2)
+        arc(CGPoint(x: r.minX + rad, y: r.maxY - rad), rad, .pi / 2, .pi)
+        arc(CGPoint(x: r.minX + rad, y: r.minY + rad), rad, .pi, 1.5 * .pi)
+        closeSubpath()
+    }
+    public mutating func addEllipse(in r: CGRect) {
+        let n = Swift.max(24, Swift.min(96, Int((r.width + r.height) / 3)))
+        var pts: [CGPoint] = []
+        for i in 0 ..< n {
+            let a = CGFloat(i) / CGFloat(n) * 2 * .pi
+            pts.append(CGPoint(x: r.midX + r.width / 2 * cos(a), y: r.midY + r.height / 2 * sin(a)))
+        }
+        addLines(pts)
+        closeSubpath()
+    }
+    public mutating func addArc(center: CGPoint, radius: CGFloat, startAngle: Angle, endAngle: Angle, clockwise: Bool) {
+        // SwiftUI's y axis points down, so "clockwise" sweeps toward decreasing angles.
+        var a0 = startAngle.radians, a1 = endAngle.radians
+        if clockwise { while a1 > a0 { a1 -= 2 * .pi } } else { while a1 < a0 { a1 += 2 * .pi } }
+        let start = CGPoint(x: center.x + radius * cos(a0), y: center.y + radius * sin(a0))
+        if contours.isEmpty || closed.last == true { move(to: start) } else { addLine(to: start) }
+        arc(center, radius, a0, a1, startLine: false)
+    }
+    mutating func arc(_ c: CGPoint, _ r: CGFloat, _ a0: Double, _ a1: Double, startLine: Bool = true) {
+        let n = Swift.max(2, Int(Swift.abs(a1 - a0) * Swift.max(r, 4) / 4))
+        for i in (startLine ? 0 : 1) ... n {
+            let a = a0 + (a1 - a0) * Double(i) / Double(n)
+            addLine(to: CGPoint(x: c.x + r * cos(a), y: c.y + r * sin(a)))
+        }
+    }
+    public mutating func addPath(_ p: Path) { contours += p.contours; closed += p.closed }
+
+    public func offsetBy(dx: CGFloat, dy: CGFloat) -> Path {
+        var p = self
+        p.contours = contours.map { $0.map { CGPoint(x: $0.x + dx, y: $0.y + dy) } }
+        return p
+    }
+    public func applying(scale s: CGFloat) -> Path {
+        var p = self
+        p.contours = contours.map { $0.map { CGPoint(x: $0.x * s, y: $0.y * s) } }
+        return p
+    }
+    public var boundingRect: CGRect {
+        let all = contours.flatMap { $0 }
+        guard let f = all.first else { return .zero }
+        var r = CGRect(origin: f, size: .zero)
+        for p in all { r = r.union(CGRect(origin: p, size: .zero)) }
+        return r
+    }
+
+    func flat() -> (xy: [Float], sizes: [Int32], closed: [Int32]) {
+        var xy: [Float] = [], sizes: [Int32] = [], cl: [Int32] = []
+        for (i, c) in contours.enumerated() where !c.isEmpty {
+            for p in c { xy.append(Float(p.x)); xy.append(Float(p.y)) }
+            sizes.append(Int32(c.count))
+            cl.append(closed[i] ? 1 : 0)
+        }
+        return (xy, sizes, cl)
+    }
+    func fillNow(_ c: Color, evenOdd: Bool = false) {
+        let f = flat()
+        guard !f.sizes.isEmpty else { return }
+        mppui_fill_path(f.xy, f.sizes, Int32(f.sizes.count), c.argb, evenOdd ? 1 : 0)
+    }
+    func strokeNow(_ c: Color, lineWidth: Double) {
+        let f = flat()
+        guard !f.sizes.isEmpty else { return }
+        mppui_stroke_path(f.xy, f.sizes, f.closed, Int32(f.sizes.count), Float(lineWidth), c.argb)
+    }
+}
+
+extension Path: Shape {
+    public var kind: ShapeKind { .custom }
+    public func path(in rect: CGRect) -> Path { self }
+}
+
+public struct FillStyle: Sendable {
+    public var isEOFilled: Bool
+    public init(eoFill: Bool = false, antialiased: Bool = true) { isEOFilled = eoFill }
+}
+
+// MARK: - Canvas
+
+/// Immediate-mode drawing inside a Canvas.
+public struct GraphicsContext {
+    var origin: CGPoint
+    public var opacity: Double = 1
+
+    public enum Shading {
+        case color(Color)
+        public static var foreground: Shading { .color(Runtime.environment.foregroundColor) }
+    }
+
+    public func fill(_ path: Path, with shading: Shading, style: FillStyle = FillStyle()) {
+        guard case .color(let c) = shading else { return }
+        path.offsetBy(dx: origin.x, dy: origin.y).fillNow(c.opacity(opacity * Double(c.argb >> 24) / 255), evenOdd: style.isEOFilled)
+    }
+    public func stroke(_ path: Path, with shading: Shading, lineWidth: CGFloat = 1) {
+        guard case .color(let c) = shading else { return }
+        path.offsetBy(dx: origin.x, dy: origin.y).strokeNow(c.opacity(opacity * Double(c.argb >> 24) / 255), lineWidth: lineWidth)
+    }
+    public func stroke(_ path: Path, with shading: Shading, style: StrokeStyle) { stroke(path, with: shading, lineWidth: style.lineWidth) }
+    /// Draws text centered on `point` (or placed by `anchor`).
+    public func draw(_ text: Text, at point: CGPoint, anchor: UnitPoint = .center) {
+        let font = text.font ?? Runtime.environment.font
+        var f = font
+        if text.bold { f.isBold = true }
+        let w = Double(mppui_text_width(text.content, Float(f.size), f.engineFont))
+        let h = Double(mppui_line_height(Float(f.size), f.engineFont))
+        let x = origin.x + point.x - w * anchor.x, y = origin.y + point.y - h * anchor.y
+        let color = text.color ?? Runtime.environment.foregroundColor
+        mppui_text(text.content, Float(x), Float(y + Double(mppui_ascent(Float(f.size), f.engineFont))), Float(f.size), f.engineFont,
+                   color.opacity(opacity * Double(color.argb >> 24) / 255).argb)
+    }
+    public mutating func translateBy(x: CGFloat, y: CGFloat) { origin.x += x; origin.y += y }
+}
+
+public struct Canvas: View, PrimitiveView {
+    public typealias Body = Never
+    let renderer: (inout GraphicsContext, CGSize) -> Void
+    public init(opaque: Bool = false, rendersAsynchronously: Bool = false, renderer: @escaping (inout GraphicsContext, CGSize) -> Void) {
+        self.renderer = renderer
+    }
+    func makeNode(_ ctx: inout BuildContext) -> Node { CanvasNode(renderer) }
+}
+
+final class CanvasNode: Node {
+    let renderer: (inout GraphicsContext, CGSize) -> Void
+    init(_ r: @escaping (inout GraphicsContext, CGSize) -> Void) { renderer = r }
+    override var flexibility: Double { 1e8 }
+    override func size(_ p: Proposal) -> Size { Size(width: Swift.min(p.width ?? 100, 1e6), height: Swift.min(p.height ?? 100, 1e6)) }
+    override func draw() {
+        let saved = Runtime.environment
+        Runtime.environment = env
+        var g = GraphicsContext(origin: CGPoint(x: frame.x, y: frame.y))
+        mppui_push_clip(Float(frame.x), Float(frame.y), Float(frame.width), Float(frame.height))
+        renderer(&g, CGSize(width: frame.width, height: frame.height))
+        mppui_pop_clip()
+        Runtime.environment = saved
+    }
+}
+
+// MARK: - GeometryReader
+
+public enum CoordinateSpace: Hashable, Sendable { case global, local }
+
+public struct GeometryProxy {
+    public let size: CGSize
+    let global: CGRect
+    public func frame(in space: CoordinateSpace) -> CGRect {
+        space == .global ? global : CGRect(origin: .zero, size: size)
+    }
+    public var safeAreaInsets: EdgeInsets { EdgeInsets() }
+}
+
+/// Gives its content the size it was offered (and fills that space).
+public struct GeometryReader: View, PrimitiveView {
+    public typealias Body = Never
+    let content: (GeometryProxy) -> ViewList
+    public init(@ViewBuilder content: @escaping (GeometryProxy) -> ViewList) { self.content = content }
+    func makeNode(_ ctx: inout BuildContext) -> Node { GeometryNode(content, path: ctx.path, env: Runtime.environment) }
+}
+
+final class GeometryNode: Node {
+    let content: (GeometryProxy) -> ViewList
+    let basePath: String
+    let buildEnv: EnvironmentValues
+    var child: Node?
+    init(_ content: @escaping (GeometryProxy) -> ViewList, path: String, env: EnvironmentValues) {
+        self.content = content; basePath = path; buildEnv = env
+    }
+    override var flexibility: Double { 1e8 }
+    override func children() -> [Node] { child.map { [$0] } ?? [] }
+    override func size(_ p: Proposal) -> Size { Size(width: Swift.min(p.width ?? 10, 1e6), height: Swift.min(p.height ?? 10, 1e6)) }
+    override func place(_ r: Rect) {
+        frame = r
+        // The content is built now, when its size is known.
+        let saved = Runtime.environment
+        Runtime.environment = buildEnv
+        var ctx = BuildContext(path: basePath)
+        let proxy = GeometryProxy(size: CGSize(width: r.width, height: r.height), global: CGRect(x: r.x, y: r.y, width: r.width, height: r.height))
+        let kids = ctx.children(of: content(proxy))
+        Runtime.environment = saved
+        let c = kids.count == 1 ? kids[0] : ZStackNode(kids, alignment: .topLeading)
+        let s = c.measure(Proposal(width: r.width, height: r.height))
+        c.place(Rect(x: r.x, y: r.y, width: Swift.min(s.width, r.width), height: Swift.min(s.height, r.height)))
+        child = c
+    }
+    override func draw() { child?.draw() }
+}

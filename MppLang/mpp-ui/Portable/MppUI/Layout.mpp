@@ -1,0 +1,627 @@
+// MppUI (portable engine) — geometry, styles and the layout/drawing nodes.
+//
+// Layout follows SwiftUI's model: a parent proposes a size, the child
+// chooses its own size, and the parent places it. Stacks give space to
+// their least flexible children first, so Spacers and `.frame(maxWidth:
+// .infinity)` soak up what is left.
+
+import MppUIEngine
+
+public struct Size: Equatable { public var width: Double; public var height: Double
+    public init(width: Double, height: Double) { self.width = width; self.height = height } }
+public struct Rect: Equatable {
+    public var x: Double, y: Double, width: Double, height: Double
+    func contains(_ px: Double, _ py: Double) -> Bool { px >= x && py >= y && px < x + width && py < y + height }
+}
+
+/// A size proposal; nil means "your ideal size".
+struct Proposal { var width: Double?; var height: Double? }
+
+public enum Axis: Sendable {
+    case horizontal, vertical
+    public struct Set: OptionSet, Sendable {
+        public let rawValue: Int
+        public init(rawValue: Int) { self.rawValue = rawValue }
+        public static let horizontal = Set(rawValue: 1), vertical = Set(rawValue: 2)
+    }
+}
+
+public enum HorizontalAlignment: Sendable { case leading, center, trailing }
+public enum VerticalAlignment: Sendable { case top, center, bottom }
+public struct Alignment: Sendable, Equatable {
+    public var horizontal: HorizontalAlignment
+    public var vertical: VerticalAlignment
+    public init(horizontal: HorizontalAlignment, vertical: VerticalAlignment) { self.horizontal = horizontal; self.vertical = vertical }
+    public static let center = Alignment(horizontal: .center, vertical: .center)
+    public static let leading = Alignment(horizontal: .leading, vertical: .center)
+    public static let trailing = Alignment(horizontal: .trailing, vertical: .center)
+    public static let top = Alignment(horizontal: .center, vertical: .top)
+    public static let bottom = Alignment(horizontal: .center, vertical: .bottom)
+    public static let topLeading = Alignment(horizontal: .leading, vertical: .top)
+    public static let topTrailing = Alignment(horizontal: .trailing, vertical: .top)
+    public static let bottomLeading = Alignment(horizontal: .leading, vertical: .bottom)
+    public static let bottomTrailing = Alignment(horizontal: .trailing, vertical: .bottom)
+}
+
+public struct Edge: Sendable {
+    public struct Set: OptionSet, Sendable {
+        public let rawValue: Int
+        public init(rawValue: Int) { self.rawValue = rawValue }
+        public static let top = Set(rawValue: 1), bottom = Set(rawValue: 2), leading = Set(rawValue: 4), trailing = Set(rawValue: 8)
+        public static let horizontal: Set = [.leading, .trailing], vertical: Set = [.top, .bottom], all: Set = [.top, .bottom, .leading, .trailing]
+    }
+}
+
+public struct EdgeInsets: Equatable, Sendable {
+    public var top: Double, leading: Double, bottom: Double, trailing: Double
+    public init(top: Double = 0, leading: Double = 0, bottom: Double = 0, trailing: Double = 0) {
+        self.top = top; self.leading = leading; self.bottom = bottom; self.trailing = trailing
+    }
+}
+
+// MARK: - Color, Font, Material
+
+public struct Color: Equatable, Sendable {
+    public var argb: UInt32
+    public init(argb: UInt32) { self.argb = argb }
+    public init(red: Double, green: Double, blue: Double, opacity: Double = 1) {
+        func c(_ v: Double) -> UInt32 { UInt32(Swift.max(0, Swift.min(255, (v * 255).rounded()))) }
+        argb = c(opacity) << 24 | c(red) << 16 | c(green) << 8 | c(blue)
+    }
+    public init(white: Double, opacity: Double = 1) { self.init(red: white, green: white, blue: white, opacity: opacity) }
+    /// "#RRGGBB" or "#AARRGGBB".
+    public init(hex: String) {
+        let v = UInt32(hex.drop { $0 == "#" }, radix: 16) ?? 0
+        argb = hex.count > 7 ? v : 0xFF00_0000 | v
+    }
+    public func opacity(_ o: Double) -> Color {
+        Color(argb: UInt32(Double(argb >> 24) * Swift.max(0, Swift.min(1, o))) << 24 | argb & 0xFF_FFFF)
+    }
+    public static let black = Color(argb: 0xFF00_0000), white = Color(argb: 0xFFFF_FFFF), clear = Color(argb: 0)
+    public static let gray = Color(argb: 0xFF8E_8E93), red = Color(argb: 0xFFFF_3B30), orange = Color(argb: 0xFFFF_9500)
+    public static let yellow = Color(argb: 0xFFFF_CC00), green = Color(argb: 0xFF34_C759), mint = Color(argb: 0xFF00_C7BE)
+    public static let teal = Color(argb: 0xFF30_B0C7), cyan = Color(argb: 0xFF32_ADE6), blue = Color(argb: 0xFF00_7AFF)
+    public static let indigo = Color(argb: 0xFF58_56D6), purple = Color(argb: 0xFFAF_52DE), pink = Color(argb: 0xFFFF_2D55)
+    public static let brown = Color(argb: 0xFFA2_845E)
+    // macOS label colors.
+    public static let primary = Color(argb: 0xD800_0000), secondary = Color(argb: 0x8000_0000)
+    public static let tertiary = Color(argb: 0x4000_0000)
+    public static let accentColor = Color.blue
+}
+
+public struct Font: Equatable, Sendable {
+    public var size: Double
+    public var isBold: Bool
+    public var isMonospaced: Bool
+    public init(size: Double, bold: Bool = false, monospaced: Bool = false) { self.size = size; isBold = bold; isMonospaced = monospaced }
+
+    public enum Weight: Sendable { case ultraLight, thin, light, regular, medium, semibold, bold, heavy, black }
+    public enum Design: Sendable { case `default`, monospaced, rounded, serif }
+    public enum TextStyle: Sendable { case largeTitle, title, title2, title3, headline, subheadline, body, callout, footnote, caption, caption2 }
+
+    // macOS text styles (SwiftUI on the Mac).
+    public static let largeTitle = Font(size: 26), title = Font(size: 22), title2 = Font(size: 17), title3 = Font(size: 15)
+    public static let headline = Font(size: 13, bold: true), subheadline = Font(size: 11), body = Font(size: 13)
+    public static let callout = Font(size: 12), footnote = Font(size: 10), caption = Font(size: 10), caption2 = Font(size: 10)
+
+    public static func system(size: Double, weight: Weight = .regular, design: Design = .default) -> Font {
+        Font(size: size, bold: [.semibold, .bold, .heavy, .black].contains(weight), monospaced: design == .monospaced)
+    }
+    public static func system(_ style: TextStyle, design: Design = .default, weight: Weight = .regular) -> Font {
+        let base: Font
+        switch style {
+        case .largeTitle: base = .largeTitle
+        case .title: base = .title
+        case .title2: base = .title2
+        case .title3: base = .title3
+        case .headline: base = .headline
+        case .subheadline: base = .subheadline
+        case .body: base = .body
+        case .callout: base = .callout
+        case .footnote: base = .footnote
+        case .caption: base = .caption
+        case .caption2: base = .caption2
+        }
+        var f = base
+        f.isMonospaced = design == .monospaced
+        if [.semibold, .bold, .heavy, .black].contains(weight) { f.isBold = true }
+        return f
+    }
+    public func weight(_ w: Weight) -> Font { var f = self; f.isBold = [.semibold, .bold, .heavy, .black].contains(w); return f }
+    public func bold() -> Font { var f = self; f.isBold = true; return f }
+    public func monospaced() -> Font { var f = self; f.isMonospaced = true; return f }
+    public func monospacedDigit() -> Font { self }
+
+    var engineFont: Int32 { isMonospaced ? Int32(MPPUI_FONT_MONO.rawValue) : isBold ? Int32(MPPUI_FONT_BOLD.rawValue) : Int32(MPPUI_FONT_SANS.rawValue) }
+}
+
+/// Translucent backgrounds; drawn as frosted glass.
+public struct Material: Sendable, Equatable {
+    let whiteness: Double
+    public static let ultraThinMaterial = Material(whiteness: 0.25), thinMaterial = Material(whiteness: 0.4)
+    public static let regularMaterial = Material(whiteness: 0.55), thickMaterial = Material(whiteness: 0.7)
+}
+
+/// Liquid Glass (SwiftUI's `Glass`), drawn by Metallic shaders ported from
+/// liquidGL. The same on every Mac and every machine: it needs no GPU.
+///
+///     Text("Hi").padding().glassEffect(.regular.tint(.blue).interactive(), in: .capsule)
+///     .glassEffect(.clear.refraction(0.05).bevel(depth: 0.2, width: 0.16).chromaticAberration(0.3))
+///     .glassEffect(.alien)                     // liquidGL's presets: .alien, .pulse, .frosted, .edge
+public struct Glass: Sendable, Equatable {
+    var tint: Color? = nil
+    var isInteractive = false
+    var refraction = 0.0
+    var aberration = 0.0
+    var bevelDepth = 0.052
+    var bevelWidth = 0.211
+    var frost = 2.0
+    var specular = true
+    var shadow = true
+    var magnify = 1.0
+    var tilt = (x: 0.0, y: 0.0)
+    var isIdentity = false
+
+    public static func == (a: Glass, b: Glass) -> Bool {
+        a.tint == b.tint && a.isInteractive == b.isInteractive && a.refraction == b.refraction && a.aberration == b.aberration
+            && a.bevelDepth == b.bevelDepth && a.bevelWidth == b.bevelWidth && a.frost == b.frost && a.specular == b.specular
+            && a.shadow == b.shadow && a.magnify == b.magnify && a.tilt == b.tilt && a.isIdentity == b.isIdentity
+    }
+
+    /// Frosted glass: liquidGL's demo default.
+    public static let regular = Glass()
+    /// Clear glass: liquidGL's option defaults (no frost).
+    public static let clear = Glass(refraction: 0.01, bevelDepth: 0.08, bevelWidth: 0.15, frost: 0)
+    /// No glass (turns the effect off).
+    public static let identity = Glass(isIdentity: true)
+    /// liquidGL's presets.
+    public static let alien = Glass(refraction: 0.073, bevelDepth: 0.2, bevelWidth: 0.156, frost: 2, specular: false)
+    public static let pulse = Glass(refraction: 0.03, bevelDepth: 0, bevelWidth: 0.273, frost: 0, specular: false, shadow: false)
+    public static let frosted = Glass(refraction: 0, bevelDepth: 0.035, bevelWidth: 0.119, frost: 0.9)
+    public static let edge = Glass(refraction: 0.047, bevelDepth: 0.136, bevelWidth: 0.076, frost: 2, specular: false)
+
+    /// Dyes the glass: content × colour; the colour's opacity is the strength (0.25 for an opaque colour).
+    public func tint(_ c: Color?) -> Glass { var g = self; g.tint = c.map { ($0.argb >> 24) == 0xFF ? $0.opacity(0.25) : $0 }; return g }
+    /// Responds to the pointer: light highlights on.
+    public func interactive(_ on: Bool = true) -> Glass { var g = self; g.isInteractive = on; if on { g.specular = true }; return g }
+    /// Base offset across the pane (0–1, as a fraction of the window).
+    public func refraction(_ v: Double) -> Glass { var g = self; g.refraction = v; return g }
+    /// The bevel: extra offset at the edge (`depth`, 0–1) over a band `width` × the shorter side.
+    public func bevel(depth: Double, width: Double) -> Glass { var g = self; g.bevelDepth = depth; g.bevelWidth = width; return g }
+    /// Blur radius in points (0 = crystal clear).
+    public func frost(_ v: Double) -> Glass { var g = self; g.frost = v; return g }
+    /// Colour fringing, strongest at the bevel (0–1).
+    public func chromaticAberration(_ v: Double) -> Glass { var g = self; g.aberration = v; return g }
+    /// Drifting light highlights.
+    public func specular(_ on: Bool) -> Glass { var g = self; g.specular = on; return g }
+    /// The soft drop shadow.
+    public func shadow(_ on: Bool) -> Glass { var g = self; g.shadow = on; return g }
+    /// Magnification of what's behind (1 = none, up to 3).
+    public func magnify(_ v: Double) -> Glass { var g = self; g.magnify = v; return g }
+    /// A 3D tilt in degrees.
+    public func tilt(x: Double, y: Double) -> Glass { var g = self; g.tilt = (x, y); return g }
+
+    /// The engine's parameters.
+    var engine: MppUIGlass {
+        var e = MppUIGlass()
+        e.refraction = Float(refraction)
+        e.aberration = Float(aberration)
+        e.bevelDepth = Float(bevelDepth)
+        e.bevelWidth = Float(bevelWidth)
+        e.frost = Float(frost)
+        e.specular = specular
+        e.shadow = shadow
+        e.magnify = Float(magnify)
+        e.tiltX = Float(tilt.x)
+        e.tiltY = Float(tilt.y)
+        e.tint = tint?.argb ?? 0
+        return e
+    }
+}
+
+// MARK: - Shapes
+
+public enum ShapeKind: Equatable, Sendable {
+    case rectangle, rounded(Double), capsule, ellipse, custom
+    func radius(_ w: Double, _ h: Double) -> Double {
+        switch self {
+        case .rectangle: return 0
+        case .rounded(let r): return r
+        case .capsule, .ellipse: return Swift.min(w, h) / 2
+        case .custom: return 0
+        }
+    }
+}
+
+/// A 2D shape. Built-in shapes have a `kind`; your own shapes implement
+/// `path(in:)`, exactly as in SwiftUI.
+public protocol Shape: View {
+    var kind: ShapeKind { get }
+    func path(in rect: CGRect) -> Path
+}
+
+// MARK: - Nodes
+
+/// A laid-out element: measured, placed, drawn, hit-tested.
+class Node {
+    var frame = Rect(x: 0, y: 0, width: 0, height: 0)
+    var env = EnvironmentValues()
+    var envAssigned = false
+    /// Position in the view tree; stable across rebuilds.
+    var path = ""
+    /// 0 = rigid, larger = more willing to grow.
+    var flexibility: Double { 0 }
+
+    func size(_ p: Proposal) -> Size { Size(width: 0, height: 0) }
+
+    /// `size` with a small per-layout cache (stacks measure children several times).
+    private var cache: [(Double?, Double?, Size)] = []
+    final func measure(_ p: Proposal) -> Size {
+        for (w, h, s) in cache where w == p.width && h == p.height { return s }
+        let s = size(p)
+        if cache.count < 8 { cache.append((p.width, p.height, s)) }
+        return s
+    }
+    func place(_ r: Rect) { frame = r }
+    func draw() {}
+    /// Deepest node accepting `event` at (x, y).
+    func hit(_ x: Double, _ y: Double) -> Node? { nil }
+    func children() -> [Node] { [] }
+
+    // Events. A node that takes clicks returns true from `acceptsClicks`.
+    var acceptsClicks: Bool { false }
+    func mouseDown(_ x: Double, _ y: Double) {}
+    func mouseDragged(_ x: Double, _ y: Double) {}
+    func mouseUp(_ x: Double, _ y: Double, inside: Bool) {}
+    /// Returns true when the node scrolled.
+    func scroll(_ dx: Double, _ dy: Double) -> Bool { false }
+    func key(_ key: Int32, modifiers: Int32) {}
+    func text(_ s: String) {}
+
+    /// All nodes under (x, y), outermost first.
+    func stack(at x: Double, _ y: Double, into out: inout [Node]) {
+        guard frame.contains(x, y) else { return }
+        out.append(self)
+        for c in children() { c.stack(at: x, y, into: &out) }
+    }
+    func find(path p: String) -> Node? {
+        if path == p { return self }
+        for c in children() { if let n = c.find(path: p) { return n } }
+        return nil
+    }
+}
+
+final class StackNode: Node {
+    let axis: Axis
+    let spacing: Double
+    let alignment: Alignment
+    let items: [Node]
+
+    init(axis: Axis, spacing: Double, alignment: Alignment, children: [Node]) {
+        self.axis = axis
+        self.spacing = spacing
+        self.alignment = alignment
+        items = children.filter { !($0 is EmptyNode) }
+        for case let sp as SpacerNode in items { sp.axis = axis }
+        for case let d as DividerNode in items { d.vertical = axis == .horizontal }
+    }
+
+    override var flexibility: Double { items.map(\.flexibility).max() ?? 0 }
+    override func children() -> [Node] { items }
+
+    func main(_ s: Size) -> Double { axis == .vertical ? s.height : s.width }
+    func cross(_ s: Size) -> Double { axis == .vertical ? s.width : s.height }
+
+    /// Main-axis sizes for each child, SwiftUI-style: least flexible first.
+    func allocate(_ p: Proposal) -> [Size] {
+        let total = axis == .vertical ? p.height : p.width
+        let crossP = axis == .vertical ? p.width : p.height
+        var sizes = [Size](repeating: Size(width: 0, height: 0), count: items.count)
+        guard let available = total else {
+            for (i, c) in items.enumerated() { sizes[i] = c.measure(axis == .vertical ? Proposal(width: crossP, height: nil) : Proposal(width: nil, height: crossP)) }
+            return sizes
+        }
+        var remaining = Swift.max(0, available - spacing * Double(Swift.max(items.count - 1, 0)))
+        // Flexibility = how much a child can grow along the main axis.
+        let flex = items.map { c -> Double in
+            let small = c.measure(axis == .vertical ? Proposal(width: crossP, height: 0) : Proposal(width: 0, height: crossP))
+            let big = c.measure(axis == .vertical ? Proposal(width: crossP, height: 1e7) : Proposal(width: 1e7, height: crossP))
+            return main(big) - main(small)
+        }
+        let order = items.indices.sorted { flex[$0] < flex[$1] }
+        var left = items.count
+        for i in order {
+            let share = remaining / Double(left)
+            let s = items[i].measure(axis == .vertical ? Proposal(width: crossP, height: share) : Proposal(width: share, height: crossP))
+            sizes[i] = s
+            remaining = Swift.max(0, remaining - main(s))
+            left -= 1
+        }
+        return sizes
+    }
+
+    override func size(_ p: Proposal) -> Size {
+        let sizes = allocate(p)
+        let m = sizes.reduce(0) { $0 + main($1) } + spacing * Double(Swift.max(sizes.count - 1, 0))
+        let c = sizes.map(cross).max() ?? 0
+        return axis == .vertical ? Size(width: c, height: m) : Size(width: m, height: c)
+    }
+
+    override func place(_ r: Rect) {
+        frame = r
+        let sizes = allocate(Proposal(width: r.width, height: r.height))
+        var pos = axis == .vertical ? r.y : r.x
+        for (i, c) in items.enumerated() {
+            let s = sizes[i]
+            if axis == .vertical {
+                let x: Double
+                switch alignment.horizontal {
+                case .leading: x = r.x
+                case .center: x = r.x + (r.width - s.width) / 2
+                case .trailing: x = r.x + r.width - s.width
+                }
+                c.place(Rect(x: x, y: pos, width: s.width, height: s.height))
+                pos += s.height + spacing
+            } else {
+                let y: Double
+                switch alignment.vertical {
+                case .top: y = r.y
+                case .center: y = r.y + (r.height - s.height) / 2
+                case .bottom: y = r.y + r.height - s.height
+                }
+                c.place(Rect(x: pos, y: y, width: s.width, height: s.height))
+                pos += s.width + spacing
+            }
+        }
+    }
+
+    override func draw() { for c in items { c.draw() } }
+    override func hit(_ x: Double, _ y: Double) -> Node? {
+        for c in items.reversed() where c.frame.contains(x, y) { if let h = c.hit(x, y) { return h } }
+        return nil
+    }
+}
+
+final class ZStackNode: Node {
+    let items: [Node]
+    let alignment: Alignment
+    init(_ items: [Node], alignment: Alignment) { self.items = items; self.alignment = alignment }
+    override var flexibility: Double { items.map(\.flexibility).max() ?? 0 }
+    override func children() -> [Node] { items }
+    override func size(_ p: Proposal) -> Size {
+        let s = items.map { $0.measure(p) }
+        return Size(width: s.map(\.width).max() ?? 0, height: s.map(\.height).max() ?? 0)
+    }
+    override func place(_ r: Rect) {
+        frame = r
+        for c in items { c.place(aligned(c.measure(Proposal(width: r.width, height: r.height)), in: r, alignment)) }
+    }
+    override func draw() { for c in items { c.draw() } }
+    override func hit(_ x: Double, _ y: Double) -> Node? {
+        for c in items.reversed() where c.frame.contains(x, y) { if let h = c.hit(x, y) { return h } }
+        return nil
+    }
+}
+
+func aligned(_ s: Size, in r: Rect, _ a: Alignment) -> Rect {
+    let w = Swift.min(s.width, r.width), h = Swift.min(s.height, r.height)
+    let x = a.horizontal == .leading ? r.x : a.horizontal == .center ? r.x + (r.width - w) / 2 : r.x + r.width - w
+    let y = a.vertical == .top ? r.y : a.vertical == .center ? r.y + (r.height - h) / 2 : r.y + r.height - h
+    return Rect(x: x, y: y, width: w, height: h)
+}
+
+final class EmptyNode: Node {}
+
+final class SpacerNode: Node {
+    let minLength: Double
+    var axis: Axis?
+    init(_ minLength: Double) { self.minLength = minLength }
+    override var flexibility: Double { 1e9 }
+    override func size(_ p: Proposal) -> Size {
+        let w = Swift.max(p.width ?? minLength, minLength), h = Swift.max(p.height ?? minLength, minLength)
+        switch axis {
+        case .horizontal?: return Size(width: w, height: 0)
+        case .vertical?: return Size(width: 0, height: h)
+        case nil: return Size(width: w, height: h)
+        }
+    }
+}
+
+final class TextNode: Node {
+    let text: String
+    var lines: [String] = []
+    init(_ text: String) { self.text = text }
+
+    var font: Font { env.font }
+    var lineHeight: Double { Double(mppui_line_height(Float(font.size), font.engineFont)) }
+    func width(_ s: String) -> Double { Double(mppui_text_width(s, Float(font.size), font.engineFont)) }
+
+    /// Word-wraps to `maxWidth` (and explicit newlines).
+    func wrap(_ maxWidth: Double?) -> [String] {
+        var out: [String] = []
+        for para in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            guard let maxWidth, width(String(para)) > maxWidth else { out.append(String(para)); continue }
+            var line = ""
+            for word in para.split(separator: " ", omittingEmptySubsequences: false) {
+                let candidate = line.isEmpty ? String(word) : line + " " + word
+                if width(candidate) <= maxWidth || line.isEmpty { line = candidate } else { out.append(line); line = String(word) }
+            }
+            out.append(line)
+        }
+        if let limit = env.lineLimit, out.count > limit {
+            out = Array(out.prefix(limit))
+            out[limit - 1] += "…"
+        }
+        return out
+    }
+
+    override func size(_ p: Proposal) -> Size {
+        let ls = wrap(p.width)
+        return Size(width: (ls.map(width).max() ?? 0).rounded(.up), height: (Double(ls.count) * lineHeight).rounded(.up))
+    }
+    override func place(_ r: Rect) { frame = r; lines = wrap(r.width + 0.5) }
+    override func draw() {
+        let asc = Double(mppui_ascent(Float(font.size), font.engineFont))
+        var y = frame.y + asc + (lineHeight - Double(mppui_line_height(Float(font.size), font.engineFont))) / 2
+        let color = env.isEnabled ? env.foregroundColor : env.foregroundColor.opacity(0.4)
+        for l in lines {
+            var x = frame.x
+            switch env.textAlignment {
+            case .leading: break
+            case .center: x += (frame.width - width(l)) / 2
+            case .trailing: x += frame.width - width(l)
+            }
+            mppui_text(l, Float(x), Float(y), Float(font.size), font.engineFont, color.argb)
+            y += lineHeight
+        }
+    }
+}
+
+final class ShapeNode: Node {
+    let kind: ShapeKind
+    var fill: Color?
+    var gradient: (Color, Color, Double)?
+    var stroke: (Color, Double)?
+    var material: Material?
+    var glass: Glass?
+    var square = false
+    var pathMaker: ((CGRect) -> Path)?
+    init(_ kind: ShapeKind) { self.kind = kind }
+    override var flexibility: Double { 1e8 }
+    override func size(_ p: Proposal) -> Size { Size(width: p.width ?? 10, height: p.height ?? 10) }
+    override func draw() {
+        var f = frame
+        if square {
+            let side = Swift.min(f.width, f.height)
+            f = Rect(x: f.x + (f.width - side) / 2, y: f.y + (f.height - side) / 2, width: side, height: side)
+        }
+        if let pathMaker {
+            let p = pathMaker(CGRect(x: 0, y: 0, width: f.width, height: f.height)).offsetBy(dx: f.x, dy: f.y)
+            if fill != nil || stroke == nil { p.fillNow(fill ?? env.foregroundColor) }
+            if let (c, lw) = stroke { p.strokeNow(c, lineWidth: lw) }
+            return
+        }
+        let r = Float(kind.radius(f.width, f.height))
+        let (x, y, w, h) = (Float(f.x), Float(f.y), Float(f.width), Float(f.height))
+        if let glass {
+            if !glass.isIdentity { mppui_glass_effect(x, y, w, h, r, glass.engine) }
+        } else if let m = material {
+            mppui_glass(x, y, w, h, r, Color(white: 1, opacity: m.whiteness).argb, 0)
+        } else if let (a, b, angle) = gradient {
+            mppui_linear_gradient(x, y, w, h, r, a.argb, b.argb, Float(angle))
+        } else if kind == .ellipse {
+            mppui_fill_ellipse(x, y, w, h, (fill ?? env.foregroundColor).argb)
+        } else if stroke == nil || fill != nil {
+            mppui_fill_rounded_rect(x, y, w, h, r, (fill ?? env.foregroundColor).argb)
+        }
+        if let (c, lw) = stroke { mppui_stroke_rounded_rect(x, y, w, h, r, Float(lw), c.argb) }
+    }
+}
+
+final class ImageNode: Node {
+    let name: String
+    init(_ name: String) { self.name = name }
+    override func size(_ p: Proposal) -> Size { let s = env.font.size * 1.1; return Size(width: s, height: s) }
+    override func draw() {
+        let s = Swift.min(frame.width, frame.height)
+        mppui_icon(name, Float(frame.x + (frame.width - s) / 2), Float(frame.y + (frame.height - s) / 2), Float(s), env.foregroundColor.argb)
+    }
+}
+
+/// Wraps one child and changes how it is sized, placed or drawn.
+class WrapperNode: Node {
+    let child: Node
+    init(_ child: Node) { self.child = child }
+    override var flexibility: Double { child.flexibility }
+    override func children() -> [Node] { [child] }
+    override func size(_ p: Proposal) -> Size { child.measure(p) }
+    override func place(_ r: Rect) { frame = r; child.place(r) }
+    override func draw() { child.draw() }
+    override func hit(_ x: Double, _ y: Double) -> Node? { child.frame.contains(x, y) ? child.hit(x, y) : nil }
+}
+
+final class PaddingNode: WrapperNode {
+    let insets: EdgeInsets
+    init(_ child: Node, _ insets: EdgeInsets) { self.insets = insets; super.init(child) }
+    override func size(_ p: Proposal) -> Size {
+        let h = insets.leading + insets.trailing, v = insets.top + insets.bottom
+        let s = child.measure(Proposal(width: p.width.map { Swift.max(0, $0 - h) }, height: p.height.map { Swift.max(0, $0 - v) }))
+        return Size(width: s.width + h, height: s.height + v)
+    }
+    override func place(_ r: Rect) {
+        frame = r
+        child.place(Rect(x: r.x + insets.leading, y: r.y + insets.top,
+                         width: Swift.max(0, r.width - insets.leading - insets.trailing), height: Swift.max(0, r.height - insets.top - insets.bottom)))
+    }
+}
+
+final class FrameNode: WrapperNode {
+    var width: Double?, height: Double?
+    var minWidth: Double?, maxWidth: Double?, minHeight: Double?, maxHeight: Double?
+    var alignment: Alignment = .center
+    override init(_ child: Node) { super.init(child) }
+    override var flexibility: Double {
+        (maxWidth == .infinity || maxHeight == .infinity) ? 1e8 : (width != nil && height != nil ? 0 : child.flexibility)
+    }
+    func clampW(_ v: Double) -> Double { Swift.min(Swift.max(v, minWidth ?? 0), maxWidth ?? .infinity) }
+    func clampH(_ v: Double) -> Double { Swift.min(Swift.max(v, minHeight ?? 0), maxHeight ?? .infinity) }
+    override func size(_ p: Proposal) -> Size {
+        let pw = width ?? p.width.map(clampW), ph = height ?? p.height.map(clampH)
+        let s = child.measure(Proposal(width: pw, height: ph))
+        var w = width ?? clampW(s.width), h = height ?? clampH(s.height)
+        if width == nil, maxWidth == .infinity, let pwid = p.width { w = Swift.max(w, clampW(pwid)) }
+        if height == nil, maxHeight == .infinity, let phei = p.height { h = Swift.max(h, clampH(phei)) }
+        return Size(width: w, height: h)
+    }
+    override func place(_ r: Rect) {
+        frame = r
+        child.place(aligned(child.measure(Proposal(width: r.width, height: r.height)), in: r, alignment))
+    }
+}
+
+/// background / overlay: a second node sized to the child.
+final class LayerNode: WrapperNode {
+    let layer: Node
+    let behind: Bool
+    let alignment: Alignment
+    init(_ child: Node, layer: Node, behind: Bool, alignment: Alignment = .center) {
+        self.layer = layer; self.behind = behind; self.alignment = alignment
+        super.init(child)
+    }
+    override func children() -> [Node] { [child, layer] }
+    override func place(_ r: Rect) {
+        frame = r
+        child.place(r)
+        layer.place(aligned(layer.measure(Proposal(width: r.width, height: r.height)), in: r, alignment))
+    }
+    override func draw() {
+        if behind { layer.draw(); child.draw() } else { child.draw(); layer.draw() }
+    }
+    override func hit(_ x: Double, _ y: Double) -> Node? {
+        if !behind, layer.frame.contains(x, y), let h = layer.hit(x, y) { return h }
+        return child.frame.contains(x, y) ? child.hit(x, y) : nil
+    }
+}
+
+final class EffectNode: WrapperNode {
+    var opacity: Double = 1
+    var clip: ShapeKind?
+    var offset: (Double, Double) = (0, 0)
+    var shadow: (Color, Double, Double, Double)?    // color, radius, x, y
+    override func place(_ r: Rect) {
+        frame = r
+        child.place(Rect(x: r.x + offset.0, y: r.y + offset.1, width: r.width, height: r.height))
+    }
+    override func draw() {
+        if let (c, radius, dx, dy) = shadow {
+            let k = clip ?? .rounded(8)
+            mppui_shadow(Float(frame.x + dx), Float(frame.y + dy), Float(frame.width), Float(frame.height),
+                         Float(k.radius(frame.width, frame.height)), Float(radius), c.argb)
+        }
+        if opacity < 1 { mppui_push_opacity(Float(opacity)) }
+        if clip != nil { mppui_push_clip(Float(frame.x), Float(frame.y), Float(frame.width), Float(frame.height)) }
+        child.draw()
+        if clip != nil { mppui_pop_clip() }
+        if opacity < 1 { mppui_pop_opacity() }
+    }
+}

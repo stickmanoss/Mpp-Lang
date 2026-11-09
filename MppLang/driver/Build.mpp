@@ -1,0 +1,606 @@
+// mpp driver — compiling modules through the bootstrap Swift 6 toolchain.
+
+import MppKit
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+let frontendVersion = "6"   // bump when lowering output changes
+
+enum ModuleKind { case library, executable }
+
+struct ModuleSpec {
+    var name: String
+    var sources: [String]
+    var generated: [(file: String, text: String)] = []
+    var kind: ModuleKind = .library
+    /// (module, stamp) this module imports, dependents first (link order).
+    var deps: [(name: String, stamp: String)] = []
+    var importCore = true
+    var implicitImports: [String] = []
+    var mainSource: String? = nil
+    var searchDirs: [String] = []
+    var displayRoot: String? = nil
+    var displayNames: [String: String] = [:]
+    var silent = false
+    var autoParallel = true
+    /// Extra linker flags for executables (e.g. the MppUI engine's C++ library).
+    var linkFlags: [String] = []
+    /// Extra swiftc flags (e.g. C++ interoperability for MppxxCpp).
+    var swiftFlags: [String] = []
+    /// Files outside `sources` whose contents the build depends on (C++ headers).
+    var stampFiles: [String] = []
+    /// Metallic shaders compiled to C++, per source file.
+    var nativeShaders: [String: [String: Lowerer.NativeShader]] = [:]
+}
+
+struct BuiltProduct {
+    let path: String
+    let stamp: String
+    let rebuilt: Bool
+}
+
+enum Toolchain {
+    static func moduleName(_ raw: String) -> String {
+        var out = String(raw.map { $0.isLetter || $0.isNumber || $0 == "_" ? $0 : "_" })
+        if out.isEmpty || out.first!.isNumber { out = "_" + out }
+        return out
+    }
+
+    static let swiftc: Result<String, DriverError> = {
+        var candidates: [String] = []
+        if let c = Env.get("MPP_SWIFTC") { candidates.append(c) }
+        if let legacy = Env.get("MPLUSPLUS_SWIFT") {
+            let p = Process.which(legacy) ?? legacy
+            candidates.append(Path.basename(p) == "swift" ? Path.join(Path.dirname(p), "swiftc") : p)
+        }
+        candidates.append("swiftc")
+        for c in candidates { if let p = Process.which(c) { return .success(p) } }
+        #if canImport(Darwin)
+        if let r = try? Process.run(["xcrun", "--find", "swiftc"]), r.status == 0 { return .success(r.output.trimmingSpaces.trimmingNewlines) }
+        #endif
+        return .failure(DriverError("Swift 6 bootstrap toolchain not found (install Swift 6, or set MPP_SWIFTC)"))
+    }()
+
+    static func compiler() throws(DriverError) -> String { try swiftc.get() }
+
+    /// Identity of the toolchain binary (cheap: no process launch).
+    static func identityKey() throws(DriverError) -> String {
+        let sc = try compiler()
+        let i = Files.info(sc)
+        var key = "\(sc)|\(i?.mtimeNanos ?? 0)|\(i?.size ?? 0)|\(Env.get("DEVELOPER_DIR") ?? "")|\(Env.get("TOOLCHAINS") ?? "")"
+        #if canImport(Darwin)
+        var buf = [CChar](repeating: 0, count: 1024)
+        let n = readlink("/var/db/xcode_select_link", &buf, buf.count - 1)
+        if n > 0 { key += "|" + String(decoding: buf[0 ..< n].map { UInt8(bitPattern: $0) }, as: UTF8.self) }
+        #endif
+        return key
+    }
+
+    static let versionCache: Result<String, DriverError> = {
+        do {
+            let key = try identityKey()
+            let cached = Path.join(Locations.cache, "toolchains", String(Stamp.of(key).prefix(24)))
+            if let v = Files.readIfExists(cached) { return .success(v) }
+            let r = try Process.run([try compiler(), "--version"])
+            let v = r.output.trimmingNewlines
+            guard r.status == 0, v.contains("Swift version") else { return .failure(DriverError("could not run swiftc --version:\n\(v)")) }
+            if v.contains("Swift version 5.") || v.contains("Swift version 4.") {
+                return .failure(DriverError("M++ needs a Swift 6 toolchain; found: \(v.split(separator: "\n")[0])"))
+            }
+            try Files.write(cached, v)
+            return .success(v)
+        } catch let e as DriverError { return .failure(e) } catch { return .failure(DriverError("\(error)")) }
+    }()
+
+    /// The compiler's version plus this driver's identity: a new `mpp` lowers
+    /// code differently, so everything it built before is rebuilt.
+    static func version() throws(DriverError) -> String { try versionCache.get() + "\n" + Locations.driverIdentity }
+
+    /// Cache-directory suffix for the optimization level.
+    static func level(_ release: Bool) -> String { release ? "release" : "debug" }
+
+    static func flags(release: Bool) -> [String] {
+        var f = ["-swift-version", "6", "-module-cache-path", Path.join(Locations.cache, "module-cache")]
+        #if canImport(Darwin)
+        #if arch(arm64)
+        let arch = "arm64"
+        #else
+        let arch = "x86_64"
+        #endif
+        f += ["-target", "\(arch)-apple-macos\(Env.get("MPP_MACOS_TARGET") ?? "14.0")"]
+        #endif
+        f += release ? ["-O", "-wmo"] : ["-Onone", "-g"]
+        return f
+    }
+}
+
+extension Substring {
+    var trimmingSpacesSub: Substring {
+        var u = self
+        while u.first == " " || u.first == "\t" { u = u.dropFirst() }
+        while u.last == " " || u.last == "\t" { u = u.dropLast() }
+        return u
+    }
+}
+
+extension String {
+    var trimmingNewlines: String {
+        var u = Substring(self)
+        while u.last == "\n" || u.last == "\r" || u.last == " " { u = u.dropLast() }
+        while u.first == "\n" || u.first == " " { u = u.dropFirst() }
+        return String(u)
+    }
+}
+
+enum Builder {
+    /// Compiles `m` into `outDir` unless an identical build is cached there.
+    static func build(_ m: ModuleSpec, into outDir: String, release: Bool) throws(DriverError) -> BuiltProduct {
+        let flags = Toolchain.flags(release: release)
+        let genDir = Path.join(outDir, "gen", m.name)
+        Files.makeDirectories(genDir)
+        Files.makeDirectories(Path.join(outDir, "bin"))
+
+        var stamp = Stamp()
+        for part in [frontendVersion, try Toolchain.version(), flags.joined(separator: " "), m.name,
+                     m.kind == .library ? "lib" : "exe", m.importCore ? "core" : "", m.implicitImports.joined(separator: ","),
+                     m.mainSource ?? "", m.autoParallel ? "par" : "", m.linkFlags.joined(separator: " "),
+                     m.swiftFlags.joined(separator: " ")] { stamp.add(part) }
+        for f in m.stampFiles.sorted() { stamp.add(f); stamp.add(Files.readIfExists(f) ?? "") }
+        for d in m.deps { stamp.add(d.name); stamp.add(d.stamp) }
+        var contents: [(path: String, text: String)] = []
+        for src in m.sources.sorted() {
+            let text = try Files.read(src)
+            contents.append((src, text))
+            stamp.add(src); stamp.add(text)
+        }
+        for g in m.generated { stamp.add(g.file); stamp.add(g.text) }
+        for (file, shaders) in m.nativeShaders.sorted(by: { $0.key < $1.key }) {
+            stamp.add(file)
+            for (name, sh) in shaders.sorted(by: { $0.key < $1.key }) { stamp.add(name + "=" + sh.symbol + "\(sh.buffers.map { "\($0.0)\($0.1)" })\(sh.textures)") }
+        }
+        let key = stamp.hex
+
+        let product = m.kind == .executable ? Path.join(outDir, "bin", m.name) : Path.join(outDir, "lib\(m.name).a")
+        let stampFile = Path.join(outDir, m.name + ".stamp")
+        if Files.exists(product), Files.readIfExists(stampFile) == key {
+            return BuiltProduct(path: product, stamp: key, rebuilt: false)
+        }
+
+        // Loops the compiler could not prove race-free stay serial (remembered per content).
+        let serialFile = Path.join(outDir, m.name + ".serial")
+        var serial: [String: Set<Int>] = [:]                       // display path -> loop first lines
+        var plain: [String: Set<Int>] = [:]                        // loops kept exactly as written
+        if let saved = Files.readIfExists(serialFile), saved.hasPrefix(key + "\n") {
+            for line in saved.split(separator: "\n").dropFirst() {
+                let parts = line.split(separator: "\t")
+                if parts.count >= 2, let l = Int(parts[1]) {
+                    if parts.count == 3 { plain[String(parts[0]), default: []].insert(l) } else { serial[String(parts[0]), default: []].insert(l) }
+                }
+            }
+        }
+
+        if !m.silent { status(m.kind == .library ? "Compiling" : "Linking", m.name + (release ? " (release)" : "")) }
+        var attempt = 0
+        while true {
+            attempt += 1
+            var lowered: [String] = []
+            var pathMap: [(gen: String, shown: String)] = []
+            var originals: [String: [Substring]] = [:]         // shown path -> source lines (for snippets)
+            var loops: [String: [ParallelLoop]] = [:]
+            var used = Set<String>()
+            for (src, text) in contents {
+                var base = Path.stem(src)
+                let isMain = m.kind == .executable && (src == m.mainSource || (m.mainSource == nil && base == "main"))
+                if isMain { base = "main" } else if base == "main" { base = "main_" }
+                var unique = base
+                var k = 2
+                while used.contains(unique) { unique = "\(base)_\(k)"; k += 1 }
+                used.insert(unique)
+                let shown = m.displayNames[src] ?? (m.displayRoot.map { Path.display(src, from: $0) } ?? src)
+                var swift = text
+                if Path.ext(src) == ".mpp" {
+                    let mpp = CppInterop.mentionsCpp(text) ? CppInterop.extract(text, file: src).text : text
+                    var options = LoweringOptions(autoParallel: m.autoParallel, serialLoops: serial[shown] ?? [], plainLoops: plain[shown] ?? [])
+                    options.nativeShaders = m.nativeShaders[src] ?? [:]
+                    let r = Frontend.lower(mpp, options)
+                    swift = r.text
+                    if !r.parallelLoops.isEmpty { loops[shown] = r.parallelLoops }
+                    if swift != text { originals[shown] = text.split(separator: "\n", omittingEmptySubsequences: false) }
+                }
+                let dst = Path.join(genDir, unique + ".swift")
+                try Files.writeIfChanged(dst, swift)
+                lowered.append(dst)
+                pathMap.append((dst, shown))
+            }
+            for g in m.generated {
+                let dst = Path.join(genDir, g.file)
+                try Files.writeIfChanged(dst, g.text)
+                lowered.append(dst)
+            }
+            pathMap.sort { $0.gen.count > $1.gen.count }
+
+            var cmd = [try Toolchain.compiler()] + flags + ["-module-name", m.name, "-I", outDir]
+            cmd += m.swiftFlags
+            if !m.nativeShaders.isEmpty { cmd += ["-enable-experimental-feature", "Extern"] }
+            if Env.stderrIsTTY { cmd.append("-color-diagnostics") }
+            for d in m.searchDirs { cmd += ["-I", d, "-L", d] }
+            for imp in (m.importCore ? ["MppCore"] : []) + m.implicitImports {
+                cmd += ["-Xfrontend", "-import-module", "-Xfrontend", imp]
+            }
+            switch m.kind {
+            case .library:
+                cmd += ["-parse-as-library", "-emit-library", "-static", "-emit-module", "-module-link-name", m.name,
+                        "-emit-module-path", Path.join(outDir, m.name + ".swiftmodule"), "-o", product]
+            case .executable:
+                // The C++ standard library once (several C++ parts may ask for it).
+                var seenCxx = false
+                let links = m.linkFlags.filter { f in
+                    guard f == "-lc++" || f == "-lstdc++" else { return true }
+                    defer { seenCxx = true }
+                    return !seenCxx
+                }
+                cmd += ["-L", outDir] + m.deps.map { "-l" + $0.name } + links + ["-o", product]
+            }
+            cmd += lowered
+            if Env.verbose { writeStderr("+ " + cmd.joined(separator: " ") + "\n") }
+            let r = try Process.run(cmd)
+            var out = r.output
+            for (gen, shown) in pathMap { out = out.replacingAll(gen, with: shown) }
+            out = out.split(separator: "\n", omittingEmptySubsequences: false)
+                .filter { !($0.hasPrefix("error: ") && $0.contains(" command failed")) }
+                .joined(separator: "\n").trimmingNewlines
+            if !originals.isEmpty { out = showOriginalSource(out, originals) }
+
+            if r.status != 0 && !loops.isEmpty {
+                // Errors inside lowered loops: compile the innermost such loop
+                // less aggressively (parallel -> sequential -> as written) and retry.
+                var culprits = 0
+                for (file, line) in errorLocations(out) {
+                    let containing = (loops[file] ?? []).filter { line >= $0.firstLine && line <= $0.lastLine }
+                    guard let loop = containing.max(by: { ($0.firstLine, -$0.lastLine) < ($1.firstLine, -$1.lastLine) }) else { continue }
+                    if loop.parallel {
+                        if serial[file, default: []].insert(loop.firstLine).inserted { culprits += 1 }
+                    } else if plain[file, default: []].insert(loop.firstLine).inserted {
+                        culprits += 1
+                    }
+                }
+                if culprits > 0 && attempt < 48 { continue }
+            }
+            if !out.isEmpty && (r.status != 0 || !m.silent) { writeStderr(out + "\n") }
+            if r.status != 0 { throw DriverError("could not compile `\(m.name)`") }
+            var record = key + "\n"
+            for (file, lines) in serial.sorted(by: { $0.key < $1.key }) { for l in lines.sorted() { record += "\(file)\t\(l)\n" } }
+            for (file, lines) in plain.sorted(by: { $0.key < $1.key }) { for l in lines.sorted() { record += "\(file)\t\(l)\tplain\n" } }
+            try Files.write(serialFile, record)
+            try Files.write(stampFile, key)
+            if Env.verbose {
+                let all = loops.values.flatMap { $0 }
+                writeStderr("  \(m.name): \(all.filter(\.parallel).count) parallel loop(s), \(all.filter { !$0.parallel }.count) proven-safe loop(s), "
+                            + "\(serial.values.reduce(0) { $0 + $1.count }) kept serial, \(plain.values.reduce(0) { $0 + $1.count }) kept as written\n")
+            }
+            return BuiltProduct(path: product, stamp: key, rebuilt: true)
+        }
+    }
+
+    /// Diagnostics quote the lowered code; show the M++ source lines instead
+    /// (lowering keeps line numbers, so line N is line N).
+    static func showOriginalSource(_ out: String, _ originals: [String: [Substring]]) -> String {
+        var file: [Substring]? = nil
+        var result: [Substring] = []
+        for line in out.split(separator: "\n", omittingEmptySubsequences: false) {
+            if let colon = line.range(ofText: ".mpp:") {
+                file = originals[String(line[..<colon.lowerBound]) + ".mpp"]
+            } else if line.range(ofText: ": error: ") != nil || line.range(ofText: ": warning: ") != nil {
+                file = nil
+            }
+            // "  87 | code" (but not the "    | `- note" marker lines)
+            if let file, let bar = line.range(ofText: " | ") {
+                let num = line[..<bar.lowerBound].trimmingSpacesSub
+                if let n = Int(num), n >= 1, n <= file.count {
+                    let code = Env.stderrIsTTY ? Substring(Highlighter.ansi(String(file[n - 1]))) : file[n - 1]
+                    result.append(Substring(String(line[..<bar.upperBound]) + code))
+                    continue
+                }
+            }
+            result.append(line)
+        }
+        return result.joined(separator: "\n")
+    }
+
+    /// (display path, line) of every "path:line:col: error:" diagnostic.
+    static func errorLocations(_ output: String) -> [(String, Int)] {
+        var out: [(String, Int)] = []
+        for raw in output.split(separator: "\n") {
+            // Strip ANSI colors.
+            var line = ""
+            var skipping = false
+            for c in raw {
+                if c == "\u{1B}" { skipping = true; continue }
+                if skipping { if c.isLetter { skipping = false }; continue }
+                line.append(c)
+            }
+            guard let r = line.range(ofText: ": error:") else { continue }
+            let head = line[..<r.lowerBound]
+            let parts = head.split(separator: ":")
+            guard parts.count >= 3, let l = Int(parts[parts.count - 2]) else { continue }
+            out.append((parts[..<(parts.count - 2)].joined(separator: ":"), l))
+        }
+        return out
+    }
+
+    // MARK: Runtime modules
+
+    static func runtimeDir(release: Bool) throws(DriverError) -> String {
+        let home = try Locations.requireHome()
+        let d = Path.join(Locations.cache, "runtime", String(Stamp.of(try Toolchain.version() + "|" + home).prefix(16)),
+                          Toolchain.level(release))
+        Files.makeDirectories(d)
+        return d
+    }
+
+    struct Runtime {
+        let dir: String
+        let coreStamp: String
+    }
+
+    static func sources(in dir: String) -> [String] { Files.walk(dir, extensions: [".mpp", ".swift"]) }
+
+    static func runtime(release: Bool) throws(DriverError) -> Runtime {
+        let home = try Locations.requireHome()
+        var core = ModuleSpec(name: "MppCore", sources: sources(in: Path.join(home, "MppLang/mpp-core/Sources")))
+        core.importCore = false
+        core.autoParallel = false
+        core.displayRoot = home
+        let dir = try runtimeDir(release: release)
+        return Runtime(dir: dir, coreStamp: try build(core, into: dir, release: release).stamp)
+    }
+
+    static func testSupport(_ rt: Runtime, release: Bool) throws(DriverError) -> String {
+        let home = try Locations.requireHome()
+        var t = ModuleSpec(name: "MppTest", sources: sources(in: Path.join(home, "MppLang/mpp-core/Testing")))
+        t.deps = [("MppCore", rt.coreStamp)]
+        t.displayRoot = home
+        t.autoParallel = false
+        return try build(t, into: rt.dir, release: release).stamp
+    }
+
+    static func packageDescription() throws(DriverError) -> (dir: String, stamp: String) {
+        let home = try Locations.requireHome()
+        var pd = ModuleSpec(name: "PackageDescription", sources: sources(in: Path.join(home, "MppLang/MppPM/PackageDescription")))
+        pd.importCore = false
+        pd.autoParallel = false
+        pd.displayRoot = home
+        let dir = try runtimeDir(release: false)
+        return (dir, try build(pd, into: dir, release: false).stamp)
+    }
+
+    // MARK: Standard modules (built when imported)
+
+    struct StdModule {
+        let name: String
+        let dir: String
+        let deps: [String]
+        let appleOnly: Bool
+        /// Uses the MppUI engine (the MppUIEngine module, written in M++).
+        var engine = false
+        /// A C++23 core beside the M++ sources (`<Name>Core.h` plus .cpp
+        /// files), compiled by MppxxCpp and imported as the module `<Name>Core`.
+        var cxx: String? = nil
+        var effectiveDir: String { dir }
+        var usesEngine: Bool { engine }
+    }
+
+    static let stdModules: [StdModule] = [
+        StdModule(name: "MppKit", dir: "MppLang/mpp-kit/Sources", deps: [], appleOnly: false),
+        StdModule(name: "neural", dir: "MppLang/mpp-neural/Sources", deps: ["MppKit"], appleOnly: false),
+        StdModule(name: "Accelarate", dir: "MppLang/mpp-accelerate/Sources", deps: [], appleOnly: false),
+        StdModule(name: "MppData", dir: "MppLang/mpp-data/Sources", deps: ["MppKit"], appleOnly: false),
+        // MppUI: SwiftUI's API on M++'s own engine, on every platform (no SwiftUI needed, even on macOS).
+        StdModule(name: "MppUI", dir: "MppLang/mpp-ui/Portable/MppUI", deps: [], appleOnly: false, engine: true),
+        // Liquid Glass on M++'s own engine everywhere (macOS too): the same glass on any Mac, any GPU.
+        StdModule(name: "liquidglass", dir: "MppLang/mpp-ui/Portable/liquidglass", deps: ["MppUI"], appleOnly: false),
+        // MppFoundation: parts of the swift-foundation fork, built as M++ (Decimal so far).
+        StdModule(name: "MppFoundation", dir: "MppLang/mpp-foundation/Sources", deps: [], appleOnly: false),
+        // Metallic: Metal-style shading language and the engine that runs it.
+        StdModule(name: "Metallic", dir: "MppLang/mpp-metallic/Sources", deps: [], appleOnly: false,
+                  cxx: "MppLang/mpp-metallic/Core"),
+        // The UI engine itself: renderer, text, Liquid Glass (on Metallic), X11/AppKit windows.
+        StdModule(name: "MppUIEngine", dir: "MppLang/mpp-ui/Engine", deps: ["Metallic"], appleOnly: false),
+        // The earlier name for MppUI on the engine (kept so old programs build).
+        StdModule(name: "MppUIKit", dir: "MppLang/mpp-ui/Portable/MppUI", deps: [], appleOnly: false, engine: true),
+    ]
+
+    static func stdModule(_ name: String) -> StdModule? { stdModules.first { $0.name == name } }
+
+    /// Builds the standard modules that `sources` import (and their dependencies).
+    /// Returns (name, stamp) dependents first, plus every source file involved.
+    static func stdModules(for sources: [String], _ rt: Runtime, release: Bool) throws(DriverError)
+        -> (deps: [(name: String, stamp: String)], inputs: [String], linkFlags: [String]) {
+        var wanted: [String] = []
+        for src in sources {
+            for name in Frontend.importedModules(try Files.read(src)) where stdModule(name) != nil && !wanted.contains(name) {
+                wanted.append(name)
+            }
+        }
+        if wanted.isEmpty { return ([], [], []) }
+        #if canImport(Darwin)
+        // MppFoundation's Decimal uses UInt128, which needs macOS 15.
+        if wanted.contains("MppFoundation"), (Double(Env.get("MPP_MACOS_TARGET") ?? "14.0") ?? 14) < 15 {
+            setenv("MPP_MACOS_TARGET", "15.0", 1)
+        }
+        #endif
+        let home = try Locations.requireHome()
+        var stamps: [String: String] = [:]
+        var order: [String] = []
+        var inputs: [String] = []
+        var coreMaps: [String] = []          // C++ cores' module maps, needed by every module built on them
+        func visit(_ name: String) throws(DriverError) {
+            if stamps[name] != nil { return }
+            let sm = stdModule(name)!
+            #if !canImport(Darwin)
+            if sm.appleOnly {
+                throw DriverError("`import \(name)` needs macOS: \(name) is built on SwiftUI, which is only available on Apple platforms")
+            }
+            #endif
+            let deps = sm.deps + (sm.usesEngine ? ["MppUIEngine"] : [])
+            for d in deps { try visit(d) }
+            let moduleDir = Path.join(home, sm.effectiveDir)
+            var m = ModuleSpec(name: sm.name, sources: Builder.sources(in: moduleDir))
+            if m.sources.isEmpty {
+                throw DriverError("`import \(name)`: no .mpp files in \(moduleDir)"
+                    + (Files.isDirectory(moduleDir) ? " (the folder is there but unreadable or empty)" : " (the folder is missing; folder names are case-sensitive here)"))
+            }
+            m.displayRoot = home
+            m.searchDirs = [rt.dir]
+            m.autoParallel = false
+            m.deps = deps.reversed().map { ($0, stamps[$0]!) } + [("MppCore", rt.coreStamp)]
+            inputs += m.sources
+            for d in coreMaps { m.swiftFlags += ["-I", d] }
+            if let shaders = try MetallicNative.prepare(sources: m.sources, module: sm.name, outDir: Path.join(rt.dir, "shaders", sm.name),
+                                                       release: release) {
+                m.nativeShaders = shaders.natives
+                inputs += shaders.inputs
+                let lib = Path.join(rt.dir, "lib\(sm.name)Shaders.a")
+                try Cpp.archive(shaders.objects, into: lib)
+                linkFlags += ["-L", rt.dir, "-l\(sm.name)Shaders"] + Cpp.cxxStandardLibrary
+            }
+            if let cxx = sm.cxx {
+                let core = try cxxCore(sm.name, dir: Path.join(home, cxx), rt, release: release)
+                coreMaps.append(core.mapDir)
+                m.swiftFlags += ["-I", core.mapDir]
+                m.stampFiles += core.inputs
+                inputs += core.inputs
+                linkFlags += ["-I", core.mapDir, "-L", Path.dirname(core.library), "-l\(sm.name)Core"] + Cpp.cxxStandardLibrary
+            }
+            stamps[name] = try build(m, into: rt.dir, release: release).stamp
+            order.append(name)
+            if name == "MppUIEngine" {
+                #if canImport(Darwin)
+                linkFlags += ["-framework", "AppKit", "-framework", "CoreGraphics", "-framework", "CoreText"]
+                #else
+                linkFlags += ["-ldl"]
+                #endif
+            }
+        }
+        var linkFlags: [String] = []
+        // The engine used to be C++ with a Clang module map here; a stale map
+        // would shadow the M++ module of the same name.
+        let staleMap = Path.join(rt.dir, "module.modulemap")
+        if let text = Files.readIfExists(staleMap), text.contains("MppUIEngine") { _ = unlink(staleMap) }
+        for w in wanted { try visit(w) }
+        return (order.reversed().map { ($0, stamps[$0]!) }, inputs, linkFlags)
+    }
+
+    // MARK: Single files
+
+    /// `mpp file.mpp`: the cached executable for a standalone program.
+    ///
+    /// Fast path: a stamp of every input's size and modification time. When
+    /// nothing changed, no file is read or hashed and no compiler runs.
+    static func singleFile(_ source: String, release: Bool, autoParallel: Bool = true) throws(DriverError) -> String {
+        let abs = Path.absolute(source)
+        let out = Path.join(Locations.cache, "single", String(Stamp.of(abs).prefix(16)),
+                            Toolchain.level(release) + (autoParallel ? "" : "-serial"))
+        let fastFile = Path.join(out, "fast")
+        if let fast = Files.readIfExists(fastFile), let exe = fastPathValid(fast) { return exe }
+
+        let rt = try runtime(release: release)
+        var m = ModuleSpec(name: Toolchain.moduleName(Path.stem(abs)), sources: [abs])
+        let imports = Frontend.importedModules(try Files.read(abs))
+        if ["MppCore", "MppTest"].contains(m.name) || stdModule(m.name) != nil || imports.contains(m.name) { m.name += "_main" }
+        m.kind = .executable
+        m.mainSource = abs
+        m.autoParallel = autoParallel
+        let (std, stdInputs, stdLinks) = try stdModules(for: [abs], rt, release: release)
+        m.deps = std + [("MppCore", rt.coreStamp)]
+        m.linkFlags = stdLinks
+        m.searchDirs = [rt.dir]
+        m.displayRoot = Path.cwd
+        // MppxxCpp: `import cpp "x.hpp"` and `#cpp { }` blocks.
+        var cppInputs: [String] = []
+        if let cpp = try CppInterop.prepare(source: abs, text: try Files.read(abs), outDir: out, release: release) {
+            m.swiftFlags += cpp.swiftFlags
+            m.linkFlags += cpp.linkFlags
+            m.stampFiles += cpp.inputs
+            m.generated.append(("_mppcpp_bridge.swift", CppInterop.bridgeSource))
+            cppInputs = cpp.inputs
+        }
+        // Metallic shaders compiled to C++.
+        if let shaders = try MetallicNative.prepare(sources: [abs], module: m.name, outDir: Path.join(out, "shaders"), release: release) {
+            m.nativeShaders = shaders.natives
+            m.linkFlags += shaders.objects + Cpp.cxxStandardLibrary
+            m.stampFiles += shaders.objects
+            cppInputs += shaders.inputs
+        }
+        let product = try build(m, into: out, release: release)
+
+        // Record the inputs for the fast path.
+        let home = try Locations.requireHome()
+        let inputs = [abs] + sources(in: Path.join(home, "MppLang/mpp-core/Sources")) + stdInputs + cppInputs
+            + [try Toolchain.compiler(), Locations.selfExecutable]
+        var record = "v1\t\(product.path)\t\(Env.get("MPP_MACOS_TARGET") ?? "")\n"
+        for p in inputs {
+            let i = Files.info(p)
+            record += "\(p)\t\(i?.mtimeNanos ?? -1)\t\(i?.size ?? -1)\n"
+        }
+        try Files.write(fastFile, record)
+        return product.path
+    }
+
+    static func fastPathValid(_ record: String) -> String? {
+        let lines = record.split(separator: "\n")
+        guard let head = lines.first?.split(separator: "\t", omittingEmptySubsequences: false), head.count == 3, head[0] == "v1",
+              head[2] == (Env.get("MPP_MACOS_TARGET") ?? "") else { return nil }
+        let exe = String(head[1])
+        guard Files.exists(exe) else { return nil }
+        for line in lines.dropFirst() {
+            let f = line.split(separator: "\t")
+            guard f.count == 3, let i = Files.info(String(f[0])), "\(i.mtimeNanos)" == f[1], "\(i.size)" == f[2] else { return nil }
+        }
+        return exe
+    }
+}
+
+extension Locations {
+    /// This driver's own executable (its changes invalidate fast-path caches).
+    static let selfExecutable: String = {
+        #if canImport(Glibc) || canImport(Musl)
+        if let p = Path.realpath("/proc/self/exe") { return p }
+        #endif
+        let a = CommandLine.arguments[0]
+        return Path.realpath(a.contains("/") ? a : (Process.which(a) ?? a)) ?? a
+    }()
+}
+
+extension String {
+    func replacingAll(_ target: String, with replacement: String) -> String {
+        guard !target.isEmpty, contains(target) else { return self }
+        var out = ""
+        var rest = Substring(self)
+        while let r = rest.range(ofText: target) {
+            out += rest[..<r.lowerBound]
+            out += replacement
+            rest = rest[r.upperBound...]
+        }
+        return out + rest
+    }
+
+    func range(ofText target: String) -> Range<String.Index>? { Substring(self).range(ofText: target) }
+}
+
+extension Substring {
+    func range(ofText target: String) -> Range<String.Index>? {
+        guard !target.isEmpty else { return nil }
+        var i = startIndex
+        while i < endIndex {
+            if self[i...].hasPrefix(target) { return i ..< index(i, offsetBy: target.count) }
+            i = index(after: i)
+        }
+        return nil
+    }
+}

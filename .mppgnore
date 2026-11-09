@@ -1,0 +1,7 @@
+# .mppgnore — files M++ should not treat as sources (gitignore syntax).
+# MppPM reads this when it collects a target's files; deeper .mppgnore files add to it.
+build/
+bin/
+.build/
+*.store
+.DS_Store

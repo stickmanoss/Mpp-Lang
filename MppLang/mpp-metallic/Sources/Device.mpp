@@ -1,0 +1,508 @@
+// Metallic — the engine that runs shaders, with Metal's API.
+//
+//   let device = MetallicCreateSystemDefaultDevice()!
+//   let queue = device.makeCommandQueue()!
+//   let pipeline = try device.makeComputePipelineState(function: invertFunction)
+//   let buffer = queue.makeCommandBuffer()!
+//   let encoder = buffer.makeComputeCommandEncoder()!
+//   encoder.setComputePipelineState(pipeline)
+//   encoder.setTexture(src, index: 0)
+//   encoder.setTexture(dst, index: 1)
+//   encoder.dispatchThreads(MetallicSize(width: w, height: h, depth: 1),
+//                           threadsPerThreadgroup: MetallicSize(width: 16, height: 16, depth: 1))
+//   encoder.endEncoding()
+//   buffer.commit()
+//   buffer.waitUntilCompleted()
+//
+// Shaders run on the CPU: kernels and fragments are spread over all cores
+// in row bands; vectors are SIMD. Command buffers execute when committed.
+// The thread pool and the bulk pixel work (clears, format conversion, blur,
+// PNG) are Metallic's C++23 core (../Core), built by MppxxCpp.
+
+internal import MetallicCore
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+public typealias MetallicTexture = texture2d<float>
+
+public struct MetallicSize: Sendable {
+    public var width: Int, height: Int, depth: Int
+    public init(width: Int, height: Int, depth: Int = 1) { self.width = width; self.height = height; self.depth = depth }
+}
+
+public struct MetallicScissorRect: Sendable {
+    public var x: Int, y: Int, width: Int, height: Int
+    public init(x: Int, y: Int, width: Int, height: Int) { self.x = x; self.y = y; self.width = width; self.height = height }
+}
+
+public struct MetallicClearColor: Sendable {
+    public var red: Double, green: Double, blue: Double, alpha: Double
+    public init(red: Double, green: Double, blue: Double, alpha: Double) { self.red = red; self.green = green; self.blue = blue; self.alpha = alpha }
+}
+
+public enum MetallicLoadAction: Sendable { case dontCare, load, clear }
+public enum MetallicPrimitiveType: Sendable { case triangle, triangleStrip }
+
+/// The default device: the CPU, all cores.
+public func MetallicCreateSystemDefaultDevice() -> MetallicDevice? { MetallicDevice.shared }
+
+public final class MetallicDevice: @unchecked Sendable {
+    static let shared = MetallicDevice()
+    public let coreCount: Int
+    public var name: String { "Metallic CPU (\(coreCount) cores)" }
+
+    init() { coreCount = max(1, mtl_core_count()) }
+
+    public func makeCommandQueue() -> MetallicCommandQueue? { MetallicCommandQueue(device: self) }
+
+    public func makeTexture(descriptor d: MetallicTextureDescriptor) -> MetallicTexture? {
+        guard d.width > 0 && d.height > 0 else { return nil }
+        return MetallicTexture(_TextureStorage(width: d.width, height: d.height, pixelFormat: d.pixelFormat))
+    }
+
+    public func makeComputePipelineState(function: MetallicFunction) throws -> MetallicComputePipelineState {
+        guard function.kind == .kernel, function.native != nil || function.kernelBody != nil else {
+            throw MetallicError("`\(function.name)` is not a kernel function")
+        }
+        return MetallicComputePipelineState(function: function, body: function.kernelBody)
+    }
+
+    public func makeRenderPipelineState(descriptor d: MetallicRenderPipelineDescriptor) throws -> MetallicRenderPipelineState {
+        guard let v = d.vertexFunction, v.kind == .vertex, v.draw != nil else {
+            throw MetallicError("the render pipeline needs a vertex function")
+        }
+        guard let f = d.fragmentFunction, f.kind == .fragment else { throw MetallicError("the render pipeline needs a fragment function") }
+        if let want = f.stageIn, let have = v.stageIn, want != have {
+            throw MetallicError("fragment `\(f.name)` takes [[stage_in]] \(want), but vertex `\(v.name)` returns \(have)")
+        }
+        return MetallicRenderPipelineState(vertex: v, fragment: f, blending: d.colorAttachments[0].isBlendingEnabled)
+    }
+}
+
+public struct MetallicTextureDescriptor: Sendable {
+    public var pixelFormat: MetallicPixelFormat = .rgba32Float
+    public var width = 1, height = 1
+    public init() {}
+    public static func texture2DDescriptor(pixelFormat: MetallicPixelFormat, width: Int, height: Int, mipmapped: Bool) -> MetallicTextureDescriptor {
+        var d = MetallicTextureDescriptor()
+        d.pixelFormat = pixelFormat
+        d.width = width
+        d.height = height
+        return d
+    }
+}
+
+public final class MetallicComputePipelineState: @unchecked Sendable {
+    public let function: MetallicFunction
+    let body: MetallicFunction.Kernel?
+    public var maxTotalThreadsPerThreadgroup: Int { 1024 }
+    public var threadExecutionWidth: Int { 8 }
+    init(function: MetallicFunction, body: MetallicFunction.Kernel?) { self.function = function; self.body = body }
+}
+
+public struct MetallicColorAttachmentDescriptor: Sendable {
+    public var texture: MetallicTexture? = nil
+    public var loadAction: MetallicLoadAction = .load
+    public var clearColor = MetallicClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+    public var isBlendingEnabled = false              // pipeline: source-over with the fragment's alpha
+    public var pixelFormat: MetallicPixelFormat = .rgba32Float
+    public init() {}
+}
+
+public struct MetallicRenderPipelineDescriptor: @unchecked Sendable {
+    public var vertexFunction: MetallicFunction? = nil
+    public var fragmentFunction: MetallicFunction? = nil
+    public var colorAttachments = [MetallicColorAttachmentDescriptor()]
+    public var label: String? = nil
+    public init() {}
+}
+
+public final class MetallicRenderPipelineState: @unchecked Sendable {
+    let vertex: MetallicFunction
+    let fragment: MetallicFunction
+    let blending: Bool
+    init(vertex: MetallicFunction, fragment: MetallicFunction, blending: Bool) {
+        self.vertex = vertex
+        self.fragment = fragment
+        self.blending = blending
+    }
+}
+
+public struct MetallicRenderPassDescriptor: Sendable {
+    public var colorAttachments = [MetallicColorAttachmentDescriptor()]
+    public init() {}
+}
+
+// MARK: - Queue and command buffers
+
+public final class MetallicCommandQueue: @unchecked Sendable {
+    public let device: MetallicDevice
+    init(device: MetallicDevice) { self.device = device }
+    public func makeCommandBuffer() -> MetallicCommandBuffer? { MetallicCommandBuffer(device: device) }
+}
+
+public enum MetallicCommandBufferStatus: Sendable { case notEnqueued, committed, completed, error }
+
+public final class MetallicCommandBuffer: @unchecked Sendable {
+    let device: MetallicDevice
+    var commands: [() throws -> Void] = []
+    public private(set) var status: MetallicCommandBufferStatus = .notEnqueued
+    public private(set) var error: Error? = nil
+    var handlers: [(MetallicCommandBuffer) -> Void] = []
+    init(device: MetallicDevice) { self.device = device }
+
+    public func makeComputeCommandEncoder() -> MetallicComputeCommandEncoder? { MetallicComputeCommandEncoder(buffer: self) }
+    public func makeRenderCommandEncoder(descriptor: MetallicRenderPassDescriptor) -> MetallicRenderCommandEncoder? {
+        guard descriptor.colorAttachments[0].texture != nil else { return nil }
+        return MetallicRenderCommandEncoder(buffer: self, pass: descriptor)
+    }
+    public func addCompletedHandler(_ h: @escaping (MetallicCommandBuffer) -> Void) { handlers.append(h) }
+
+    /// Runs the recorded commands (on all cores) and completes.
+    public func commit() {
+        precondition(status == .notEnqueued, "Metallic: a command buffer can be committed once")
+        status = .committed
+        do {
+            for c in commands { try c() }
+            status = .completed
+        } catch {
+            self.error = error
+            status = .error
+        }
+        commands.removeAll()
+        for h in handlers { h(self) }
+    }
+    public func waitUntilCompleted() {}
+}
+
+// MARK: - Compute
+
+public final class MetallicComputeCommandEncoder {
+    let buffer: MetallicCommandBuffer
+    var pipeline: MetallicComputePipelineState? = nil
+    var arguments = MetallicArguments()
+    init(buffer: MetallicCommandBuffer) { self.buffer = buffer }
+
+    public func setComputePipelineState(_ p: MetallicComputePipelineState) { pipeline = p }
+    public func setTexture(_ t: MetallicTexture?, index: Int) { arguments.textures[index] = t?.storage }
+    public func setBytes<T>(_ value: T, index: Int) { arguments.setBytes(value, index: index) }
+    public func setBuffer<T>(_ values: [T], index: Int) { arguments.setBuffer(values, index: index) }
+    public func setSamplerState(_ s: sampler, index: Int) { arguments.samplers[index] = s }
+
+    public func dispatchThreads(_ threads: MetallicSize, threadsPerThreadgroup: MetallicSize) {
+        guard let p = pipeline else { fatalError("Metallic: dispatch without a compute pipeline") }
+        let w = threads.width, h = threads.height
+        let cores = buffer.device.coreCount
+        if let native = p.function.native {
+            let bindings = _NativeBindings(arguments, p.function)
+            buffer.commands.append {
+                _parallelRows(h, cores: cores, work: w * h) { y0, y1 in
+                    var rows = mtl_rows(y0: y0, y1: y1, width: w, height: h)
+                    withUnsafePointer(to: &rows) { native(bindings.pointer, $0) }
+                }
+            }
+            return
+        }
+        let run = p.body!(arguments)
+        buffer.commands.append {
+            _parallelRows(h, cores: cores, work: w * h) { y0, y1 in run(MetallicRows(y0: y0, y1: y1, width: w, height: h)) }
+        }
+    }
+    public func dispatchThreadgroups(_ groups: MetallicSize, threadsPerThreadgroup tg: MetallicSize) {
+        dispatchThreads(MetallicSize(width: groups.width * tg.width, height: groups.height * tg.height), threadsPerThreadgroup: tg)
+    }
+    public func endEncoding() {}
+}
+
+// MARK: - Render
+
+public final class MetallicRenderCommandEncoder {
+    let buffer: MetallicCommandBuffer
+    let pass: MetallicRenderPassDescriptor
+    var pipeline: MetallicRenderPipelineState? = nil
+    var vertexArguments = MetallicArguments()
+    var fragmentArguments = MetallicArguments()
+    var scissor: MetallicScissorRect? = nil
+
+    init(buffer: MetallicCommandBuffer, pass: MetallicRenderPassDescriptor) {
+        self.buffer = buffer
+        self.pass = pass
+        let a = pass.colorAttachments[0]
+        if a.loadAction == .clear, let t = a.texture {
+            let c = float4(Float(a.clearColor.red), Float(a.clearColor.green), Float(a.clearColor.blue), Float(a.clearColor.alpha))
+            buffer.commands.append { t.fill(c) }
+        }
+    }
+
+    public func setRenderPipelineState(_ p: MetallicRenderPipelineState) { pipeline = p }
+    public func setVertexBytes<T>(_ value: T, index: Int) { vertexArguments.setBytes(value, index: index) }
+    public func setVertexBuffer<T>(_ values: [T], index: Int) { vertexArguments.setBuffer(values, index: index) }
+    public func setVertexTexture(_ t: MetallicTexture?, index: Int) { vertexArguments.textures[index] = t?.storage }
+    public func setFragmentBytes<T>(_ value: T, index: Int) { fragmentArguments.setBytes(value, index: index) }
+    public func setFragmentBuffer<T>(_ values: [T], index: Int) { fragmentArguments.setBuffer(values, index: index) }
+    public func setFragmentTexture(_ t: MetallicTexture?, index: Int) { fragmentArguments.textures[index] = t?.storage }
+    public func setFragmentSamplerState(_ s: sampler, index: Int) { fragmentArguments.samplers[index] = s }
+    public func setScissorRect(_ r: MetallicScissorRect) { scissor = r }
+
+    public func drawPrimitives(type: MetallicPrimitiveType, vertexStart: Int, vertexCount: Int) {
+        guard let p = pipeline, let target = pass.colorAttachments[0].texture else { fatalError("Metallic: draw without a render pipeline") }
+        let job = _DrawJob(target: target, primitive: type, vertexStart: vertexStart, vertexCount: vertexCount,
+                           vertexArguments: vertexArguments, fragmentArguments: fragmentArguments,
+                           scissor: scissor, blending: p.blending, cores: buffer.device.coreCount)
+        let fragment = p.fragment, vertex = p.vertex
+        buffer.commands.append { try vertex.draw!(fragment, job) }
+    }
+    public func endEncoding() {}
+}
+
+public struct _DrawJob {
+    @usableFromInline let target: MetallicTexture
+    @usableFromInline let primitive: MetallicPrimitiveType
+    @usableFromInline let vertexStart: Int, vertexCount: Int
+    @usableFromInline let vertexArguments: MetallicArguments, fragmentArguments: MetallicArguments
+    @usableFromInline let scissor: MetallicScissorRect?
+    @usableFromInline let blending: Bool
+    @usableFromInline let cores: Int
+}
+
+/// Splits rows 0..<rows into bands and runs them on all cores (serially for
+/// small work) through the C++ core's thread pool.
+@usableFromInline func _parallelRows(_ rows: Int, cores: Int, work: Int, _ body: (Int, Int) -> Void) {
+    if rows <= 0 { return }
+    let bands = work < 4096 ? 1 : min(rows, cores * 4)
+    if bands == 1 { body(0, rows); return }
+    withoutActuallyEscaping(body) { b in
+        var context = (b, rows, bands)
+        withUnsafeMutablePointer(to: &context) { p in
+            mtl_parallel_for(bands, p) { raw, i in
+                let (f, rows, bands) = raw!.assumingMemoryBound(to: (((Int, Int) -> Void), Int, Int).self).pointee
+                let y0 = rows * i / bands, y1 = rows * (i + 1) / bands
+                if y0 < y1 { f(y0, y1) }
+            }
+        }
+    }
+}
+
+struct _UncheckedBox<T>: @unchecked Sendable {
+    let value: T
+    init(_ v: T) { value = v }
+}
+
+/// Runs a vertex function and rasterizes with a fragment function. Inlined
+/// where the shaders are declared, so it is specialized for their varyings.
+@inlinable func _draw<V: Varyings>(_ job: _DrawJob, _ fragment: MetallicFunction,
+                                   _ vertex: (MetallicArguments) -> (MetallicThread) -> V) throws {
+    if let native = fragment.native {
+        if let want = fragment.stageIn, want != V.self {
+            throw MetallicError("fragment function `\(fragment.name)` takes [[stage_in]] \(want), but the vertex function returns \(V.self)")
+        }
+        let verts = _vertices(job, vertex)
+        let bindings = _NativeBindings(job.fragmentArguments, fragment)
+        verts.withUnsafeBufferPointer { b in
+            _nativeRasterize(job, b.map(\.clipPosition), fragment.stageIn == nil ? nil : UnsafeRawPointer(b.baseAddress),
+                             MemoryLayout<V>.stride, bindings, native)
+        }
+        return
+    }
+    if let f = fragment.body as? (MetallicArguments) -> (MetallicSpan<V>) -> Void {
+        let shade = f(job.fragmentArguments)
+        _rasterize(job, _vertices(job, vertex), shade)
+    } else if let f = fragment.body as? (MetallicArguments) -> (MetallicSpan<MetallicNoVaryings>) -> Void {
+        let shade = f(job.fragmentArguments)
+        _rasterize(job, _vertices(job, vertex)) { shade($0.withoutVaryings) }
+    } else {
+        throw MetallicError("fragment function `\(fragment.name)` takes [[stage_in]] \(fragment.stageIn.map { "\($0)" } ?? "?"), but the vertex function returns \(V.self)")
+    }
+}
+
+@inlinable func _vertices<V: Varyings>(_ job: _DrawJob, _ vertex: (MetallicArguments) -> (MetallicThread) -> V) -> [V] {
+    let run = vertex(job.vertexArguments)
+    var verts: [V] = []
+    verts.reserveCapacity(job.vertexCount)
+    var t = MetallicThread()
+    for i in 0 ..< job.vertexCount {
+        t.vertexID = uint(job.vertexStart + i)
+        verts.append(run(t))
+    }
+    return verts
+}
+
+/// Triangle setup: each row's covered pixels are found exactly from the edge
+/// equations, then handed to the fragment loop as one span.
+@inlinable func _rasterize<V: Varyings>(_ job: _DrawJob, _ verts: [V], _ shade: (MetallicSpan<V>) -> Void) {
+    var triangles: [(Int, Int, Int)] = []
+    switch job.primitive {
+    case .triangle: for k in stride(from: 0, to: verts.count - 2, by: 3) { triangles.append((k, k + 1, k + 2)) }
+    case .triangleStrip: if verts.count >= 3 { for k in 0 ..< verts.count - 2 { triangles.append(k % 2 == 0 ? (k, k + 1, k + 2) : (k + 1, k, k + 2)) } }
+    }
+    let W = job.target.width, H = job.target.height
+    var clip = (x0: 0, y0: 0, x1: W, y1: H)
+    if let s = job.scissor { clip = (max(0, s.x), max(0, s.y), min(W, s.x + s.width), min(H, s.y + s.height)) }
+    let texels = job.target.storage.texels
+    let blending = job.blending
+    for (ia, ib, ic) in triangles {
+        let va = verts[ia], vb = verts[ib], vc = verts[ic]
+        let pa = va.clipPosition, pb = vb.clipPosition, pc = vc.clipPosition
+        if pa.w <= 0 || pb.w <= 0 || pc.w <= 0 { continue }        // behind the eye (no clipping)
+        func screen(_ p: float4) -> float3 {
+            let n = p.xyz / p.w
+            return float3((n.x * 0.5 + 0.5) * Float(W), (0.5 - n.y * 0.5) * Float(H), n.z)
+        }
+        let a = screen(pa), b = screen(pb), c = screen(pc)
+        let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+        if !(abs(area) >= 1e-12) { continue }
+        let minX = max(clip.x0, Int(min(a.x, b.x, c.x).rounded(.down))), maxX = min(clip.x1, Int(max(a.x, b.x, c.x).rounded(.up)))
+        let minY = max(clip.y0, Int(min(a.y, b.y, c.y).rounded(.down))), maxY = min(clip.y1, Int(max(a.y, b.y, c.y).rounded(.up)))
+        if minX >= maxX || minY >= maxY { continue }
+        let invW = float3(1 / pa.w, 1 / pb.w, 1 / pc.w)
+        let inv = 1 / area
+        _parallelRows(maxY - minY, cores: job.cores, work: (maxX - minX) * (maxY - minY)) { r0, r1 in
+            for py in (minY + r0) ..< (minY + r1) {
+                let fy = Float(py) + 0.5
+                // Each barycentric weight is k + m·x along the row; keep x where all are ≥ 0.
+                let k0 = (b.x * (c.y - fy) - (b.y - fy) * c.x) * inv, m0 = (b.y - c.y) * inv
+                let k1 = (c.x * (a.y - fy) - (c.y - fy) * a.x) * inv, m1 = (c.y - a.y) * inv
+                let k2 = 1 - k0 - k1, m2 = -m0 - m1
+                var lo = Float(minX), hi = Float(maxX)
+                for (k, m) in [(k0, m0), (k1, m1), (k2, m2)] {
+                    if m > 0 { lo = max(lo, -k / m) } else if m < 0 { hi = min(hi, -k / m) } else if k < 0 { lo = .infinity }
+                }
+                guard lo <= hi else { continue }
+                let x0 = max(minX, Int((lo - 0.5).rounded(.down))), x1 = min(maxX, Int((hi - 0.5).rounded(.down)) + 2)
+                if x0 >= x1 { continue }
+                shade(MetallicSpan(y: py, x0: x0, x1: x1, a: a, b: b, c: c, inv: inv, invW: invW,
+                                   va: va, vb: vb, vc: vc, row: texels + py * W, blending: blending))
+            }
+        }
+    }
+}
+
+// MARK: - Shaders compiled to C++
+
+/// The bindings a compiled shader reads, checked like the M++ path checks them.
+@usableFromInline final class _NativeBindings: @unchecked Sendable {
+    let buffers = UnsafeMutablePointer<UnsafeRawPointer?>.allocate(capacity: 31)
+    let textures = UnsafeMutablePointer<mtl_texture>.allocate(capacity: 31)
+    let samplers = UnsafeMutablePointer<mtl_sampler>.allocate(capacity: 16)
+    let bindings = UnsafeMutablePointer<mtl_bindings>.allocate(capacity: 1)
+    let keep: MetallicArguments
+    @usableFromInline var pointer: UnsafeRawPointer { UnsafeRawPointer(bindings) }
+
+    @usableFromInline init(_ a: MetallicArguments, _ f: MetallicFunction) {
+        keep = a
+        for (index, size) in f.nativeBuffers {
+            guard let r = a.raw[index] else {
+                if a.buffers[index] == nil { fatalError("Metallic: nothing bound at buffer(\(index)) for `\(f.name)`") }
+                fatalError("Metallic: buffer(\(index)) of `\(f.name)` needs setBytes (it holds \(type(of: a.buffers[index]!)))")
+            }
+            if r.count < size { fatalError("Metallic: buffer(\(index)) holds \(r.count) bytes, `\(f.name)` reads \(size)") }
+        }
+        for index in f.nativeTextures where a.textures[index] == nil {
+            fatalError("Metallic: nothing bound at texture(\(index)) for `\(f.name)`")
+        }
+        for i in 0 ..< 31 {
+            buffers[i] = a.raw[i].map { UnsafeRawPointer($0.pointer) }
+            let t = a.textures[i]
+            textures[i] = mtl_texture(texels: t.map { _floats($0.texels) }, width: t?.width ?? 0, height: t?.height ?? 0)
+        }
+        for i in 0 ..< 16 {
+            let s = a.samplers[i]
+            let address: Int32 = switch s.address { case .clamp_to_edge: 0; case .repeat_: 1; case .mirrored_repeat: 2; case .clamp_to_zero: 3 }
+            samplers[i] = mtl_sampler(filter: s.filter == .nearest ? 0 : 1, address: address)
+        }
+        bindings.initialize(to: mtl_bindings(buffers: UnsafePointer(buffers), textures: UnsafePointer(textures), samplers: UnsafePointer(samplers)))
+    }
+    deinit {
+        buffers.deallocate(); textures.deallocate(); samplers.deallocate(); bindings.deallocate()
+    }
+}
+
+/// Rasterizes for a compiled fragment shader: the same spans as `_rasterize`,
+/// handed to C++ with pointers to the vertices' varyings.
+@usableFromInline func _nativeRasterize(_ job: _DrawJob, _ positions: [float4], _ varyings: UnsafeRawPointer?, _ stride: Int,
+                                        _ bindings: _NativeBindings, _ native: MetallicFunction.Native) {
+    var triangles: [(Int, Int, Int)] = []
+    switch job.primitive {
+    case .triangle: for k in Swift.stride(from: 0, to: positions.count - 2, by: 3) { triangles.append((k, k + 1, k + 2)) }
+    case .triangleStrip: if positions.count >= 3 { for k in 0 ..< positions.count - 2 { triangles.append(k % 2 == 0 ? (k, k + 1, k + 2) : (k + 1, k, k + 2)) } }
+    }
+    let W = job.target.width, H = job.target.height
+    var clip = (x0: 0, y0: 0, x1: W, y1: H)
+    if let s = job.scissor { clip = (max(0, s.x), max(0, s.y), min(W, s.x + s.width), min(H, s.y + s.height)) }
+    let texels = _floats(job.target.storage.texels)
+    let blending: Int32 = job.blending ? 1 : 0
+    for (ia, ib, ic) in triangles {
+        let pa = positions[ia], pb = positions[ib], pc = positions[ic]
+        if pa.w <= 0 || pb.w <= 0 || pc.w <= 0 { continue }
+        func screen(_ p: float4) -> float3 {
+            let n = p.xyz / p.w
+            return float3((n.x * 0.5 + 0.5) * Float(W), (0.5 - n.y * 0.5) * Float(H), n.z)
+        }
+        let a = screen(pa), b = screen(pb), c = screen(pc)
+        let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+        if !(abs(area) >= 1e-12) { continue }
+        let minX = max(clip.x0, Int(min(a.x, b.x, c.x).rounded(.down))), maxX = min(clip.x1, Int(max(a.x, b.x, c.x).rounded(.up)))
+        let minY = max(clip.y0, Int(min(a.y, b.y, c.y).rounded(.down))), maxY = min(clip.y1, Int(max(a.y, b.y, c.y).rounded(.up)))
+        if minX >= maxX || minY >= maxY { continue }
+        let inv = 1 / area
+        let va = varyings.map { $0 + ia * stride }, vb = varyings.map { $0 + ib * stride }, vc = varyings.map { $0 + ic * stride }
+        let template = mtl_span(y: 0, x0: 0, x1: 0, a: (a.x, a.y, a.z), b: (b.x, b.y, b.z), c: (c.x, c.y, c.z), inv: inv,
+                                invW: (1 / pa.w, 1 / pb.w, 1 / pc.w), va: va, vb: vb, vc: vc, row: nil, blending: blending)
+        _parallelRows(maxY - minY, cores: job.cores, work: (maxX - minX) * (maxY - minY)) { r0, r1 in
+            var span = template
+            for py in (minY + r0) ..< (minY + r1) {
+                let fy = Float(py) + 0.5
+                let k0 = (b.x * (c.y - fy) - (b.y - fy) * c.x) * inv, m0 = (b.y - c.y) * inv
+                let k1 = (c.x * (a.y - fy) - (c.y - fy) * a.x) * inv, m1 = (c.y - a.y) * inv
+                let k2 = 1 - k0 - k1, m2 = -m0 - m1
+                var lo = Float(minX), hi = Float(maxX)
+                for (k, m) in [(k0, m0), (k1, m1), (k2, m2)] {
+                    if m > 0 { lo = max(lo, -k / m) } else if m < 0 { hi = min(hi, -k / m) } else if k < 0 { lo = .infinity }
+                }
+                guard lo <= hi else { continue }
+                let x0 = max(minX, Int((lo - 0.5).rounded(.down))), x1 = min(maxX, Int((hi - 0.5).rounded(.down)) + 2)
+                if x0 >= x1 { continue }
+                span.y = py; span.x0 = x0; span.x1 = x1
+                span.row = texels + py * W * 4
+                withUnsafePointer(to: &span) { native(bindings.pointer, $0) }
+            }
+        }
+    }
+}
+
+// MARK: - Image filters (like Metal Performance Shaders)
+
+/// Each texel becomes the average of itself and its four neighbours — what
+/// sampling five one-texel-apart points and averaging gives, done once.
+public struct MetallicCrossAverage: Sendable {
+    public init() {}
+    public func encode(commandBuffer: MetallicCommandBuffer, inPlaceTexture texture: MetallicTexture) {
+        commandBuffer.commands.append { mtl_cross_average(_floats(texture.storage.texels), texture.width, texture.height) }
+    }
+}
+
+/// A Gaussian blur with any radius at the same cost (`MPSImageGaussianBlur`).
+public struct MetallicGaussianBlur: Sendable {
+    public var sigma: Float
+    public init(sigma: Float) { self.sigma = sigma }
+
+    public func encode(commandBuffer: MetallicCommandBuffer, inPlaceTexture texture: MetallicTexture) {
+        let sigma = sigma
+        commandBuffer.commands.append {
+            mtl_gaussian_blur(_floats(texture.storage.texels), texture.width, texture.height, sigma)
+        }
+    }
+
+    public func encode(commandBuffer: MetallicCommandBuffer, sourceTexture src: MetallicTexture, destinationTexture dst: MetallicTexture) {
+        commandBuffer.commands.append {
+            precondition(src.width == dst.width && src.height == dst.height, "Metallic: blur source and destination sizes differ")
+            dst.storage.texels.update(from: src.storage.texels, count: src.width * src.height)
+        }
+        encode(commandBuffer: commandBuffer, inPlaceTexture: dst)
+    }
+}

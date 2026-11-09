@@ -1,0 +1,212 @@
+// mpp — the MppxxCpp wrapper's M++ side.
+//
+// Everything `mpp` does with C++ — building C++ programs, M++ calling C++,
+// compiling Metallic shaders and standard modules' C++ cores — is the C++23
+// library in MppLang/mpp-cpp/wrapper, linked into `mpp`. This file only
+// calls it (C functions that return JSON) and keeps the M++ types the rest of
+// the driver uses.
+
+import MppKit
+import MppxxWrapper
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+/// C++ options from the command line (nil: the file's own, else the default).
+struct CppOptions {
+    var std: String? = nil
+    var strict: Bool? = nil
+}
+
+nonisolated(unsafe) var cppCommandLine = CppOptions()
+
+enum Wrapper {
+    /// Tells the C++ side where M++ and its cache are (once).
+    static let configured: Bool = {
+        let swiftc = (try? Toolchain.compiler()) ?? ""
+        let key = (try? Toolchain.identityKey()) ?? swiftc
+        mppxx_configure(Locations.home ?? "", Locations.cache, swiftc, key, Locations.selfExecutable)
+        return true
+    }()
+
+    /// Calls a wrapper function and parses its JSON result.
+    static func call(_ body: () -> UnsafeMutablePointer<CChar>?) throws(DriverError) -> JSON {
+        _ = configured
+        guard let p = body() else { throw DriverError("the C++ wrapper returned nothing") }
+        defer { mppxx_free(p) }
+        let text = String(cString: p)
+        let json: JSON
+        do { json = try JSON.parse(text) } catch { throw DriverError("the C++ wrapper returned bad JSON: \(text.prefix(200))") }
+        if let message = json["error"].string { throw DriverError(message) }
+        return json
+    }
+
+    static func strings(_ j: JSON) -> [String] { (j.array ?? []).compactMap(\.string) }
+}
+
+// MARK: - C++ programs
+
+enum Cpp {
+    static let standards = ["c++17", "c++20", "c++23", "c++26"]
+
+    static func isSource(_ path: String) -> Bool { mppxx_is_cpp_source(path) != 0 }
+
+    /// `mpp file.cpp`: the cached executable for a C++ program.
+    static func program(_ source: String, release: Bool) throws(DriverError) -> String {
+        let strict: Int32 = cppCommandLine.strict.map { $0 ? 1 : 0 } ?? -1
+        let r = try Wrapper.call {
+            if let std = cppCommandLine.std { return mppxx_cpp_program(source, release ? 1 : 0, std, strict) }
+            return mppxx_cpp_program(source, release ? 1 : 0, nil, strict)
+        }
+        guard let exe = r["exe"].string else { throw DriverError("the C++ wrapper didn't return a program") }
+        return exe
+    }
+
+    /// "clang version 17.0.0 (Swift toolchain)" and so on.
+    static func describe() -> String {
+        _ = Wrapper.configured
+        guard let p = mppxx_cpp_describe() else { return "not found" }
+        defer { mppxx_free(p) }
+        return String(cString: p)
+    }
+
+    /// The C++ standard library, for swiftc links.
+    static var cxxStandardLibrary: [String] { [String(cString: mppxx_cxx_stdlib())] }
+
+    static func archive(_ objects: [String], into lib: String) throws(DriverError) {
+        _ = try Wrapper.call { mppxx_archive(objects.joined(separator: "\n"), lib) }
+    }
+
+    static func parseDepFile(_ text: String) -> [String] {
+        (try? Wrapper.call { mppxx_parse_dep_file(text) }).map(Wrapper.strings) ?? []
+    }
+
+    /// Parses `--std=` / `--iso-strict` on the command line; true if `arg` was one.
+    static func parseOption(_ arg: String) throws(DriverError) -> Bool {
+        if arg.hasPrefix("--std=") || arg.hasPrefix("-std=") {
+            let s = String(arg.split(separator: "=", maxSplits: 1)[1])
+            guard mppxx_is_standard(s) != 0 else {
+                throw DriverError("unknown C++ standard `\(s)` (use one of \(standards.joined(separator: ", ")))")
+            }
+            cppCommandLine.std = s
+            return true
+        }
+        if arg == "--iso-strict" { cppCommandLine.strict = true; return true }
+        return false
+    }
+}
+
+// MARK: - M++ calling C++
+
+struct CppHeaderImport {
+    let path: String      // as written
+    let module: String
+    let line: Int
+}
+
+struct CppExtraction {
+    var text: String                  // the M++ source with C++ removed (same line count)
+    var headers: [CppHeaderImport] = []
+    var inline = ""                    // C++ from `#cpp { }` blocks, with #line markers
+}
+
+/// Prepared C++ for one M++ program.
+struct CppInteropBuild {
+    var swiftFlags: [String] = []
+    var linkFlags: [String] = []
+    var inputs: [String] = []          // files whose changes require a rebuild
+}
+
+enum CppInterop {
+    static func mentionsCpp(_ text: String) -> Bool { text.contains("#cpp") || text.contains("import cpp") }
+
+    /// Finds `import cpp "..."` lines and `#cpp { ... }` blocks and replaces
+    /// them with Swift imports, keeping every other line where it was.
+    static func extract(_ source: String, file: String) -> CppExtraction {
+        guard mentionsCpp(source), let j = try? Wrapper.call({ mppxx_interop_extract(source, file) }) else { return CppExtraction(text: source) }
+        var ex = CppExtraction(text: j["text"].string ?? source)
+        ex.inline = j["inline"].string ?? ""
+        for h in j["headers"].array ?? [] {
+            ex.headers.append(CppHeaderImport(path: h["path"].string ?? "", module: h["module"].string ?? "", line: h["line"].int ?? 0))
+        }
+        return ex
+    }
+
+    static var bridgeSource: String { String(cString: mppxx_interop_bridge_source()) }
+
+    /// Module maps and compiled C++ for an M++ program (nil when it has none).
+    static func prepare(source: String, text: String, outDir: String, release: Bool) throws(DriverError) -> CppInteropBuild? {
+        guard mentionsCpp(text) else { return nil }
+        let strict: Int32 = (cppCommandLine.strict ?? false) ? 1 : 0
+        let j = try Wrapper.call {
+            if let std = cppCommandLine.std { return mppxx_interop_prepare(source, text, outDir, release ? 1 : 0, std, strict) }
+            return mppxx_interop_prepare(source, text, outDir, release ? 1 : 0, nil, strict)
+        }
+        if j == .null { return nil }
+        return CppInteropBuild(swiftFlags: Wrapper.strings(j["swiftFlags"]), linkFlags: Wrapper.strings(j["linkFlags"]),
+                               inputs: Wrapper.strings(j["inputs"]))
+    }
+}
+
+// MARK: - Metallic
+
+extension Lowerer {
+    struct NativeShader {
+        var symbol: String
+        /// [[buffer(n)]] parameters: (index, Swift type) — the engine checks they are bound and big enough.
+        var buffers: [(Int, String)] = []
+        var textures: [Int] = []
+    }
+
+    struct NativeShaders {
+        var cpp = ""
+        var shaders: [String: NativeShader] = [:]
+    }
+
+    static func nativeShaders(_ j: JSON) -> [String: NativeShader] {
+        var out: [String: NativeShader] = [:]
+        for (name, s) in j.object ?? JSON.Object() {
+            var sh = NativeShader(symbol: s["symbol"].string ?? "")
+            for b in s["buffers"].array ?? [] { sh.buffers.append((b[0].int ?? 0, b[1].string ?? "")) }
+            sh.textures = (s["textures"].array ?? []).compactMap(\.int)
+            out[name] = sh
+        }
+        return out
+    }
+
+    /// This file's kernels and fragment shaders in C++ (nil when none can be).
+    func translateShadersToCpp(prefix: String) -> NativeShaders? {
+        let src = String(decoding: s, as: UTF8.self)
+        guard let j = try? Wrapper.call({ mppxx_shaders_translate(src, prefix) }), j != .null else { return nil }
+        return NativeShaders(cpp: j["cpp"].string ?? "", shaders: Lowerer.nativeShaders(j["shaders"]))
+    }
+}
+
+enum MetallicNative {
+    struct Prepared {
+        var natives: [String: [String: Lowerer.NativeShader]] = [:]    // source -> shaders
+        var objects: [String] = []
+        var inputs: [String] = []
+    }
+
+    static func prepare(sources: [String], module: String, outDir: String, release: Bool) throws(DriverError) -> Prepared? {
+        let j = try Wrapper.call { mppxx_shaders_prepare(sources.joined(separator: "\n"), module, outDir, release ? 1 : 0) }
+        if j == .null { return nil }
+        var p = Prepared(objects: Wrapper.strings(j["objects"]), inputs: Wrapper.strings(j["inputs"]))
+        for (src, shaders) in j["natives"].object ?? JSON.Object() { p.natives[src] = Lowerer.nativeShaders(shaders) }
+        return p
+    }
+}
+
+extension Builder {
+    /// A standard module's C++23 core, compiled by the wrapper.
+    static func cxxCore(_ name: String, dir: String, _ rt: Runtime, release: Bool) throws(DriverError)
+        -> (library: String, mapDir: String, inputs: [String]) {
+        let j = try Wrapper.call { mppxx_cxx_core(name, dir, rt.dir, release ? 1 : 0) }
+        return (j["library"].string ?? "", j["mapDir"].string ?? "", Wrapper.strings(j["inputs"]))
+    }
+}
